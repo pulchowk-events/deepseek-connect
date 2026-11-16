@@ -1,14 +1,21 @@
 {
   "manifest_version": 3,
   "name": "deepseek-connect",
-  "version": "0.1.0",
-  "description": "Drives a real DeepSeek chat tab over a local HTTP server.",
-  "permissions": ["storage", "alarms", "scripting"],
+  "version": "0.2.0",
+  "description": "Drives real AI chat tabs (DeepSeek, Qwen, etc.) over a local HTTP server.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "scripting",
+    "tabs"
+  ],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",
     "file:///*",
-    "https://chat.deepseek.com/*"
+    "https://chat.deepseek.com/*",
+    "https://chat.qwen.ai/*",
+    "https://tongyi.aliyun.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -17,9 +24,17 @@
     {
       "matches": [
         "https://chat.deepseek.com/*",
+        "https://chat.qwen.ai/*",
+        "https://tongyi.aliyun.com/*",
         "file:///*mock-deepseek.html"
       ],
-      "js": ["shared.js", "selectors.js", "content.js"],
+      "js": [
+        "shared.js",
+        "selectors.js",
+        "providers/deepseek.js",
+        "providers/qwen.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],

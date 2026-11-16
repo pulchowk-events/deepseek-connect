@@ -41,6 +41,8 @@ function createServer(opts) {
         mode: entry.mode || 'prompt',
         chatName: entry.chatName,
         targetTabId: entry.targetTabId,
+        targetUrl: entry.targetUrl,
+        provider: entry.provider,
         prompt: entry.prompt,
         delimiters: entry.delimiters,
       });
@@ -66,6 +68,8 @@ function createServer(opts) {
         prompt: req.prompt,
         chatName: req.chatName || ('chat-' + requestId.slice(0, 8)),
         targetTabId: req.targetTabId,
+        targetUrl: req.targetUrl,
+        provider: req.provider || 'deepseek',
         delimiters: req.delimiters || DEFAULT_DELIMITERS,
         resolve,
         reject,
@@ -180,6 +184,7 @@ function createServer(opts) {
             mode: body.mode,
             debug: body.debug,
             chat: body.chat,
+            url: body.url,
           });
         } else {
           if (body.error === 'dom_drift') {
@@ -205,14 +210,16 @@ function createServer(opts) {
       if (method === 'POST' && url === '/open') {
         const body = await readJson(req);
         const chatName = body.chatName;
+        const targetUrl = body.url;
         if (!chatName) return writeJson(res, 400, { ok: false, error: 'chatName required' });
         try {
-          const result = await enqueue({ prompt: null, chatName, openOnly: true });
+          const result = await enqueue({ prompt: null, chatName, openOnly: true, targetUrl, provider: body.provider || 'deepseek' });
           return writeJson(res, 200, {
             ok: true,
             existing: !!(result && result.existing),
             mode: result && result.mode,
             debug: result && result.debug,
+            url: (result && result.url) || targetUrl || null,
             chat: chatName,
           });
         } catch (e) {
@@ -243,10 +250,11 @@ function createServer(opts) {
         const targetTabId = body.targetTabId;
         const startedAt = Date.now();
         try {
-          const result = await enqueue({ prompt, chatName, targetTabId });
+          const result = await enqueue({ prompt, chatName, targetTabId, provider: body.provider || 'deepseek' });
           return writeJson(res, 200, {
             content: result.content,
             chat: chatName,
+            url: result.url,
             elapsedMs: Date.now() - startedAt,
           });
         } catch (e) {

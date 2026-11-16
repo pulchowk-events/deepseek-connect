@@ -2,20 +2,21 @@
 
 How the pieces fit together and why. Read this before touching code — the module boundaries and the constraints below are load-bearing, not stylistic. If you find yourself thinking "this looks over-complicated, let me simplify it," the section that explains why it's not is probably below.
 
-Companion docs: [protocol.md](protocol.md) specifies the wire contract that follows from these decisions; [selector-maintenance.md](selector-maintenance.md) is the recovery playbook when the DeepSeek DOM changes; the [ADR folder](adr/) records each decision atomically. This doc is the cohesive narrative that ties them together.
+Companion docs: [protocol.md](protocol.md) specifies the wire contract that follows from these decisions; [providers.md](providers.md) is the how-to for adding a provider; [selector-maintenance.md](selector-maintenance.md) is the recovery playbook when a provider's DOM changes; the [ADR folder](adr/) records each decision atomically. This doc is the cohesive narrative that ties them together.
 
 **Contents**
 - [System overview](#system-overview)
 - [Lifecycle of one prompt](#lifecycle-of-one-prompt)
 - [Module boundaries](#module-boundaries)
-- [The seven load-bearing decisions](#the-seven-load-bearing-decisions)
+- [The eight load-bearing decisions](#the-eight-load-bearing-decisions)
   - [1. Long-poll over WebSockets](#1-long-poll-over-websockets)
   - [2. Real Chrome over Puppeteer](#2-real-chrome-over-puppeteer)
-  - [3. One chat per source](#3-one-chat-per-source)
-  - [4. Sticky work tab over targetTabId](#4-sticky-work-tab-over-targettabid)
+  - [3. One chat per source, URL-primary identity](#3-one-chat-per-source-url-primary-identity)
+  - [4. Sticky work tab with provider-scoped override](#4-sticky-work-tab-with-provider-scoped-override)
   - [5. URL navigation over new-chat button](#5-url-navigation-over-new-chat-button)
   - [6. Answer-block extraction over whole-message](#6-answer-block-extraction-over-whole-message)
-  - [7. Structural sidebar walk over class names](#7-structural-sidebar-walk-over-class-names)
+  - [7. Structural sidebar walk as fallback](#7-structural-sidebar-walk-as-fallback)
+  - [8. Plugin registry over feature flags](#8-plugin-registry-over-feature-flags)
 - [The two streaming guards](#the-two-streaming-guards)
 - [What the extension does not do](#what-the-extension-does-not-do)
 - [Data flow between modules](#data-flow-between-modules)
@@ -24,187 +25,248 @@ Companion docs: [protocol.md](protocol.md) specifies the wire contract that foll
 
 ## System overview
 
-Four participants, three transport boundaries, one job: turn a prompt into a DeepSeek reply that the caller can consume as JSON.
+Four participants, three transport boundaries, one job: turn a prompt plus a provider name into a provider-specific reply that the caller can consume as JSON.
 
 ```mermaid
 flowchart TD
     Caller["External caller<br/>(wizard, curl, any Node process)"]
-    Caller -->|"POST /chat<br/>{messages, chat}"| Srv["Terminal server<br/>src/server.js"]
+    Caller -->|"POST /chat<br/>{messages, chat, provider}"| Srv["Terminal server<br/>src/server.js"]
 
     Srv -->|"queue[]"| Pump["pump()<br/>(single serialization point)"]
     Pump -->|"inFlight"| Wait["GET /next<br/>(30s long-poll hold)"]
 
     Ext["Extension service worker<br/>background.js"] -->|"GET /next"| Wait
-    Wait -->|"action: next<br/>{requestId, prompt, chatName}"| Ext
+    Wait -->|"action: next<br/>{requestId, prompt, chatName, provider}"| Ext
 
-    Ext -->|"chrome.tabs.sendMessage<br/>action: sendPrompt"| Content["Content script<br/>content.js"]
-    Content -->|"DOM manipulation<br/>type + click + wait + read"| Page["DeepSeek chat tab<br/>chat.deepseek.com"]
+    Ext -->|"getWorkTab(provider)<br/>(queries provider domain)"| Pinned["Provider tab<br/>(DeepSeek / Qwen / Tongyi)"]
 
-    Page -->|"assistant message<br/>.ds-assistant-message-main-content"| Content
-    Content -->|"chrome.runtime.sendMessage<br/>type: dsc_phase"| Ext
-    Content -->|"sendMessage response<br/>{content, raw, trace}"| Ext
-    Ext -->|"POST /reply<br/>{requestId, status, content}"| Srv
+    Ext -->|"chrome.tabs.sendMessage<br/>action: sendPrompt<br/>provider: 'qwen'"| Router["content.js<br/>(router)"]
+    Router -->|"DSC_PROVIDERS['qwen']<br/>.sendPrompt(...)"| Prov["providers/qwen.js<br/>(provider module)"]
+
+    Prov -->|"DOM manipulation<br/>type + pace + click + wait + read"| Page["Provider chat page<br/>chat.qwen.ai / chat.deepseek.com"]
+
+    Page -->|"assistant reply<br/>(provider-specific element)"| Prov
+    Prov -->|"chrome.runtime.sendMessage<br/>type: dsc_phase"| Ext
+    Prov -->|"sendMessage response<br/>{content, raw, url, trace}"| Router
+    Router -->|"{content, raw, url, trace}"| Ext
+    Ext -->|"POST /reply<br/>{requestId, status, content, url}"| Srv
     Ext -->|"POST /progress<br/>{requestId, phase}"| Srv
-    Srv -->|"{content, chat, elapsedMs}"| Caller
+    Srv -->|"{content, chat, url, elapsedMs}"| Caller
 ```
 
-Three properties the diagram makes obvious:
+Four properties the diagram makes obvious:
 
-**1. Every prompt follows the same path.** There is no "fast path," no "reuse the last prompt," no per-source shortcut. Every `/chat` becomes a queue entry, every queue entry dispatches to `/next` exactly once, every content script round-trip ends with a `/reply`. This is what makes the queue serialization guarantee (`inFlight.size <= 1`) structural rather than cooperative — there's nowhere else to go.
+**1. Every prompt follows the same path, regardless of provider.** There is no "DeepSeek fast path" and "Qwen slow path." Both go through `/chat` → queue → `/next` → `sendToTab` → `content.js` → `providers/<name>.js` → `/reply`. The provider name is a data field on every message from the caller down to the provider module, but the routing above the provider module is identical.
 
 **2. The extension is a client, not a server.** The extension never accepts HTTP connections. It polls. This is not a limitation — it's the only way to make Manifest V3 work at all, since a service worker can't bind a listening socket. Everything follows from that constraint: long-poll not WebSocket (see [decision 1](#1-long-poll-over-websockets)), stateless routing not session state, and the whole reason the wizard *runs* the server instead of the extension.
 
-**3. The caller blocks on the whole round-trip.** A `POST /chat` call doesn't return "queued, poll for status" — it returns the content or the error. This is deliberate: batch wizards are per-source iterative, so the caller has nothing to do while waiting for source N's reply except wait for source N's reply. A two-round-trip API would add stateful polling for no benefit.
+**3. The router is deliberately blind.** `content.js` looks up `DSC_PROVIDERS[msg.provider]` and calls one of four methods on it. It has zero knowledge of what a "DeepSeek" or a "Qwen" is. All provider-specific logic lives inside `providers/<name>.js`. This is what makes adding a third provider a single-file change (see [decision 8](#8-plugin-registry-over-feature-flags)).
+
+**4. The caller blocks on the whole round-trip.** A `POST /chat` call doesn't return "queued, poll for status" — it returns the content or the error. This is deliberate: batch wizards are per-source iterative, so the caller has nothing to do while waiting for source N's reply except wait for source N's reply. A two-round-trip API would add stateful polling for no benefit.
 
 ## Lifecycle of one prompt
 
-The sequence view of the same flow, with timing annotations. Everything below the caller is inside the "one `POST /chat` call" bracket.
+The sequence view of the same flow, with provider routing highlighted and timing annotations. Everything below the caller is inside the "one `POST /chat` call" bracket.
 
 ```mermaid
 sequenceDiagram
     participant C as Caller
     participant S as Server
     participant E as Extension
-    participant K as Content
-    participant D as DeepSeek
+    participant R as Router (content.js)
+    participant P as Provider (providers/X.js)
+    participant D as Provider page
 
-    C->>S: POST /chat {messages, chat: "src-alpha"}
-    Note over S: enqueue() → queue[]
+    C->>S: POST /chat {messages, chat, provider: "qwen"}
+    Note over S: enqueue() → queue[]<br/>provider: "qwen" stamped on entry
     Note over S: caller's HTTP connection held open
 
     E->>S: GET /next (already polling)
     S->>S: pump(): queue→inFlight
-    S-->>E: {action: 'next', requestId, chatName, prompt}
+    S-->>E: {action, requestId, chatName, provider: "qwen", prompt}
     S->>C: (still waiting, connection open)
 
-    E->>K: ensureChat(name)
-    K->>D: find in sidebar OR navigate to /
-    D-->>K: input ready
-    K-->>E: {ok, existing, mode}
+    E->>E: getWorkTab(provider="qwen")<br/>queries chat.qwen.ai tabs<br/>bypasses pinned workTabId
+    E->>R: sendMessage({action: ensureChat, provider: "qwen"})
+    R->>P: DSC_PROVIDERS["qwen"].ensureChat(name)
+    P->>D: dismissAgeModal()<br/>wait for input
+    D-->>P: input ready
+    P-->>R: {ok, existing, mode, debug}
+    R-->>E: {ok, existing, mode, debug}
 
-    E->>K: sendPrompt(prompt, delimiters)
-    K->>D: click DeepThink (if off) → verify
-    K->>D: click Search (if off) → verify
-    K->>D: type prompt
-    K->>D: click send
-    Note over K: capture streamUrl
-    D-->>K: reasoning stream (firstMsg, reasoning)
-    D-->>K: answer stream (answerStarted, answer)
-    D-->>K: stream stabilizes (replyDone)
-    Note over K: check streamUrl unchanged
-    K->>K: extract delimited content
-    K-->>E: {content, raw, trace}
+    E->>R: sendMessage({action: sendPrompt, provider: "qwen", prompt})
+    R->>P: DSC_PROVIDERS["qwen"].sendPrompt(prompt, delimiters)
+    P->>D: dismissAgeModal()<br/>sleep 1s<br/>type prompt + delimiter instruction<br/>sleep 1.5s<br/>click send
+    Note over P: capture streamUrl<br/>poll for START_QWEN_REPLY / END_QWEN_REPLY
+    D-->>P: reply streams (with required delimiters)
+    P->>P: extract between delimiters
+    P-->>R: {content, raw, url, source, trace}
+    R-->>E: {content, raw, url, source, trace}
 
     loop during prompt (fire-and-forget)
-        K->>E: dsc_phase
+        P->>E: dsc_phase
         E->>S: POST /progress
         S->>S: log '~ <id8> <phase>'
     end
 
-    E->>S: POST /reply {requestId, status:'ok', content}
+    E->>S: POST /reply {requestId, status:'ok', content, url}
     S->>S: resolve pending /chat promise
-    S-->>C: {content, chat, elapsedMs}
+    S-->>C: {content, chat, url, elapsedMs}
     S->>S: pump() (no queued job, done)
 ```
 
-Six things worth naming from the sequence:
+Seven things worth naming from the sequence:
 
-**`ensureChat` runs per source, before `sendPrompt`.** This is the retry-reuse mechanism. On the first attempt for `src-alpha`, `ensureChat` navigates to `/` for a fresh chat and DeepSeek auto-names it from the first message. On retry, `ensureChat` finds the existing chat via sidebar fuzzy match and clicks it. The LLM sees its own prior attempt in context. See [decision 3](#3-one-chat-per-source).
+**`getWorkTab(provider)` runs before any message dispatch.** This is the multi-provider tab-routing. When `provider` is specified, `getWorkTab` queries that provider's domain directly (`chrome.tabs.query({ url: 'https://chat.qwen.ai/*' })`) and bypasses the pinned `workTabId`. This is what makes "both DeepSeek and Qwen tabs are open, route to Qwen" work correctly. See [decision 4](#4-sticky-work-tab-with-provider-scoped-override).
 
-**DeepThink and Search are verified before the prompt is typed, not after.** If they can't be enabled, the request fails with `deepthink_enable_failed` or `search_enable_failed` — the prompt is never sent with them off. This is the only hard requirement that's enforced structurally rather than by convention. See [the aggregator's spec](../README.md#what-this-is) for why these must be on.
+**`ensureChat` runs per source, before `sendPrompt`, on the provider's own terms.** For DeepSeek, this means "find in sidebar, else navigate to `/`." For Qwen, this means "dismiss age modal, wait for input, return fresh." Each provider decides what "ensure the chat is ready" means — the router doesn't impose a shared meaning. See [decision 3](#3-one-chat-per-source-url-primary-identity).
 
-**`streamUrl` is captured at `firstMsg`, checked at `replyDone`.** The tab can navigate mid-stream — the user clicking around, DeepSeek auto-redirecting, the wizard's own nav. If the URL changed, the read is discarded as `user_navigated`. Without this guard, the completion detector locks onto whatever assistant message is on whatever page happens to be showing. See [the two streaming guards](#the-two-streaming-guards).
+**`sendPrompt` is provider-owned, start to finish.** The provider decides: whether to append a delimiter instruction to the caller's prompt (Qwen does, DeepSeek doesn't), how long to pause between actions (Qwen 1000-1500ms, DeepSeek near-instant), what constitutes "done" (DeepSeek waits for `.ds-assistant-message-main-content` to stabilize, Qwen waits for both delimiters to appear), and what to extract (DeepSeek uses `.ds-assistant-message-main-content`, Qwen uses the strict-delimiter slice). The router doesn't know any of these details.
 
-**Progress fires in the background, in parallel with the main loop.** `dsc_phase` messages don't block `sendPrompt`. They're forwarded by a separate `chrome.runtime.onMessage` listener in background.js. If the server is slow or the `/progress` endpoint is missing, the prompt still completes normally — the progress stream is entirely best-effort. See [decision 6's corollary](#the-two-streaming-guards) for why this matters.
+**`streamUrl` is captured by the provider at "first assistant message" time, checked at "reply done" time.** Each provider implements this independently. For DeepSeek it's captured when the first assistant message block appears; for Qwen it's captured when the first assistant message fires. If the URL changed by the time the reply finished, the read is discarded as `user_navigated`. Without this, the completion detector locks onto whatever assistant message is on whatever page happens to be showing. See [the two streaming guards](#the-two-streaming-guards).
 
-**`/reply` resolves the caller's promise; `pump()` advances the queue.** These are two separate operations inside the same HTTP handler. Resolve happens first, so the caller gets its content even if the next `pump()` throws. This is deliberate — a caller whose `/chat` succeeded shouldn't see a 500 because the *next* job's enqueue went wrong.
+**Progress fires in the background, in parallel with the main loop.** `dsc_phase` messages don't block `sendPrompt`. Each provider emits phase messages (DeepSeek's are `probe`/`waitInput`/`toggleDeepthink`/etc.; Qwen's are `step_1_dismiss_modal`/`step_2_find_input`/etc.), background forwards them to `/progress`, and the main sendPrompt loop doesn't care. Phase names are provider-specific; the `/progress` endpoint accepts any string.
 
-**The caller's connection stays open the entire time.** No heartbeats, no keep-alive trickery, no chunked encoding. It's a plain HTTP request that doesn't return for 4-12 seconds (typical) or 90 seconds (timeout). Node's `http.createServer` handles this fine, but a reverse proxy in front of it wouldn't. That's why [protocol.md#constraints](protocol.md#constraints) says "loopback only" — the architecture assumes no intermediary.
+**`/reply` resolves the caller's promise; `pump()` advances the queue.** These are two separate operations inside the same HTTP handler. Resolve happens first, so the caller gets its content even if the next `pump()` throws.
+
+**The caller's connection stays open the entire time.** No heartbeats, no keep-alive trickery, no chunked encoding. It's a plain HTTP request that doesn't return for 4-15 seconds (typical — Qwen is a bit slower than DeepSeek due to pacing) or 90 seconds (timeout). Node's `http.createServer` handles this fine, but a reverse proxy in front of it wouldn't. That's why [protocol.md#constraints](protocol.md#constraints) says "loopback only."
 
 ## Module boundaries
 
-Six files in the extension, two in the server package, one shared. Every module has a rule about what it can import and what it owns. Bypassing a rule breaks a guarantee.
+Nine files in the extension, two providers, three server-side modules. Every module has a rule about what it can import and what it owns. Bypassing a rule breaks a guarantee.
 
 ```
 deepseek-connect/
-├── shared.js           constants, DSC.ERR, DSC.MSG, DSC.VERSION
-├── selectors.js        tiered selector resolution, DSC_SELECTORS global
-├── content.js          DOM manipulation (the only file with querySelector)
-├── background.js       poll loop, message router, sticky tab (the only file with chrome.tabs)
-├── popup.html          status UI
-├── popup.js            config + status (reads chrome.storage.local)
-├── manifest.json       permissions, content_scripts, service_worker
+├── shared.js               constants, DSC.PROVIDER_DOMAINS, DSC.providerForUrl
+├── selectors.js            DeepSeek-specific selector registry (not provider-neutral)
+├── content.js              router — the ONLY file that dispatches by provider name
+├── providers/
+│   ├── deepseek.js         DeepSeek DOM manipulation
+│   └── qwen.js             Qwen DOM manipulation
+├── background.js           poll loop, provider-aware tab routing, message router
+├── popup.html              status UI
+├── popup.js                config + status (reads chrome.storage.local)
+├── manifest.json           permissions, content_scripts, service_worker
 └── src/
-    ├── server.js       HTTP server (the only file with require('node:http'))
-    ├── client.js       HTTP client (the only file callers require)
-    └── errors.js       taxonomy (the only file both server and client import)
+    ├── server.js           HTTP server (the only file with require('node:http'))
+    ├── client.js           HTTP client (the only file callers require)
+    └── errors.js           taxonomy (the only file both server and client import)
 ```
 
 ### `shared.js` — the constant surface
 
 Loaded by `background.js` via `importScripts('shared.js')` and by `content.js` as a content-script dependency. Both contexts get `globalThis.DSC`.
 
-The rule: **no logic, no DOM, no chrome APIs.** It's a constants file with a self-executing wrapper (`(function () { ... })()`) so it doesn't pollute the global scope with anything except `DSC`. Every constant that both background and content need lives here. Every constant that only one side needs lives in that side's file.
+The rule: **no logic beyond `providerForUrl`, no DOM, no chrome APIs.** It's a constants file with three small exceptions that earn their keep:
 
-**`DSC.ERR` is a mirror of `src/errors.js`'s `CODES`**, not the source of truth. The duplication is a Manifest V3 consequence — `shared.js` is a classic script (no `import`), and content scripts can't `require()` the Node module. The duplication is checked by a test that asserts the two maps agree (see [error-codes.md#adding-a-new-code](error-codes.md#adding-a-new-code)). There's one stale entry today (`DEEPTHINK_OFF`) that isn't in `CODES` — tracked as a cleanup, not a bug.
+1. **`DSC.PROVIDER_DOMAINS`** — the single source of truth for URL → provider mapping. `background.js` reads it twice (in `getWorkTab` and in `register`), and `DSC.providerForUrl(url)` uses it. Adding a provider means adding one line here, plus the manifest and the provider file itself. There is no other place to update.
 
-### `selectors.js` — the DOM contract
+2. **`DSC.providerForUrl(url)`** — provider name from a URL, or null if unsupported. Three lines of logic, used by both callers in `background.js`. This is the only place URL string parsing for provider detection exists.
 
-Loaded after `shared.js` and before `content.js`. Exposes `globalThis.DSC_SELECTORS` with `resolve(name)` and `probeDom()`.
+3. **The `PROVIDER CONTRACT` comment block** — a docstring, not code. Documents the four-method interface and the three registration points. `content.js`'s router references this block from the top of its IIFE. If you're adding a provider, this comment is the first thing to read.
 
-The rule: **the only file with selector strings.** Every `querySelector` in `content.js` for a stable DeepSeek element goes through `DSC_SELECTORS.resolve(name)`, which tries a tiered fallback list. If `content.js` has a raw selector string, it's a bug — that string belongs in `selectors.js` where the next DOM change can update it in one place.
+Every other constant that both background and content need lives here. Every constant that only one side needs lives in that side's file.
 
-The tiers are ordered by fragility: text-content match first (most stable), structural walk second (stable but slower), `aria-` attributes third (usually stable), build-hashed class names never. See [decision 7](#7-structural-sidebar-walk-over-class-names) for the reasoning, and [selector-maintenance.md](selector-maintenance.md) for the per-selector table.
+**`DSC.ERR` is a mirror of `src/errors.js`'s `CODES`**, not the source of truth. The duplication is a Manifest V3 consequence — `shared.js` is a classic script (no `import`), and content scripts can't `require()` the Node module. The duplication is checked by a test that asserts the two maps agree (see [error-codes.md#adding-a-new-code](error-codes.md#adding-a-new-code)).
 
-### `content.js` — the DOM owner
+### `selectors.js` — DeepSeek's DOM contract
 
-The meat. ~900 lines. Everything that touches the DeepSeek page lives here.
+Loaded after `shared.js` and before the provider modules. Exposes `globalThis.DSC_SELECTORS` with `resolve(name)` and `probeDom()`.
 
-The rule: **content.js owns the DOM; nothing else does.** Background doesn't query the DOM (no `chrome.scripting.executeScript` for reads — only for re-injection on crash). Server doesn't know DOM exists. Selectors.js defines what to look for; content.js is the only file that looks.
+The rule: **DeepSeek-specific. Not shared infrastructure.** Despite living at the repo root, this file is DeepSeek's, not a neutral registry. The header comment says so explicitly. Qwen declares its own selectors inline and ignores this file entirely.
 
-The five phases inside `sendPrompt` are the load-bearing structure:
+The reason is historical and pragmatic: DeepSeek was the first provider, and when it was the only provider, `selectors.js` was the obvious place for selectors. When Qwen was added, copying the tier-list structure into `providers/qwen.js` was faster than abstracting the tier-list concept — and the abstraction (a `selector-tiers.js` shared module with per-provider config) hasn't been justified yet because two providers don't justify it. If a third provider arrives and needs the same tier-list pattern, that's the moment to extract the genuinely shared part.
 
-1. **probe** — resolve every required selector; fail `dom_drift` if any missing
-2. **ensureChat** (called by background, not sendPrompt) — sidebar match or fresh nav
-3. **toggle checks** — DeepThink and Search verified on; fail `deepthink_enable_failed` / `search_enable_failed` if not
-4. **type and send** — set input value, click send
-5. **stream and extract** — wait loop, capture `streamUrl`, extract on completion
+For now: DeepSeek uses `DSC_SELECTORS`, Qwen doesn't. When a provider has selectors, they live in `providers/<name>.js`.
 
-A sixth concern — `dsc_phase` progress messages — runs concurrently via `chrome.runtime.sendMessage`. Content emits; background forwards to `/progress`; the main sendPrompt loop doesn't care.
+### `content.js` — the router
 
-### `background.js` — the router
+~40 lines. The only file that dispatches by provider name.
 
-~400 lines. The service worker. Everything that talks to `chrome.tabs`, `chrome.storage`, and `fetch` lives here.
+The rule: **the router is deliberately blind.** It reads `msg.provider || 'deepseek'`, looks up `globalThis.DSC_PROVIDERS[providerName]`, and calls one of four methods. It does not check whether the provider is a class or an object, doesn't have any fallback logic, doesn't know what `sendPrompt` returns.
 
-The rule: **background owns tab lifecycle, not tab content.** It picks the work tab (and pins it), navigates it, re-injects content scripts when they crash, and forwards messages to and from the content script. It never reads the DOM directly. If it needs to know something about the page, it asks `content.js` via `sendToTab` and gets a structured response.
+```js
+const providerName = msg.provider || 'deepseek';
+const provider = (globalThis.DSC_PROVIDERS && globalThis.DSC_PROVIDERS[providerName]);
+if (!provider) {
+  return sendResponse({ error: 'no_provider_loaded', provider: providerName, hostname: location.hostname });
+}
+if (msg.action === DSC.MSG.SEND_PROMPT) {
+  return sendResponse(await provider.sendPrompt(msg.prompt, msg.delimiters));
+}
+// ...
+```
 
-The `getWorkTab()` function is the load-bearing piece. It reads `chrome.storage.local.workTabId` first (sticky), falls back to picking a fresh tab if the stored ID is stale (tab closed, URL changed to non-DeepSeek, browser restarted), and hard-fails if a caller-supplied `targetTabId` doesn't exist (no silent fallback to a different tab — see [decision 4](#4-sticky-work-tab-over-targettabid)).
+The `no_provider_loaded` error is what surfaces when a provider module failed to load (usually a `manifest.json` registration bug — see [providers.md#the-registration-checklist](providers.md#the-registration-checklist)). It's a distinctive error because it means "the router received a request it can't dispatch," which only happens when the provider's content script registration is broken.
 
-The `dsc_phase` listener is the second load-bearing piece. It's a separate `chrome.runtime.onMessage.addListener` that fires `fetch(/progress)` on every phase message from content. It runs in parallel with the main `handleNext` loop and doesn't block. This is what makes the live progress stream work without slowing the prompt down.
+The router also emits a `[dsc:router:diag]` console.debug at load time, reporting the URL, hostname, frame context, and registered providers. That diagnostic is what F12 shows when someone asks "is the provider loaded on this tab?"
+
+### `providers/deepseek.js` — DeepSeek's DOM logic
+
+~600 lines wrapped in an IIFE. The pre-refactor `content.js` logic, unchanged in behavior. Registers itself into `globalThis.DSC_PROVIDERS['deepseek']` at the end of the IIFE.
+
+The rule: **self-contained.** No imports from other files. Uses `globalThis.DSC_SELECTORS` (which it can, because `selectors.js` loads before it) but declares its own helpers for everything else (`visible`, `waitFor`, `findByText`, `findInput`, `findSendButton`, etc.).
+
+Implements the four-method contract with DeepSeek-specific concerns:
+
+- **`ensureChat`** — sidebar walk from "New chat" anchor, or navigate to `/` for fresh. Returns `{ok, existing, mode, debug}` on success, or `{ok: false, needNewChat: true}` to signal "background should navigate."
+- **`sendPrompt`** — probes required selectors, enables DeepThink + Search, types prompt, clicks send, watches `.ds-assistant-message-main-content` until stable, extracts (delimiter → fence → raw fallback), returns `{content, raw, url, source, trace}`.
+- **`checkState`** — returns input/DeepThink/Search state.
+- **`resetChat`** — delegates to `ensureChat`.
+
+### `providers/qwen.js` — Qwen's DOM logic
+
+~230 lines, no IIFE wrapper (registers directly). Self-contained to the point of bundling its own helpers rather than sharing any with DeepSeek.
+
+The rule: **self-contained, even more strictly than DeepSeek.** The Qwen provider doesn't use `globalThis.DSC_SELECTORS` — it has inline `selectors: { input, sendButton, assistantMessages }` functions. This is deliberate: sharing selectors between providers is a coupling that breaks when one provider redesigns. Two providers, two selector strategies, zero shared assumptions.
+
+Three Qwen-specific concerns that don't exist in DeepSeek:
+
+- **`dismissAgeModal()`** runs at the top of every action (`ensureChat`, `sendPrompt`, `checkState`). Qwen shows a "confirm your age" modal on first use per session; the modal blocks the input, so failing to dismiss it produces `input_not_found` even though the input is technically present.
+- **Anti-bot pacing** — 1000-1500ms `sleep()` between every action. Qwen's React app drops fast send clicks and can trigger bot defense.
+- **Strict delimiter enforcement** — Qwen's completion detector **only** breaks when both `START_QWEN_REPLY` and `END_QWEN_REPLY` appear in the DOM. The provider appends a delimiter instruction to every prompt and fails with `invalid_response_format` if the delimiters are missing at the end. This eliminates the "Thinking..." false positive that a DeepSeek-style stability detector would produce on Qwen.
+
+See [providers.md#case-study-qwen](providers.md#case-study-qwen) for the full reasoning behind each.
+
+### `background.js` — the router and the tab manager
+
+~450 lines. The service worker. Everything that talks to `chrome.tabs`, `chrome.storage`, and `fetch` lives here.
+
+The rule: **background owns tab lifecycle and provider routing, not tab content.** It picks the work tab (provider-aware, see [decision 4](#4-sticky-work-tab-with-provider-scoped-override)), navigates it, re-injects content scripts when they crash, and forwards messages to and from the content script. It never reads the DOM directly.
+
+Two load-bearing pieces for the multi-provider behavior:
+
+**`getWorkTab(targetTabId, provider)`** — provider-aware tab selection. When `provider` is specified, queries that provider's domain directly via `chrome.tabs.query({url: DSC.PROVIDER_DOMAINS[provider] + '*'})` and returns the first non-active match. Bypasses the pinned `workTabId` entirely — because if the user has a DeepSeek tab pinned and a Qwen request arrives, reusing the pinned DeepSeek tab would type Qwen's DOM logic into DeepSeek's page and fail. When `provider` is unset (v0.1.x callers), preserves the sticky behavior: pinned tab first, else first non-active across all supported domains.
+
+**`register()`** — the `/hello` body includes a per-tab `provider` field so callers can see which provider each tab belongs to without parsing URLs. The `provider` field comes from `DSC.providerForUrl(t.url)`. This is what makes `/tabs` usable for debugging multi-provider state.
+
+The `dsc_phase` listener is a separate `chrome.runtime.onMessage.addListener` that fires `fetch(/progress)` on every phase message from any provider. It runs in parallel with the main `handleNext` loop and doesn't block. This is what makes the live progress stream work without slowing the prompt down.
 
 ### `src/server.js` — the queue
 
-~500 lines. The HTTP server. Everything that binds a socket, reads a request, writes a response lives here.
+~450 lines. The HTTP server. Everything that binds a socket, reads a request, writes a response lives here.
 
-The rule: **server.js owns the queue, not the request semantics.** It doesn't know what a "prompt" is (it has a `prompt` field but treats it as opaque text). It doesn't know what "delimiters" are (again, opaque). It knows how to enqueue an entry, how to dispatch it via `/next`, how to resolve it via `/reply`, how to hold a long-poll for 30s, and how to fail cleanly on shutdown. The semantics of the fields belong to `content.js` and `background.js`.
+The rule: **server.js owns the queue, not the request semantics.** It doesn't know what a "prompt" is, what "delimiters" are, or what "provider" means — all three are opaque fields that get threaded from the HTTP request through `enqueue()` → `pump()` → `/next` → `/reply` → the caller's response. The semantics belong to the provider.
 
-The three collections — `queue[]`, `waiting[]`, `inFlight` Map — are the entire state. `pump()` is the only place jobs move between them. `enqueue()` is the only place jobs enter `queue[]`. `/reply` is the only place jobs exit `inFlight`. See [protocol.md#queue-state-machine](protocol.md#queue-state-machine) for the state diagram and the "extension dies mid-flight" hole (which is real and documented as a v0.1 limitation).
+The three collections — `queue[]`, `waiting[]`, `inFlight` Map — are the entire state. `pump()` is the only place jobs move between them. `enqueue()` is the only place jobs enter `queue[]`. `/reply` is the only place jobs exit `inFlight`. See [protocol.md#queue-state-machine](protocol.md#queue-state-machine) for the state diagram and the "extension dies mid-flight" hole (which is real and documented as a v0.2.0 limitation).
+
+**Provider threading** is a one-line addition to `enqueue`'s entry object (`provider: req.provider || 'deepseek'`) and a one-line addition to `pump`'s `/next` payload. That's the entire server-side multi-provider surface — ~4 lines of code total. If server.js ever grows provider-specific logic beyond those 4 lines, that's a design bug — provider details should not reach the queue layer.
 
 ### `src/client.js` — the caller's interface
 
-~150 lines. Zero-dependency HTTP client.
+~180 lines. Zero-dependency HTTP client.
 
-The rule: **client.js doesn't retry.** Every method throws `DSCError` on non-2xx and returns the parsed body on 2xx. The caller's retry policy (see [integration-guide.md#sendwithretry](integration-guide.md#sendwithretry)) lives in the caller, not here. A client that retried silently would hide rate-limit conditions and make the caller's attempt-counting wrong.
+The rule: **client.js doesn't retry, and it threads `provider` through.** Every method throws `DSCError` on non-2xx and returns the parsed body on 2xx. `chat()` and `open()` accept a `provider` parameter and forward it in the request body. The `provider` field defaults to nothing on the client side — if the caller omits it, the server defaults to `'deepseek'`, which preserves v0.1.x caller behavior. A client that retried silently would hide rate-limit conditions and make the caller's attempt-counting wrong. A client that defaulted provider explicitly would change what old callers see — better to leave the default to the server, which has the single source of truth.
 
 ### `src/errors.js` — the shared taxonomy
 
-~180 lines. `CODES`, `META`, `DSCError` class, four helpers. Imported by both `src/server.js` and `src/client.js`, and mirrored (not imported) in `shared.js`.
+~200 lines. `CODES`, `META`, `DSCError` class, four helpers. Imported by both `src/server.js` and `src/client.js`, and mirrored (not imported) in `shared.js`.
 
-The rule: **errors.js is the single source of truth for codes.** A code that isn't in `CODES` isn't a code. A code that's in `CODES` has metadata in `META` (verified at module load). The `DSCError` class is what `client.js` throws and what `server.js` serializes to HTTP. See [error-codes.md](error-codes.md) for the full table.
+The rule: **errors.js is the single source of truth for codes.** 21 codes as of v0.2.0, including the multi-provider-specific `INVALID_RESPONSE_FORMAT`. A code that isn't in `CODES` isn't a code — providers that raise unregistered codes get collapsed to `internal_error` by the client, which loses the wizard's ability to switch on them. When Qwen was added and needed `invalid_response_format`, the code was registered in `errors.js` in the same commit as the provider, not raised ad-hoc from `qwen.js`. See [error-codes.md](error-codes.md).
 
-## The seven load-bearing decisions
+## The eight load-bearing decisions
 
-Each decision below shapes multiple modules. Reversing any of them requires understanding the failure mode it prevents, and the ADR that pins it. If you're about to propose "let's simplify this by doing X instead," find the decision X would violate and read its rationale first.
+Each decision below shapes multiple modules. Reversing any of them requires understanding the failure mode it prevents, and the ADR that pins it.
 
 ### 1. Long-poll over WebSockets
 
@@ -216,165 +278,196 @@ Each decision below shapes multiple modules. Reversing any of them requires unde
 
 1. **Service worker lifecycle.** MV3 service workers can be killed at any moment after ~30 seconds of inactivity. A WebSocket connection's `close` event fires when the worker dies, but reopening requires re-establishing the handshake, re-authenticating, and re-registering with the server. That's ~50 lines of reconnect logic to write and test.
 2. **Debug surface.** A long-poll failure produces a `curl` command. A WebSocket failure produces a browser DevTools network tab entry with a binary protocol frame that's hard to inspect. When the batch wizard hangs at 2 AM, you want `curl`.
-3. **Strict alternation.** The flow is `/next` → extension works → `/reply` → `/next` → extension works → `/reply`. There's never a moment where the server needs to push a second message before the first completes. A polling model with a hold is functionally identical to a push model for this workflow.
-4. **No libraries.** Node's `http` module and the browser's `fetch` API both handle long-poll natively. WebSockets need `ws` on the Node side (a dependency) and careful frame parsing on both sides.
+3. **Strict alternation.** The flow is `/next` → extension works → `/reply` → `/next` → extension works → `/reply`. There's never a moment where the server needs to push a second message before the first completes.
+4. **No libraries.** Node's `http` module and the browser's `fetch` API both handle long-poll natively. WebSockets need `ws` on the Node side.
 
-**Consequence:** The `waiting[]` array in `src/server.js` and the `LONG_POLL_MS = 30000` constant. The extension's `pollLoop` calls `GET /next`, handles the `next` action or the `idle` timeout, and immediately re-polls. The 30s hold is the compromise between "too chatty" (10s hold → 3x the requests) and "too slow to first job" (60s hold → a fresh job waits up to a minute for the poll to return). See [ADR 0001](adr/0001-use-long-poll-over-websocket.md).
+**Consequence:** The `waiting[]` array in `src/server.js` and the `LONG_POLL_MS = 30000` constant. The extension's `pollLoop` calls `GET /next`, handles the `next` action or the `idle` timeout, and immediately re-polls. See [ADR 0001](adr/0001-use-long-poll-over-websocket.md).
 
 ### 2. Real Chrome over Puppeteer
 
 **Decision:** Drive the user's already-logged-in Chrome/Brave tab via a load-unpacked extension. No Puppeteer, no headless browser, no scripted login.
 
-**Context:** The goal is to use DeepSeek as a free LLM endpoint from a batch wizard. The two ways to automate a web page are: (a) drive a fresh browser instance from a script (Puppeteer / Playwright), (b) inject into an existing browser tab (extension).
+**Context:** The goal is to use a free LLM endpoint from a batch wizard. The two ways to automate a web page are: (a) drive a fresh browser instance from a script (Puppeteer / Playwright), (b) inject into an existing browser tab (extension).
 
-**Alternative considered:** Puppeteer with `puppeteer-extra-plugin-stealth`. This is what the aggregator currently uses for its *scrapers* — but DeepSeek's anti-automation is more aggressive than typical sites. Three failure modes pushed us off Puppeteer:
+**Alternative considered:** Puppeteer with `puppeteer-extra-plugin-stealth`. DeepSeek and Qwen both rate-limit headless sessions aggressively, detect headless fingerprints even with stealth plugins, and require real auth cookies that a fresh profile doesn't have. Three failure modes pushed off Puppeteer:
 
-1. **Headless fingerprinting.** DeepSeek rate-limits headless sessions aggressively. Even with stealth plugins, the fingerprint — canvas, WebGL renderer, audio context, plugin list — is detectable on a fresh profile. The rate limits go from "one prompt per 5 seconds" to "one prompt per 10 minutes" or "account banned."
-2. **Credential handling.** A Puppeteer-driven session starts with an empty profile. To use the user's actual DeepSeek account, we'd need to script the login flow — email, password, possibly 2FA — which means storing credentials somewhere the extension doesn't. That's a security regression with no compensating benefit.
-3. **Session continuity.** Cookies from the extension-driven tab persist across runs because they're the same Chrome profile. A Puppeteer session that closes loses them (unless you persist the profile directory, which is another complication).
+1. **Headless fingerprinting.** DeepSeek and Qwen both fingerprint canvas, WebGL renderer, audio context, plugin list. Even with stealth, a fresh profile is detectable. Rate limits go from "one prompt per 5 seconds" to "one prompt per 10 minutes" or "account banned."
+2. **Credential handling.** A Puppeteer-driven session starts with an empty profile. To use the user's actual account, we'd script the login — email, password, possibly 2FA — which means storing credentials somewhere the extension doesn't. Security regression with no compensating benefit.
+3. **Session continuity.** Cookies from the extension-driven tab persist across runs because it's the same Chrome profile. A Puppeteer session that closes loses them.
 
-**Consequence:** The whole architecture. The wizard *runs* the server; the user *loads* the extension; the extension *talks* to the server. Credentials never leave the user's Chrome profile. DeepSeek sees a real browser with real cookies making real requests. The cost is that the user must install the extension (one-time) and keep a DeepSeek tab open (per-batch). That cost is small compared to Puppeteer's rate-limit ceiling and login fragility. See [ADR 0002](adr/0002-real-chrome-over-puppeteer.md).
+**Consequence:** The whole architecture. The wizard *runs* the server; the user *loads* the extension; the extension *talks* to the server. Credentials never leave the user's Chrome profile. See [ADR 0002](adr/0002-real-chrome-over-puppeteer.md).
 
-### 3. One chat per source
+### 3. One chat per source, URL-primary identity
 
-**Decision:** Each source gets its own DeepSeek chat. The chat name matches the source name. On retry, the same chat is reopened so the LLM sees its prior attempt in context.
+**Decision:** Each source gets its own chat. On retry, the same chat is reopened so the LLM sees its prior attempt in context. The primary identity mechanism is the **chat URL** (the `/a/chat/s/<uuid>` for DeepSeek, `/c/<uuid>` for Qwen), persisted by the caller and passed back via `/open { chatName, url }`. The sidebar fuzzy-match walk is a **fallback**, used only when the URL isn't available (first send per source, or a fresh run directory).
 
-**Context:** DeepSeek's chat is stateful — the LLM sees every prior turn in the current conversation. For a batch wizard, this matters: if source A's extractor fails verification and the wizard refines the prompt, the refined prompt should land in the *same* chat so the LLM can see "here's what I tried last time, here's why it failed, now fix it."
+**Context:** DeepSeek's chat is stateful — the LLM sees every prior turn in the current conversation. For a batch wizard, if source A's extractor fails verification and the wizard refines the prompt, the refined prompt should land in the same chat so the LLM can see "here's what I tried last time, here's why it failed, now fix it."
 
-**Alternative considered:** One chat for the whole batch, prepend every prompt with a "the previous source was X, the current source is Y" disambiguation header. Rejected for two reasons:
+**The original design used sidebar fuzzy-match as the primary identity.** The chat name was embedded in the prompt's first line, DeepSeek auto-named the chat from that, and `findChatInSidebar(name)` found it via title substring match. **This broke in testing.** DeepSeek *paraphrases* the first message into a title. A prompt starting with `reuse-test-1754824017022 — reply with just: alpha` became a chat titled "Alpha reply." The `reuse-test-175...` prefix was completely dropped. No sidebar fuzzy match could find it. Every retry opened a fresh chat, and the LLM never saw its prior turn.
 
-1. **Context window fills up.** A 76-source batch would need 76 rounds of exchange in one chat. DeepSeek's context window is large but not infinite, and even if it fits, the LLM's attention degrades on long contexts. The 60th source's prompt gets worse quality than the 1st's.
-2. **Cross-contamination.** The LLM sees the previous source's extractor code and, when asked for the new source's extractor, sometimes copies patterns from the previous site's DOM structure. This produces extractors that reference selectors that don't exist on the new site — silent bugs that pass verification by coincidence.
+Qwen has the same behavior — its titles are paraphrases too.
 
-**Consequence:** The `ensureChat` phase, the `/open` route, the sticky `chatName` field threaded through `/chat`, `/next`, `/reply`. The naming convention: `chatName` = source name. DeepSeek auto-names the chat from the first message, and the batch prompt's first line embeds the source name, so the auto-generated title contains it. On retry, the sidebar fuzzy match (`findChatInSidebar`) finds the chat by name. See [decision 7](#7-structural-sidebar-walk-over-class-names) for how the sidebar match actually works, and [ADR 0003](adr/0003-one-chat-per-source.md) for the alternatives considered (renaming via three-dot menu, URL-based lookup).
+**The URL-based fix:** Every provider's `sendPrompt` returns the actual chat URL in its response. The wizard persists this in `chat-map.json`. On retry, `POST /open { chatName, url }` navigates directly via `chrome.tabs.update({ url })`, skips the sidebar walk entirely, and the LLM sees its prior turn. This was proven end-to-end after the fix: the second prompt to the same chat correctly referenced the first turn's content.
 
-**Sub-consequence: rename is deferred.** DeepSeek's three-dot menu rename flow is fragile (menu trigger, rename menu item, rename input, submit — four selectors, each breakable). For v0.1 we rely on auto-naming instead. The auto-name is deterministic (first line of the first message), so it contains the source name by construction. If the batch prompt changes such that the first line isn't the source name, fuzzy match could miss — that's a prompt-construction bug, not a chat-lifecycle bug, and the fix is to keep the source name in the first line.
+**Consequence:** The `url` field on every `/chat` response and every `/reply` body. The `targetUrl` threading through `enqueue` → `pump` → `/next` → `handleNext`. The `if (work.targetUrl)` branch in `handleNext` that navigates directly and skips `ensureChat`. The sidebar walk is still present as `ensureChat`'s fallback (for the first send per source, and for callers that didn't persist the URL), but it's no longer the primary mechanism. See [ADR 0003](adr/0003-one-chat-per-source.md) and its amendment by [ADR 0008](adr/0008-multi-provider-plugin-architecture.md).
 
-### 4. Sticky work tab over targetTabId
+### 4. Sticky work tab with provider-scoped override
 
-**Decision:** The extension pins exactly one DeepSeek tab in `chrome.storage.local.workTabId` on first use and reuses it for the entire session. Callers do not supply tab IDs. If a stale `targetTabId` is passed (deprecated), it's hard-failed rather than silently falling back.
+**Decision:** The extension pins exactly one tab in `chrome.storage.local.workTabId` on first use. **When a request specifies a provider, the extension queries that provider's domain directly and bypasses the pin.** When no provider is specified (v0.1.x callers), the pin is used.
 
-**Context:** With multiple DeepSeek tabs open (which happens — the user might be chatting in one while the batch runs in another), the extension needs to pick one for automation. It must be consistent across requests, or different requests would land in different tabs.
+**Context:** With multiple provider tabs open — which happens, the user might be chatting in a DeepSeek tab while the batch runs against Qwen — the extension needs to route each request to the right tab.
 
-**Alternative considered:** Caller supplies `targetTabId` on every `/chat`. Rejected because tab IDs are not stable across `chrome.tabs` interactions — they change on tab close, on browser restart, on some reload paths. A caller that captured a `targetTabId` once and reused it would eventually point at a different tab (or no tab), and either type into the wrong chat or fail with `input_not_found`. Either way the caller has to capture a fresh `targetTabId` before every request, which means querying `/tabs` before every `/chat`, which is one extra round-trip per prompt — ~76 extra round-trips per batch. And even then, the caller and the extension could disagree on which tab is "the work tab" if the caller cached.
+**Alternative considered:** Extend the pinned tab to a per-provider map `{deepseek: 123, qwen: 456}`. Rejected because the persistence is fragile in a different way — when a Qwen tab closes and reopens, its new tab ID is different, and the map needs to be invalidated for that provider. The domain-query approach is simpler: `chrome.tabs.query({url: 'https://chat.qwen.ai/*'})` returns whatever Qwen tabs are currently open, and if there's exactly one, use it. No persistence needed for the provider-scoped path.
 
-**Consequence:** The `getWorkTab()` function in background.js:
+**Consequence:** `getWorkTab(targetTabId, provider)` in `background.js` has three branches:
 
-1. Try `chrome.storage.local.workTabId`. If the tab exists and has a `chat.deepseek.com` URL, use it.
-2. If the stored ID is stale, clear it and pick a fresh one.
-3. Pick from `chrome.tabs.query({ url: 'https://chat.deepseek.com/*' })` — prefer the non-active tab (the one the user isn't reading), fall back to the first.
-4. Store the picked ID. Every subsequent request in this session reuses it.
+1. `targetTabId` specified → validate it against the requested provider (or against any supported URL if no provider), hard-fail if mismatched.
+2. `provider` specified, no `targetTabId` → query that provider's domain, return first non-active match, hard-fail with `no_work_tab` if none.
+3. Neither → existing sticky behavior: check `workTabId` in storage, pick from all supported domains if stale, cache the pick.
 
-The stale-tab case (user closed the work tab) produces `input_not_found` rather than silent fallback. This is deliberate: silent fallback to a *different* DeepSeek tab would type into a chat the user is actively reading, which is exactly the "wait, why did this text appear in my chat" bug that decision 4 exists to prevent. Failing loudly is better.
-
-The deprecated `targetTabId` path remains for backward compatibility but hard-fails if the tab doesn't exist. See [ADR 0004](adr/0004-sticky-work-tab-over-target-tab-id.md) for the failure cases considered.
+This preserves the v0.1.x behavior for existing callers (they don't send provider, they get sticky-tab), while adding provider-scoped routing for new callers (they send provider, they get the right tab). Both paths work; the distinction is visible in `/tabs`'s `provider` field per tab. See [ADR 0004](adr/0004-sticky-work-tab-over-target-tab-id.md) and its amendment by [ADR 0008](adr/0008-multi-provider-plugin-architecture.md).
 
 ### 5. URL navigation over new-chat button
 
-**Decision:** When `ensureChat` needs a fresh chat, background navigates the work tab to `https://chat.deepseek.com/` via `chrome.tabs.update({ url: '...' })`, not by clicking the "New chat" button.
+**Decision:** When `ensureChat` needs a fresh chat, background navigates the work tab to the provider's origin (`https://chat.deepseek.com/` or `https://chat.qwen.ai/`) via `chrome.tabs.update({ url: ... })`, not by clicking the provider's "New chat" button.
 
-**Context:** DeepSeek has a "New chat" button in the sidebar. Clicking it produces a fresh chat page. Navigating to `/` produces the same result.
+**Context:** Every provider has a "New chat" button in its sidebar. Clicking it produces a fresh chat page. Navigating to `/` produces the same result.
 
-**Alternative considered:** Clicking the button. Rejected because the button is fragile:
+**Alternative considered:** Clicking the button. Rejected because the button is fragile across providers and across redesigns:
 
-1. **Text-based match.** `findByText(document, 'button, a, [role="button"]', /new\s*chat/i)` depends on the button's text content being literally "New chat" (case-insensitive). A rename, a translation, an icon-only redesign, or a "New" prefix all break it.
-2. **Build-hashed classes.** The actual button element on current DeepSeek has classes like `_7b40dad dc1f7bee _4bcc731` — build artifacts, no semantic name. Any selector that relies on the class name breaks on every deploy.
-3. **Sidebar-collapsed state.** When the sidebar is collapsed (narrow window, user preference), the "New chat" button might be hidden inside a hamburger menu or unmounted entirely. This was observed during development — the sidebar is `display:none` with `querySelectorAll` returning zero elements.
-4. **Navigation is atomic.** `chrome.tabs.update({ url: '/' })` either navigates or throws. No state to wait for, no element to find, no "did the click register" ambiguity. The wait for `chrome.tabs.onUpdated` with `status: 'complete'` is the only synchronization point, and it's a browser-level event, not a DOM-level one.
+1. **Text-based match.** `findByText(document, 'button, a, [role="button"]', /new\s*chat/i)` depends on the button's text content being literally "New chat". A rename, a translation, an icon-only redesign, or a "New" prefix all break it.
+2. **Build-hashed classes.** Both DeepSeek's and Qwen's buttons have build-artifact classes with no semantic name. Any selector that relies on the class name breaks on every deploy.
+3. **Sidebar-collapsed state.** When the sidebar is collapsed, the "New chat" button might be hidden inside a hamburger menu or unmounted entirely.
+4. **Navigation is atomic.** `chrome.tabs.update({ url: '/' })` either navigates or throws. No element to find, no ambiguity about whether the click registered.
 
-**Consequence:** `background.js` `handleNext` has a branch:
-
-```js
-if (ensured && ensured.needNewChat) {
-  await chrome.tabs.update(tab.id, { url: 'https://chat.deepseek.com/' });
-  // wait for status: complete, wait 800ms for React to mount
-  // retry ensureChat once
-}
-```
-
-The content script's `ensureChat` returns `{ ok: false, needNewChat: true }` when it can't find a sidebar match and isn't already on `/`. Background does the navigation, then asks content again. Content is the one that knows the DOM; background is the one that knows the tab. The division is clean: content never touches `chrome.tabs`, background never touches the DOM.
-
-See [ADR 0005](adr/0005-url-navigation-over-new-chat-button.md) for the "New chat" button failure modes observed during development.
+**Consequence:** `background.js` `handleNext` has a branch that navigates based on the current tab's origin (not a hardcoded provider URL) — `new URL(tab.url).origin + '/'`. This works for any provider whose fresh chat is at the domain root. If a future provider's fresh-chat URL is not at the root, the provider's `ensureChat` needs to return a `freshChatUrl` field, and background will use that. For DeepSeek and Qwen, the origin is correct. See [ADR 0005](adr/0005-url-navigation-over-new-chat-button.md).
 
 ### 6. Answer-block extraction over whole-message
 
-**Decision:** When extracting the assistant's reply, target `.ds-assistant-message-main-content` specifically — the element that contains only the final answer, not the "Thought for N seconds" reasoning block above it.
+**Decision:** When extracting the assistant's reply, each provider targets its own "answer element" — DeepSeek uses `.ds-assistant-message-main-content`, Qwen uses a strict-delimiter slice of `.qwen-chat-message`. The provider does **not** extract the whole message; the whole message includes reasoning/thinking text that isn't the reply.
 
-**Context:** DeepSeek with DeepThink enabled produces a message with two parts: a collapsible "Thought for X seconds" section that contains the reasoning trace, and a final answer below it. Both are visible; only the answer is the "reply" the caller wants.
+**Context:** DeepSeek with DeepThink enabled produces a message with two parts: a collapsible "Thought for N seconds" section and a final answer below it. Qwen produces a "Thinking..." preamble streamed before the actual answer. Both are visible; only the answer is the reply the caller wants.
 
-**Alternative considered:** Extract the entire `.ds-message` element's text. Rejected because it includes the reasoning, and the reasoning frequently contains fragments that look like the answer — "The user wants me to reply with exactly that content. Just output it verbatim." That's the model's planning, not its output. A caller that got the reasoning as content would see a batch full of broken extractors and blame the LLM.
+**Alternative considered:** Extract the whole `.ds-message` element's text. Rejected because reasoning text frequently contains fragments that look like the answer. The specific bug that motivated this: a "Reply with exactly: console.log(42);" prompt returned 78 characters of "The user wants me to reply with exactly that content. Just output it verbatim." — the model's plan, not its output. Every DeepThink prompt was returning reasoning text as content.
 
-**Alternative considered (second):** Extract the last `.ds-markdown` block. Rejected because on real DeepSeek, `.ds-markdown` is *both* the reasoning block *and* the answer block — same class, different parents. A `last.querySelector('.ds-markdown')` returns the first one (reasoning), because `querySelector` returns the first match in document order, and the reasoning appears before the answer.
+**Alternative considered (second):** Extract the last `.ds-markdown` block. Rejected because on real DeepSeek, `.ds-markdown` is both the reasoning block *and* the answer block — same class, different parents. A `last.querySelector('.ds-markdown')` returns the first one (reasoning).
 
-**The actual fix:** `.ds-assistant-message-main-content` is a dedicated class for the answer element. It's still a `.ds-markdown` inside, but the wrapper is distinguishable. `last.querySelector('.ds-assistant-message-main-content')` returns the answer; if that's not present (mock page, older DeepSeek), fall back to "the last `.ds-markdown` that is *not* inside a `[class*="think"]` parent."
+**Provider-specific solutions:**
 
-**Consequence:** `lastAssistantText()` in content.js has two branches, both non-trivial. The `answerStarted` phase in the stream loop is gated on `.ds-assistant-message-main-content` appearing. The whole "wait through reasoning, then wait for answer, then wait for answer to stabilize" loop is a direct consequence of this decision — without it, the completion detector locks onto the reasoning stream (which finishes first, before the answer starts), and the extracted content is "The user wants me to..." instead of `console.log(42);`. See [ADR 0006](adr/0006-answer-block-extraction-over-whole-message.md) for the false-positive traces that led to this decision.
+DeepSeek uses `.ds-assistant-message-main-content` as the answer wrapper. If it's not present, the fallback is "the last `.ds-markdown` that is not inside a `[class*="think"]` parent." The completion detector gates on the answer block appearing — before that point, `lastAssistantText` returns null and the loop continues.
 
-### 7. Structural sidebar walk over class names
+Qwen is stricter: it requires both `START_QWEN_REPLY` and `END_QWEN_REPLY` to appear in the DOM. If both don't appear within the timeout, the provider fails with `invalid_response_format` rather than returning whatever text happened to be present. This eliminates the "Thinking..." false positive entirely — if the delimiters aren't there, the answer isn't done yet.
 
-**Decision:** The sidebar chat list is found by walking from the "New chat" button text up to a narrow-tall container, then enumerating leaf elements with text content. No `[class*="chat-list"]`, no `aside`, no `nav`.
+**Consequence:** Each provider implements its own completion detector and extraction. There is no shared "extract the answer" function. This is deliberate — the failure modes are provider-specific and a shared abstraction would either be too loose (return preamble) or too strict (fail on legitimate replies). The `extract` phase in `/progress` shows `source: 'delimiter'`, `'fence'`, or `'raw'`, so the caller can see what happened. See [ADR 0006](adr/0006-answer-block-extraction-over-whole-message.md).
 
-**Context:** To find an existing chat by name (for `/open`'s fuzzy match), the extension needs to enumerate chat titles in the sidebar. On current DeepSeek, the sidebar has no semantic classes — every element has a build-hashed class like `dc04ec1d`, `c08e6e93`, `_7b40dad`. The only stable anchors are text content.
+### 7. Structural sidebar walk as fallback
 
-**Alternative considered:** `querySelectorAll('a[href*="/a/chat/s/"]')`. This is the "obvious" approach — chat entries are links, right? Rejected because on current DeepSeek, they aren't links. They're `<div>` elements with click handlers. The href-based selector returns 0 on real DeepSeek. It works on older DeepSeek versions and on the mock page; it's kept as tier 1 for backward compat but never fires on the version we're actually driving.
+**Decision:** DeepSeek's sidebar chat list is found by walking from the "New chat" button text up to a narrow-tall container, then enumerating leaf elements with text content. This is a **fallback**, used only when the URL-based retry path isn't available. Qwen doesn't implement the sidebar walk at all — it returns `existing: false, mode: 'fresh'` and relies entirely on the URL-based mechanism.
 
-**Alternative considered (second):** `querySelector('aside')` or `querySelector('[class*="sidebar"]')`. Rejected because on current DeepSeek, the sidebar container is a plain `<div class="dc04ec1d">`. No `<aside>`, no `nav`, no class containing "sidebar". This tier is also kept as a fallback but doesn't match.
+**Context:** When the caller doesn't have a persisted URL (first send per source, or a fresh run directory), the extension needs to establish a chat. The mechanism the original DeepSeek provider chose was sidebar fuzzy-match: enumerate chat titles, find one whose text contains the source name, click it.
 
-**The actual fix:** Structural walk. Find the "New chat" button by text, walk up its parent chain until you hit a container with `height > 400 && 100 < width < 500`. That's the sidebar container. Then enumerate its leaf elements (`el.children.length === 0`) with text content 2-200 characters, height 10-60 pixels, positioned above the profile section at the bottom. Those are the chat titles.
+**The sidebar walk is now secondary** because of [decision 3's URL-primary fix](#3-one-chat-per-source-url-primary-identity). It was always going to be fragile — DeepSeek's sidebar has no semantic class names (every class is build-hashed like `dc04ec1d`), chat entries aren't anchors, and the titles are paraphrased. The structural walk (find "New chat" text, walk up to a tall-narrow container, enumerate leaves) works but breaks every time DeepSeek changes sidebar dimensions or the "New chat" text.
 
-**Consequence:** Three new functions in content.js — `findSidebarContainer`, `listChatLeafItems`, `clickableAncestor` — plus the rewrite of `findChatInSidebar`. The `debug` field on `/open`'s response exists entirely because this walk is opaque — when it fails, the `leafPreview` array shows exactly what the walk saw, so you don't have to F12 the tab. The `debug` field was originally intended as a temporary diagnostic; it's now a permanent part of the contract because every DeepSeek redesign will make it useful again. See [ADR 0007](adr/0007-structural-sidebar-walk.md), and [selector-maintenance.md](selector-maintenance.md) for the recovery playbook when the walk breaks.
+**Consequence:** Qwen doesn't have a sidebar walk at all. Its `ensureChat` returns `{existing: false, mode: 'fresh'}` unconditionally — the provider assumes the caller is on a fresh page or will navigate. If a Qwen retry needs to find a chat by name, it can't; it must use the URL. This is documented as a known limitation, mitigated by `chat-map.json` in the aggregator layer. DeepSeek's walk remains for the "no URL yet" case, but its failure no longer blocks the wizard — a missed match just opens a fresh chat, and the retry-from-URL path handles subsequent turns.
 
-**The trade-off accepted:** The walk is O(n) over the sidebar's elements and re-runs on every `findChatInSidebar` call. For a sidebar with 50 chat entries and 500 nested divs, that's ~500 `getBoundingClientRect()` calls per lookup, at maybe 1-2ms total. Fast enough that caching isn't worth the staleness risk. If the sidebar grows to 500 entries or the walk becomes perceptibly slow, a targeted cache (invalidated on URL change) would be the fix — not a selector-based shortcut.
+See [ADR 0007](adr/0007-structural-sidebar-walk.md) and its amendment by [ADR 0008](adr/0008-multi-provider-plugin-architecture.md), and [selector-maintenance.md](selector-maintenance.md) for the DeepSeek walk's recovery playbook.
+
+### 8. Plugin registry over feature flags
+
+**Decision:** Multi-provider support is a **registry-based plugin system**: `content.js` is a thin router, each provider registers itself into `globalThis.DSC_PROVIDERS[name]`, and dispatch happens by name lookup. Providers are self-contained modules with a four-method contract.
+
+**Context:** When Qwen was added as a second provider, the codebase had to support both. Three architecture options were considered.
+
+**Alternative considered (1): Feature flags inside a monolithic `content.js`.** Every function checks `if (provider === 'deepseek') { ... } else if (provider === 'qwen') { ... }`. Rejected because:
+
+- `content.js` would grow to ~800 lines with both providers' logic, and every function would need dual branches.
+- A third provider would add a third branch to every function — linear blowup.
+- The provider-specific code would be interleaved with the shared router code, making it hard to see what's shared vs provider-specific.
+
+**Alternative considered (2): Class inheritance.** A base `Provider` class with `ensureChat`/`sendPrompt`/`checkState`/`resetChat`, with `DeepSeekProvider extends Provider` and `QwenProvider extends Provider`. Rejected because:
+
+- Manifest V3 content scripts are classic scripts, not modules. `import`/`export` don't work in content scripts without a bundler, and adding a bundler is against the project's hard constraint.
+- The class approach creates an implicit interface (the base class's abstract methods) that has to be maintained in two places (the base and each subclass). The registry approach has one place: the `PROVIDER CONTRACT` comment in `shared.js`.
+- Two providers don't justify the abstraction. A registry is 10 lines of code; a class hierarchy is 200 lines of scaffolding for 30 lines of shared behavior.
+
+**Alternative considered (3): Separate content script per provider, with background dispatching to the right tab.** Rejected because background would need to know which content script is injected where, which is exactly the coordination problem that `manifest.json`'s `content_scripts` already solves at load time. And the router pattern (one content script, dispatched by provider) is more flexible: the same tab can handle multiple providers if needed (e.g., a future cross-provider orchestration mode).
+
+**The chosen design** — registry-based dispatch — wins on three axes:
+
+1. **Adding a provider is one new file plus three registrations.** `providers/claude.js` + one line in `shared.js` `PROVIDER_DOMAINS` + two places in `manifest.json` + one place in `background.js` `sendToTab`. Nothing in `content.js`, `src/server.js`, or `src/client.js` changes.
+2. **The provider contract is documented in code.** `shared.js`'s `PROVIDER CONTRACT` comment block is the spec — the interface is four methods, the registration is three places, and both are visible from the router's top. A contributor reading `content.js` sees the reference to the contract block, reads it, and knows what to implement.
+3. **Provider internals are truly isolated.** `providers/qwen.js` doesn't import anything from `providers/deepseek.js`. `providers/deepseek.js` doesn't know Qwen exists. When a provider redesigns, its file is the only file that changes for that provider's DOM. When a provider is added, its file is the only new file for that provider's DOM.
+
+**Consequence:** The `globalThis.DSC_PROVIDERS` global, the `content.js` router, the three-registration checklist, and the Qwen provider's fully self-contained design (no shared helpers). The cost is the `no_provider_loaded` failure mode when a registration is missed — a distinctive error the router surfaces specifically, with the hostname included, so the diagnosis is "which registration is missing" rather than "why isn't it working." See [ADR 0008](adr/0008-multi-provider-plugin-architecture.md) for the full reasoning.
 
 ## The two streaming guards
 
-Two guards in the stream loop that exist for two different reasons. Both are easy to delete accidentally.
+Two guards that exist in every provider's `sendPrompt`, for two different reasons. Both are easy to delete accidentally when refactoring a provider.
 
 ### `streamUrl` — mid-stream navigation
 
-**What:** `streamUrl` is captured at `firstMsg` (the moment the first assistant message of this response appears). On every subsequent poll iteration, `location.href` is compared against `streamUrl`. If they differ, the response is discarded as `user_navigated`.
+**What:** `streamUrl` is captured when the first assistant message of the response appears. On every subsequent poll iteration, `location.href` is compared against `streamUrl`. If they differ, the response is discarded as `user_navigated`.
 
-**Why:** Between `firstMsg` and `replyDone` (typically 3-8 seconds), the work tab is fully interactive. The user can click a different chat in the sidebar. The user can hit browser back. DeepSeek can auto-redirect. Any of these changes `location.href` to a different chat's URL — and the content script, which is polling "the last assistant message on this page", will suddenly start reading a *different* chat's assistant message. The reply that comes back would be from the wrong conversation.
+**Why:** Between the first assistant message and the reply done (typically 3-8 seconds), the work tab is fully interactive. The user can click a different chat in the sidebar. The user can hit browser back. The provider can auto-redirect. Any of these changes `location.href` to a different chat's URL — and the provider's polling loop, which is watching "the last assistant message on this page," will suddenly start reading a *different* chat's assistant message. The reply that comes back would be from the wrong conversation.
 
-**The specific bug that motivated this:** During development, a "Say hello" prompt on `chat.deepseek.com/` returned the string "state.cfg was my invention; real config is loadConfig()..." — which was a prior assistant message from a completely different chat that the user had navigated to mid-stream. The `completedBy: 'stable'` detector locked onto the wrong page's message and read it as the answer. `streamUrl` was added the same day.
+**The specific bug that motivated this:** During development, a "Say hello" prompt on DeepSeek returned the string "state.cfg was my invention; real config is loadConfig()..." — a prior assistant message from a completely different chat that the user had navigated to mid-stream. The completion detector locked onto the wrong page's message and read it as the answer.
 
-**What deleting it costs:** Silent cross-chat contamination. Every source that happens to have a mid-stream navigation would produce content from the wrong chat, which would pass identity checks (the LLM did mention the source name — it mentioned it in the *wrong* chat), would pass JS syntax checks (it's real code from the wrong source), and would land in `generated/` as a silently wrong extractor. The batch would "succeed" with extractors that reference the wrong site's DOM. This is exactly the class of bug that takes a day to trace once it's in production.
+**What deleting it costs:** Silent cross-chat contamination. Every source that happens to have a mid-stream navigation would produce content from the wrong chat, which would pass identity checks (the LLM did mention the source name — in the *wrong* chat), would pass JS syntax checks (it's real code from the wrong source), and would land in `generated/` as a silently wrong extractor.
 
-### `reasoning` phase gating — stream stabilization on the wrong text
+**Implemented per-provider.** DeepSeek checks `if (streamUrl && location.href !== streamUrl)` inside its poll loop. Qwen captures `streamUrl = location.href` at first message and checks it the same way. Each provider implements the guard; the pattern is shared, the code is not.
 
-**What:** The completion detector tracks `lastAssistantText()` — the *answer block's* text — not the whole message's text. The `answerStarted` flag gates the stabilization check on the answer block appearing. Before `answerStarted`, the loop logs `reasoning` length periodically and continues without touching `stableLen`.
+### `answerStarted` gating — stream stabilization on the wrong text
 
-**Why:** DeepSeek with DeepThink streams the reasoning first, then the answer. The reasoning stabilizes (stops growing) 1-2 seconds before the answer starts. If the completion detector tracked "the whole message's text content", it would see the reasoning stabilize and declare `replyDone` — before the answer had begun streaming. The extracted content would be the reasoning, which is what happened in the initial build (see decision 6).
+**What (DeepSeek):** The completion detector tracks the answer block's text (`.ds-assistant-message-main-content`), not the whole message's text. The `answerStarted` flag gates the stabilization check on the answer block appearing. Before `answerStarted`, the loop logs reasoning length periodically and continues without touching `stableLen`.
 
-**What deleting it costs:** Every prompt with DeepThink enabled returns reasoning text as content. `extract` shows `source: 'raw'` because no delimiters appear in reasoning (the LLM hasn't produced the answer yet). The batch would complete with 76 sources of reasoning text — which happens to look plausible (it's prose mentioning the source name and the LLM's intent) and would pass identity checks. `source: 'delimiter'` only appears on the *good* runs, so the operator might not notice until they try to deploy an extractor and find it's a paragraph of English.
+**What (Qwen):** The completion detector requires both `START_QWEN_REPLY` and `END_QWEN_REPLY` to appear in the DOM. The delimiter enforcement is stricter than DeepSeek's — Qwen fails with `invalid_response_format` rather than returning whatever text happens to be present.
+
+**Why:** Both providers stream reasoning/thinking before the answer. DeepSeek streams "Thought for N seconds" into `.ds-think-content`. Qwen streams "Thinking..." into a preamble element. Each stabilization (stopping growth) fires 1-2 seconds before the answer starts streaming. If the completion detector tracked "the whole message's text content," it would see the reasoning stabilize and declare `replyDone` — before the answer had begun.
+
+**What deleting it costs:** Every prompt with the provider's reasoning mode enabled returns reasoning text as content. `extract` shows `source: 'raw'` because no delimiters appear in reasoning. The batch completes with 76 sources of reasoning text — which happens to look plausible (it mentions the source name and the LLM's intent) and would pass identity checks. `source: 'delimiter'` only appears on the *good* runs, so the operator might not notice until they try to deploy an extractor and find it's a paragraph of English.
+
+**The two providers chose different implementations.** DeepSeek gated on a DOM signal (`.ds-assistant-message-main-content` appearing). Qwen gated on content signal (both delimiters appearing). Both are correct; the choice depends on which signal the provider's DOM provides reliably.
 
 ## What the extension does not do
 
-Five things that are out of scope by design, each for a specific reason.
+Six things that are out of scope by design, each for a specific reason.
 
-**1. It does not solve DeepSeek captchas.** If DeepSeek decides a request is automated and serves a captcha, the extension can't click through. That's `input_not_found` or `response_timeout`, not a solvable automation problem. The mitigation is using a real Chrome profile that DeepSeek trusts — which is what decision 2 is about.
+**1. It does not solve captchas.** If a provider decides a request is automated and serves a captcha, the extension can't click through. That's `input_not_found` or `response_timeout`, not a solvable automation problem. The mitigation is using a real Chrome profile that providers trust — which is what decision 2 is about. Qwen's age modal is a mild case of this; the provider dismisses it, but a harder bot check (Cloudflare challenge, "are you human" CAPTCHA) would still fail.
 
-**2. It does not rotate accounts.** One extension, one Chrome profile, one DeepSeek account. Multi-account is a different product with different security implications.
+**2. It does not rotate accounts.** One extension, one Chrome profile, one provider account per provider. Multi-account is a different product.
 
-**3. It does not scan the whole DOM.** Every selector is a targeted lookup — the input, the send button, the two toggles, the answer block, the sidebar container. No `document.querySelectorAll('*')` for anything. The one place that enumerates a container's contents is `listChatLeafItems`, and that's scoped to the sidebar.
+**3. It does not auto-pivot between providers on rate limit.** When a DeepSeek request fails with `rate_limited`, the extension returns the error to the caller. The caller (or the wizard layer above it) decides whether to retry on Qwen. The extension does not have a "pivot to Qwen automatically" mode, because "pivot" implies the extension knows about both providers and has a policy for when to switch — that's the caller's policy, not the extension's.
 
-**4. It does not interpret the reply.** Delimiter extraction, fence extraction, raw fallback — those are three text-manipulation passes, not a parser. The content script doesn't validate that the extracted text is valid JavaScript, doesn't check that it references the source name, doesn't know whether it's a code block or a prose reply. Those are the caller's concern (the batch wizard's identity check). The extension's contract is "here's what the assistant said between the delimiters (or the fences, or the whole thing)" — the caller decides what to do with it.
+**4. It does not scan the whole DOM.** Every selector is a targeted lookup — the input, the send button, the toggles (DeepSeek only), the answer block, the sidebar container. No `document.querySelectorAll('*')` for anything, in any provider.
 
-**5. It does not retry.** A single `sendPrompt` call is a single attempt. If the content script reports `send_failed`, the extension does not internally retry. It returns the error to the background, which posts `/reply { status: 'error' }`, which the caller sees as a `DSCError`. Retry policy lives in the caller (see [integration-guide.md#sendwithretry](integration-guide.md#sendwithretry)). Putting retry inside `sendPrompt` would make the trace opaque ("why did it take 30 seconds to fail?") and would conflate "the extension tried and gave up" with "the caller will try again." The extension's job is one attempt, faithfully reported.
+**5. It does not interpret the reply.** Delimiter extraction, fence extraction, raw fallback — those are three text-manipulation passes, not a parser. The provider doesn't validate that the extracted text is valid JavaScript, doesn't check that it references the source name, doesn't know whether it's a code block or a prose reply. Those are the caller's concern (the batch wizard's identity check). The provider's contract is "here's what the assistant said between the delimiters (or the fences, or the whole thing)" — the caller decides what to do with it.
+
+**6. It does not retry.** A single `sendPrompt` call is a single attempt. If the provider reports `send_failed`, the extension does not internally retry. It returns the error to the background, which posts `/reply { status: 'error' }`, which the caller sees as a `DSCError`. Retry policy lives in the caller (see [integration-guide.md#sendwithretry](integration-guide.md#sendwithretry)). Putting retry inside `sendPrompt` would make the trace opaque and would conflate "the extension tried and gave up" with "the caller will try again."
 
 ## Data flow between modules
 
 One line per boundary. Useful when tracing "which module is responsible for X".
 
 - **`src/errors.js` → `src/server.js`, `src/client.js`** — the code table and `DSCError` class are shared by both. If you add a code, both sides get it.
-- **`shared.js` → `background.js`, `content.js`** — `DSC.ERR`, `DSC.MSG`, `DSC.VERSION`, timing constants. Neither background nor content hardcodes a code string.
-- **`selectors.js` → `content.js`** — `DSC_SELECTORS.resolve(name)` and `DSC_SELECTORS.probeDom()`. Content never queries the DOM by raw selector string.
-- **`background.js` → `content.js`** via `chrome.tabs.sendMessage` — `ensureChat`, `sendPrompt`, `checkState`, `resetChat`. Four actions, all structured, no DOM assumptions.
+- **`shared.js` → `background.js`, `content.js`, all providers** — `DSC.ERR`, `DSC.MSG`, `DSC.VERSION`, `DSC.PROVIDER_DOMAINS`, `DSC.providerForUrl`, timing constants. Neither background, content, nor any provider hardcodes a code string or a provider domain.
+- **`selectors.js` → `providers/deepseek.js`** — `DSC_SELECTORS.resolve(name)` and `DSC_SELECTORS.probeDom()`. DeepSeek uses this file; Qwen doesn't. DeepSeek-specific.
+- **`content.js` → `providers/*.js`** — the router dispatches by `msg.provider` name. It calls `provider.ensureChat`, `provider.sendPrompt`, `provider.checkState`, `provider.resetChat`, and does nothing else. Four methods, one direction.
+- **`providers/*.js` → `content.js`** — return values from the four methods. Structured objects; no side effects beyond DOM manipulation and `chrome.runtime.sendMessage({type: 'dsc_phase'})`.
+- **`background.js` → `content.js`** via `chrome.tabs.sendMessage` — `ensureChat`, `sendPrompt`, `checkState`, `resetChat`, each with `provider` field. Four actions, all structured, no DOM assumptions in background.
+- **`background.js` → `getWorkTab(provider)`** — tab selection is provider-aware. When `provider` is set, query that domain; when unset, use pinned tab.
 - **`content.js` → `background.js`** via `chrome.runtime.sendMessage` — `dsc_phase` (progress), `state` (popup UI). Two types, both fire-and-forget.
 - **`background.js` → `src/server.js`** via `fetch` — `/hello`, `/next`, `/reply`, `/progress`. HTTP, authenticated with `EXTENSION_TOKEN`.
 - **`src/server.js` → `src/client.js`** (via the caller) — the HTTP response body is what the caller's `dc.chat()` resolves to. `DSCError` on non-2xx, parsed body on 2xx.
 - **`src/client.js` → caller's batch loop** — `chat()`, `open()`, `reset()`, `tabs()`. `DSCError` on failure with `{ code, retryable, userFixable, retryAfter, details }`.
+- **`src/server.js` `enqueue` → `pump` → `/next` → `background.handleNext` → `sendToTab`** — the `provider` string threads through every hop, unchanged. Four hops, four assignments, no transformation.
 
-When a bug appears at one of these boundaries, the fix belongs on the side that owns the contract. A prompt that lands in the wrong chat is a `background.getWorkTab` bug or a `content.ensureChat` bug, not a `server` bug. A reply that doesn't contain the answer is a `content.lastAssistantText` bug (decision 6) or a `content` extraction bug, not a `background` bug. A `/chat` that hangs is a `server` queue bug (see the "extension dies mid-flight" note in [protocol.md#queue-state-machine](protocol.md#queue-state-machine)), not a `content` bug.
+When a bug appears at one of these boundaries, the fix belongs on the side that owns the contract:
 
-The single hardest boundary to debug is `content.js` → `background.js` → `server.js` → `client.js` for the same failure. When a prompt "fails silently," the failure could be: content threw an uncaught exception (background gets `Receiving end does not exist`, retries, fails, reports `input_not_found`); content returned `{error: 'dom_drift'}` (background reports `dom_drift` cleanly); or background's `sendToTab` timed out (background reports `input_not_found` after two attempts). Three different root causes, one visible symptom. The `trace` array on the `/reply` payload is the way to tell them apart — it carries the content-side phases, so a trace that ends at `probe` means content got that far and stopped; a trace that's empty means content never ran. Check the trace first when a source fails for a non-obvious reason.
+- A prompt that lands in the wrong provider's tab is a `background.getWorkTab` bug (or a caller that didn't pass `provider`).
+- A provider that isn't dispatched is a `manifest.json` or `background.sendToTab` registration bug (see [providers.md#the-registration-checklist](providers.md#the-registration-checklist)).
+- A reply that doesn't contain the answer is a provider's `sendPrompt` extraction bug (see [decision 6](#6-answer-block-extraction-over-whole-message)).
+- A `/chat` that hangs is a `server` queue bug (see [protocol.md#queue-state-machine](protocol.md#queue-state-machine)).
+
+The single hardest boundary to debug is `providers/*.js` → `content.js` → `background.js` → `server.js` → `client.js` for the same failure. When a prompt "fails silently," the failure could be: provider threw an uncaught exception (background gets `Receiving end does not exist`, retries, fails, reports `input_not_found`); provider returned `{error: 'dom_drift'}` (background reports `dom_drift` cleanly); or background's `sendToTab` timed out (background reports `input_not_found` after two attempts). Three different root causes, one visible symptom. The `trace` array on the `/reply` payload is the way to tell them apart — it carries the provider-side phases, so a trace that ends at `probe` means the provider got that far and stopped; a trace that's empty means the provider never ran (registration bug). Check the trace first when a source fails for a non-obvious reason.
+
+For provider-specific failures, the trace phase names are the diagnostic: `probe` / `waitInput` / `toggleDeepthink` / `toggleSearch` indicate DeepSeek; `step_1_dismiss_modal` / `step_2_find_input` / `step_3_type_prompt` indicate Qwen. If a trace mixes both, something is wrong with the routing — the provider that ran doesn't match the provider that was requested.

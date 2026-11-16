@@ -106,6 +106,7 @@ function createClient(opts) {
     const body = { messages: params.messages };
     if (params.chat) body.chat = params.chat;
     if (params.targetTabId) body.targetTabId = params.targetTabId;
+    if (params.provider) body.provider = params.provider;
     const timeoutMs = params.timeoutMs || DEFAULT_CHAT_TIMEOUT_MS;
     return await request('POST', '/chat', body, timeoutMs);
   }
@@ -115,7 +116,10 @@ function createClient(opts) {
       throw new DSCError(CODES.BAD_REQUEST, { reason: 'chatName required' });
     }
     const timeoutMs = params.timeoutMs || DEFAULT_OPEN_TIMEOUT_MS;
-    return await request('POST', '/open', { chatName: params.chatName }, timeoutMs);
+    const body = { chatName: params.chatName };
+    if (params.url) body.url = params.url;
+    if (params.provider) body.provider = params.provider;
+    return await request('POST', '/open', body, timeoutMs);
   }
 
   async function reset(params) {

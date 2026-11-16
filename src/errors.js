@@ -15,7 +15,7 @@
 'use strict';
 
 const CODES = {
-  // ---- DeepSeek page (content script) ----
+  // ---- Provider page (content script) ----
   DOM_DRIFT: 'dom_drift',
   INPUT_NOT_FOUND: 'input_not_found',
   DEEPTHINK_ENABLE_FAILED: 'deepthink_enable_failed',
@@ -26,6 +26,7 @@ const CODES = {
   RESPONSE_TIMEOUT: 'response_timeout',
   SEND_FAILED: 'send_failed',
   USER_NAVIGATED: 'user_navigated',
+  INVALID_RESPONSE_FORMAT: 'invalid_response_format',
 
   // ---- Server / transport ----
   EXTENSION_DISCONNECTED: 'extension_disconnected',
@@ -43,19 +44,19 @@ const CODES = {
 const META = {
   [CODES.DOM_DRIFT]: {
     retryable: false, userFixable: false, http: 500,
-    human: 'DeepSeek page structure changed; selectors need updating.',
+    human: 'Provider page structure changed; selectors need updating.',
   },
   [CODES.INPUT_NOT_FOUND]: {
     retryable: false, userFixable: true, http: 502,
-    human: 'Chat input not found. Is the work tab on chat.deepseek.com and logged in?',
+    human: 'Chat input not found. Is the work tab on a supported provider and logged in?',
   },
   [CODES.DEEPTHINK_ENABLE_FAILED]: {
     retryable: false, userFixable: true, http: 502,
-    human: 'Could not enable DeepThink. Toggle it manually in the tab and retry.',
+    human: 'Could not enable provider feature toggle. Toggle it manually in the tab and retry.',
   },
   [CODES.SEARCH_ENABLE_FAILED]: {
     retryable: false, userFixable: true, http: 502,
-    human: 'Could not enable Search. Toggle it manually in the tab and retry.',
+    human: 'Could not enable provider search feature. Toggle it manually in the tab and retry.',
   },
   [CODES.CHAT_NOT_FOUND]: {
     retryable: false, userFixable: false, http: 404,
@@ -63,11 +64,11 @@ const META = {
   },
   [CODES.RATE_LIMITED]: {
     retryable: true, userFixable: false, http: 429,
-    human: 'DeepSeek rate limit hit; retry after retryAfter ms.',
+    human: 'Provider rate limit hit; retry after retryAfter ms.',
   },
   [CODES.LOGGED_OUT]: {
     retryable: false, userFixable: true, http: 401,
-    human: 'Not logged in to DeepSeek. Log in and retry.',
+    human: 'Not logged in to provider. Log in and retry.',
   },
   [CODES.RESPONSE_TIMEOUT]: {
     retryable: true, userFixable: true, http: 504,
@@ -80,6 +81,10 @@ const META = {
   [CODES.USER_NAVIGATED]: {
     retryable: false, userFixable: true, http: 409,
     human: 'Work tab navigated mid-stream; result discarded to avoid stale read.',
+  },
+  [CODES.INVALID_RESPONSE_FORMAT]: {
+    retryable: true, userFixable: false, http: 502,
+    human: 'Model reply did not include the required delimiters. Retry may succeed; if it repeats, the prompt enforcement needs strengthening.',
   },
 
   [CODES.EXTENSION_DISCONNECTED]: {
