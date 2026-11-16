@@ -11,5 +11,12 @@
     "server": "node src/server.js",
     "test": "node --test tests/*.test.js"
   },
-  "devDependencies": {}
+  "devDependencies": {},
+  "main": "src/server.js",
+  "exports": {
+    ".": "./src/server.js",
+    "./client": "./src/client.js",
+    "./errors": "./src/errors.js",
+    "./package.json": "./package.json"
+  }
 }
