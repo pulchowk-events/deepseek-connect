@@ -174,3 +174,6 @@ Errors thrown by the client are `DSCError` instances carrying `{ code, reason, r
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+---

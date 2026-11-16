@@ -594,3 +594,4 @@ Record of past drifts, as a reference for what "a drift" looks like in practice.
 **Pre-November 2026 (unrecorded)** — the initial scaffolding had several selector misses during development, before the tiered strategy existed. The tiered strategy itself was a response to discovering that naive selectors break on every deploy.
 
 **What each incident teaches:** the drift is usually one thing changing, not a wholesale redesign. The fix is usually a new tier or a structural rewrite of one function. The diagnosis is always the same: `DSC_SELECTORS.resolve()` in the console, read the `tried` array.
+
