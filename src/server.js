@@ -116,7 +116,7 @@ function createServer(opts) {
     try {
       if (!checkAuth(req)) {
         log('! auth fail', req.method, req.url);
-        return writeJson(res, 401, { ok: false, error: 'unauthorized' });
+        return writeJson(res, 401, { ok: false, error: 'auth_failed', reason: 'unauthorized' });
       }
 
       const method = req.method;
@@ -267,19 +267,24 @@ function createServer(opts) {
     }
   });
 
-  function listen() {
+  let boundPort = null;
+  function start() {
     return new Promise((resolve, reject) => {
       httpServer.once('error', reject);
       httpServer.listen(port, host, () => {
-        log('listening on ' + host + ':' + port);
-        resolve();
+        boundPort = httpServer.address().port;
+        log('listening on ' + host + ':' + boundPort);
+        resolve(boundPort);
       });
     });
   }
+  // Backward-compatible alias — old callers use listen().
+  const listen = start;
 
-  function close() {
+  function stop() {
     return new Promise((resolve) => {
       const err = new Error('server_closed');
+      err.code = 'cancelled';
       for (const e of queue) e.reject(err);
       for (const e of inFlight.values()) e.reject(err);
       queue.length = 0;
@@ -289,13 +294,31 @@ function createServer(opts) {
       httpServer.close(() => resolve());
     });
   }
+  // Backward-compatible alias — old callers use close().
+  const close = stop;
+
+  function status() {
+    return {
+      connected: !!(sessionId && httpServer.listening),
+      sessionId,
+      listening: httpServer.listening,
+      port: boundPort || port,
+      queued: queue.length,
+      inFlight: inFlight.size,
+      waitingPollers: waiting.length,
+      tabs: cachedTabs.length,
+    };
+  }
 
   return {
     httpServer,
     enqueue,
-    listen,
-    close,
-    port,
+    start,
+    stop,
+    listen,   // alias for start
+    close,    // alias for stop
+    status,
+    port: () => boundPort || port,
     get sessionId() { return sessionId; },
   };
 }
@@ -330,10 +353,10 @@ async function main() {
     process.exit(1);
   }
   const server = createServer({ port, token });
-  await server.listen();
+  await server.start();
   const shutdown = async () => {
     console.log('');
-    await server.close();
+    await server.stop();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
