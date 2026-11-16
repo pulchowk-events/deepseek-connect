@@ -365,6 +365,18 @@ function createServer(opts) {
   // Backward-compatible alias -- old callers use listen().
   const listen = start;
 
+  // Answer every held /next with a synthetic idle so the extension's fetch
+  // resolves instead of hanging on a socket the server is about to drop.
+  function answerAllWaiters() {
+    const n = waiting.length;
+    for (const w of waiting) {
+      if (w.timer) clearTimeout(w.timer);
+      writeJson(w.res, 200, { action: 'idle' });
+    }
+    waiting.length = 0;
+    return n;
+  }
+
   function stop() {
     return new Promise((resolve) => {
       const err = new Error('server_closed');
@@ -373,9 +385,16 @@ function createServer(opts) {
       for (const e of inFlight.values()) e.reject(err);
       queue.length = 0;
       inFlight.clear();
-      for (const w of waiting) { if (w.timer) clearTimeout(w.timer); }
-      waiting.length = 0;
-      httpServer.close(() => resolve());
+      const answered = answerAllWaiters();
+      if (answered > 0) log('stop: answered ' + answered + ' waiting /next poller(s)');
+      let killer = null;
+      httpServer.close(() => {
+        if (killer) clearTimeout(killer);
+        resolve();
+      });
+      httpServer.closeIdleConnections();
+      killer = setTimeout(() => httpServer.closeAllConnections(), 250);
+      killer.unref();
     });
   }
   // Backward-compatible alias -- old callers use close().
@@ -440,8 +459,13 @@ async function main() {
   }
   const server = createServer({ port, token });
   await server.start();
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('');
+    // Failsafe: if stop() somehow hangs, still exit.
+    setTimeout(() => process.exit(0), 3000).unref();
     await server.stop();
     process.exit(0);
   };
