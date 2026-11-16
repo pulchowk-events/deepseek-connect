@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Mock DeepSeek</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; display: flex; height: 100vh; margin: 0; }
+    aside { width: 220px; border-right: 1px solid #ccc; padding: 8px; overflow-y: auto; }
+    aside .new-chat { display: block; width: 100%; padding: 6px; margin-bottom: 8px; }
+    aside ul { list-style: none; padding: 0; margin: 0; }
+    aside li { padding: 6px; cursor: pointer; border-radius: 4px; }
+    aside li:hover { background: #eee; }
+    main { flex: 1; display: flex; flex-direction: column; padding: 8px; }
+    header { font-weight: 600; padding: 6px 0; border-bottom: 1px solid #eee; }
+    .messages { flex: 1; overflow-y: auto; padding: 8px 0; }
+    .assistant { border-left: 3px solid #4a9; padding: 8px; margin: 8px 0; background: #f7fff9; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; }
+    .actions { margin-top: 6px; }
+    .actions button { margin-right: 4px; font-size: 11px; }
+    .composer { display: flex; gap: 8px; padding-top: 8px; border-top: 1px solid #eee; }
+    .composer textarea { flex: 1; height: 60px; padding: 6px; font: inherit; }
+    .toggles { display: flex; gap: 8px; padding: 4px 0; }
+    .toggles button { font-size: 12px; padding: 4px 8px; border: 1px solid #ccc; background: #fff; border-radius: 4px; cursor: pointer; }
+    .toggles button[aria-pressed="true"] { background: #4a9; color: #fff; border-color: #4a9; }
+  </style>
+</head>
+<body>
+  <aside>
+    <button class="new-chat">New chat</button>
+    <ul id="chat-list">
+      <li>existing-source-1</li>
+      <li>existing-source-2</li>
+    </ul>
+  </aside>
+
+  <main>
+    <header id="chat-title">Mock Chat</header>
+
+    <div class="messages" id="messages"></div>
+
+    <div class="toggles">
+      <button id="toggle-deepthink" aria-pressed="false">DeepThink</button>
+      <button id="toggle-search" aria-pressed="false">Search</button>
+    </div>
+
+    <div class="composer">
+      <textarea placeholder="Message DeepSeek..."></textarea>
+      <button aria-label="Send" type="button" id="send">Send</button>
+    </div>
+  </main>
+
+  <script>
+    const messages = document.getElementById('messages');
+    const input = document.querySelector('.composer textarea');
+    const send = document.getElementById('send');
+    const titleEl = document.getElementById('chat-title');
+    const chatList = document.getElementById('chat-list');
+
+    document.getElementById('toggle-deepthink').addEventListener('click', (e) => {
+      const on = e.target.getAttribute('aria-pressed') === 'true';
+      e.target.setAttribute('aria-pressed', String(!on));
+    });
+    document.getElementById('toggle-search').addEventListener('click', (e) => {
+      const on = e.target.getAttribute('aria-pressed') === 'true';
+      e.target.setAttribute('aria-pressed', String(!on));
+    });
+
+    document.querySelector('.new-chat').addEventListener('click', () => {
+      const li = document.createElement('li');
+      li.textContent = 'new-chat';
+      chatList.prepend(li);
+      titleEl.textContent = 'new-chat';
+      messages.innerHTML = '';
+      input.value = '';
+    });
+
+    chatList.addEventListener('click', (e) => {
+      if (e.target.tagName !== 'LI') return;
+      titleEl.textContent = e.target.textContent;
+      messages.innerHTML = '';
+    });
+
+    send.addEventListener('click', () => {
+      const prompt = input.value.trim();
+      if (!prompt) return;
+      const user = document.createElement('div');
+      user.textContent = '> ' + prompt;
+      user.style.opacity = '0.6';
+      user.style.margin = '4px 0';
+      messages.appendChild(user);
+      input.value = '';
+
+      // Streamed reply: append text incrementally, add copy/regenerate only at end.
+      const reply = document.createElement('div');
+      reply.className = 'assistant';
+      reply.setAttribute('data-message-author-role', 'assistant');
+      messages.appendChild(reply);
+
+      const body = [
+        'Sure, here you go:',
+        '',
+        'source1 START_file.js',
+        'console.log("hello from mock");',
+        'source1 END_file.js',
+        '',
+        'Done.'
+      ].join('\n');
+
+      let i = 0;
+      const stream = setInterval(() => {
+        reply.textContent = body.slice(0, i);
+        i += 5;
+        if (i > body.length) {
+          reply.textContent = body;
+          clearInterval(stream);
+          const actions = document.createElement('div');
+          actions.className = 'actions';
+          const copy = document.createElement('button');
+          copy.textContent = 'Copy';
+          copy.setAttribute('aria-label', 'Copy');
+          const regen = document.createElement('button');
+          regen.textContent = 'Regenerate';
+          regen.setAttribute('aria-label', 'Regenerate');
+          actions.appendChild(copy);
+          actions.appendChild(regen);
+          reply.appendChild(actions);
+        }
+      }, 20);
+    });
+  </script>
+</body>
+</html>

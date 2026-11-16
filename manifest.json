@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "deepseek-connect",
+  "version": "0.1.0",
+  "description": "Drives a real DeepSeek chat tab over a local HTTP server.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "file:///*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.deepseek.com/*",
+        "file:///*mock-deepseek.html"
+      ],
+      "js": ["shared.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "deepseek-connect",
+    "default_popup": "popup.html"
+  }
+}
