@@ -34,14 +34,12 @@
     return null;
   }
 
+  // Input lookup goes through the DeepSeek selector registry only. No raw
+  // textarea / contenteditable fallback here: a bare textarea fallback is
+  // what let this provider match another provider's input box.
   function findInput() {
     const r = globalThis.DSC_SELECTORS && globalThis.DSC_SELECTORS.resolve('input');
-    if (r && r.el) return r.el;
-    return (
-      document.querySelector('textarea[placeholder]') ||
-      document.querySelector('textarea') ||
-      document.querySelector('[contenteditable="true"]')
-    );
+    return (r && r.el) ? r.el : null;
   }
 
   function findSendButton() {
@@ -143,7 +141,7 @@
   function findSidebarContainer() {
     // DeepSeek's sidebar no longer has semantic class names (only build
     // hashes). Anchor on the "New chat" button text and walk up to a
-    // narrow-tall container — that's the sidebar.
+    // narrow-tall container -- that's the sidebar.
     const btn = findByText(document, 'button, div, a, span', /^new chat$/i);
     if (btn) {
       let el = btn;
@@ -375,6 +373,9 @@
     return false;
   }
 
+  // Two-pass extractor for the "<token> START_<name>" / "<token> END_<name>"
+  // line protocol. Also exported on DSC for providers that need the same
+  // contract (see qwen.js).
   function extractDelimited(raw, start, end) {
     if (!raw) return null;
     const s = escapeRe(start);
@@ -581,6 +582,10 @@
       trace,
     };
   }
+
+  // Shared with other providers that speak the same marker-line protocol.
+  DSC.extractDelimited = extractDelimited;
+
   globalThis.DSC_PROVIDERS = globalThis.DSC_PROVIDERS || {};
   globalThis.DSC_PROVIDERS['deepseek'] = {
     name: 'deepseek',

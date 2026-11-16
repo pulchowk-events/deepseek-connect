@@ -1,6 +1,6 @@
 # Error codes
 
-The `DSCError` taxonomy. Twenty-one codes, every failure mode the extension or server can report, and — the part that matters for integrators — the decision rule for what to do about each one. Read this before writing a `try/catch` around any `deepseek-connect` call.
+The `DSCError` taxonomy. Twenty-three codes, every failure mode the extension or server can report, and — the part that matters for integrators — the decision rule for what to do about each one. Read this before writing a `try/catch` around any `deepseek-connect` call.
 
 Multi-provider changes the taxonomy in two ways. First, one code is new: `invalid_response_format`, raised only by Qwen. Second, several codes are now **provider-specific** — `deepthink_enable_failed` and `search_enable_failed` only apply to DeepSeek; `invalid_response_format` only applies to Qwen. A wizard that switches on `err.code` needs to know which codes can appear from which providers.
 
@@ -95,7 +95,7 @@ The `attempts < 3` cap is a wizard-side policy, not a `DSCError` guarantee. See 
 
 ## Five decision buckets
 
-Twenty-one codes, grouped by their response. Every code falls into exactly one bucket.
+Twenty-three codes, grouped by their response. Every code falls into exactly one bucket.
 
 ### Bucket A — Retry, no beep (5 codes)
 
@@ -134,12 +134,13 @@ Twenty-one codes, grouped by their response. Every code falls into exactly one b
 
 **The beep message must be specific.** `extension_disconnected` says "reload the extension in `brave://extensions`"; `response_timeout` says "check the work tab — the provider might be stuck streaming". The reason field carries this through; beep renderers should not collapse it to the code name.
 
-### Bucket D — Beep, no auto-retry (7 codes)
+### Bucket D — Beep, no auto-retry (9 codes)
 
 `retryable: false, userFixable: true`. The operator must act. Beep 3 times at 20-second intervals, surface `err.reason` to the terminal, wait. If the user doesn't act by the third beep, mark `needs-review` and advance to the next source.
 
 | Code | What causes it | User action | Provider |
 |---|---|---|---|
+| `ambiguous_provider_tab` | The request names a provider and the number of open tabs on that provider's exact hostname is not exactly one — none, or several | Open one tab for that provider, or close the extras | both |
 | `auth_failed` | Bearer token mismatch — `.env` and popup disagree on `EXTENSION_TOKEN` | Set the same token in `.env` and the popup | both |
 | `deepthink_enable_failed` | Could not verify DeepThink is on after clicking the toggle | Manually toggle DeepThink on, confirm it stays on | **deepseek only** |
 | `input_not_found` | The chat input box isn't where it should be — tab closed, wrong page, or the DOM changed | Open the work tab, confirm it's on the provider's URL, refresh | both |
@@ -147,6 +148,7 @@ Twenty-one codes, grouped by their response. Every code falls into exactly one b
 | `protocol_version_mismatch` | Server and extension disagree on the protocol version — **not raised in v0.2.0**, see [protocol.md#version-negotiation](protocol.md#version-negotiation) | Reload the extension, restart the server | both |
 | `search_enable_failed` | Could not verify Search is on after clicking the toggle | Manually toggle Search on, confirm it stays on | **deepseek only** |
 | `user_navigated` | The work tab URL changed mid-stream — user clicked into a different chat while a reply was streaming | Don't touch the work tab while a prompt is running | both |
+| `version_mismatch` | Extension `BUILD_HASH` differs from the server's, checked on `/hello` — the extension is refused and never registers | The extension reloads itself once; if it persists, reload it in `brave://extensions`, hard-reload provider tabs, restart the server | server |
 
 `input_not_found` and `logged_out` are the two most common beeps across both providers. `deepthink_enable_failed` and `search_enable_failed` are DeepSeek-only and rarer but harder to debug — the beep message names the specific toggle.
 
@@ -177,6 +179,7 @@ Which codes can be raised by which providers. A wizard that switches on `err.cod
 |---|---|---|---|
 | `dom_drift` | ✓ | ✓ | — |
 | `input_not_found` | ✓ | ✓ | — |
+| `ambiguous_provider_tab` | ✓ | ✓ | — |
 | `deepthink_enable_failed` | ✓ | — | — |
 | `search_enable_failed` | ✓ | — | — |
 | `invalid_response_format` | — | ✓ | — |
@@ -190,6 +193,7 @@ Which codes can be raised by which providers. A wizard that switches on `err.cod
 | `extension_stale` | — | — | ✓ |
 | `extension_timeout` | — | — | ✓ |
 | `protocol_version_mismatch` | — | — | ✓ |
+| `version_mismatch` | — | — | ✓ |
 | `bad_request` | — | — | ✓ |
 | `auth_failed` | — | — | ✓ |
 | `unknown_request` | — | — | ✓ |
@@ -221,6 +225,7 @@ Sorted by bucket, then alphabetically within bucket. Use this for reference look
 | **B** | `rate_limited` | ✓ | 30000 | ✗ | 429 | both | Provider rate limit hit |
 | **C** | `extension_disconnected` | ✓ | 0 | ✓ | 409 | server | Extension not connected |
 | **C** | `response_timeout` | ✓ | 0 | ✓ | 504 | both | No answer within timeout |
+| **D** | `ambiguous_provider_tab` | ✗ | 0 | ✓ | 409 | both | Zero or several tabs match the provider |
 | **D** | `auth_failed` | ✗ | 0 | ✓ | 401 | server | Bearer token mismatch |
 | **D** | `deepthink_enable_failed` | ✗ | 0 | ✓ | 502 | **deepseek** | DeepThink couldn't be verified on |
 | **D** | `input_not_found` | ✗ | 0 | ✓ | 502 | both | Chat input not found |
@@ -228,6 +233,7 @@ Sorted by bucket, then alphabetically within bucket. Use this for reference look
 | **D** | `protocol_version_mismatch` | ✗ | 0 | ✓ | 500 | server | Protocol versions differ |
 | **D** | `search_enable_failed` | ✗ | 0 | ✓ | 502 | **deepseek** | Search couldn't be verified on |
 | **D** | `user_navigated` | ✗ | 0 | ✓ | 409 | both | Work tab URL changed mid-stream |
+| **D** | `version_mismatch` | ✗ | 0 | ✓ | 409 | server | Build hash differs from the server's |
 | **E** | `bad_request` | ✗ | 0 | ✗ | 400 | server | Malformed request |
 | **E** | `cancelled` | ✗ | 0 | ✗ | 499 | server | Request cancelled by caller |
 | **E** | `chat_not_found` | ✗ | 0 | ✗ | 404 | both | Chat not found and not creatable |
@@ -235,7 +241,7 @@ Sorted by bucket, then alphabetically within bucket. Use this for reference look
 | **E** | `unknown_request` | ✗ | 0 | ✗ | 404 | server | Unknown requestId |
 | **E** | `user_skipped` | ✗ | 0 | ✓ | 499 | both | Skipped by user via popup |
 
-**Sanity check:** 5 (A) + 1 (B) + 2 (C) + 7 (D) + 6 (E) = 21. Matches `Object.keys(CODES).length` in `src/errors.js` and the bucket-count assertion in `tests/errors.test.js`.
+**Sanity check:** 5 (A) + 1 (B) + 2 (C) + 9 (D) + 6 (E) = 23. Matches `Object.keys(CODES).length` in `src/errors.js` and the bucket-count assertion in `tests/errors.test.js`.
 
 ---
 
@@ -351,6 +357,18 @@ The one-liner in the full table is what fits on a log line. This section is what
 
 ### Bucket D
 
+#### `ambiguous_provider_tab`
+
+**Raises in:** `background.js#resolveWorkTab`, when a request names a provider and the open tabs on that provider's exact hostname number zero or more than one; and `content.js`, as `reason: 'provider_mismatch'`, when a tab receives a request for a provider it doesn't belong to. The aggregator's `ProviderRouter.checkTabs` raises the same code in its preflight against `/tabs`.
+
+**Means:** the extension cannot pick a single tab for the requested provider, and it will not fall back to another provider's tab. `reason` is one of `no_work_tab`, `multiple_work_tabs`, `target_tab_mismatch`, `target_tab_not_found`, or `provider_mismatch`.
+
+**Retry:** no. The tab set is the state.
+
+**Beep:** yes, immediately. Message: "expected exactly one <provider> tab — open one or close the extras".
+
+**Details:** `{ provider, count, tabs: [{ id, url }] }` for none/several; `{ provider, targetTabId, url }` for a mismatched `targetTabId`; `{ requested, actual, hostname }` for `provider_mismatch`.
+
 #### `auth_failed`
 
 **Raises in:** `src/server.js`, before any route dispatch, when the `Authorization` header is missing, malformed, or doesn't match the token.
@@ -443,6 +461,18 @@ The one-liner in the full table is what fits on a log line. This section is what
 **Beep:** yes, after the second occurrence within the same batch. The first `user_navigated` is treated as an accident; the second means the user is genuinely interfering and needs to be told.
 
 **Details:** `{ expected: '<captured URL>', actual: '<current URL>' }` — the two URLs that differ.
+
+#### `version_mismatch`
+
+**Raises in:** `src/server.js`, `/hello`, when the extension's `buildHash` differs from the server's. The server reads its hash from `BUILD_HASH` in `shared.js` when it starts and also serves it on `GET /version`. HTTP 409, logged as `! version_mismatch`.
+
+**Means:** the loaded extension and the running server come from different builds — usually the extension was not reloaded after a code change, or the server was not restarted after the stamp was bumped. The refusal goes to the extension, not to `dc.chat()` callers: the extension never registers, so it never polls `/next`.
+
+**Retry:** no. The extension calls `chrome.runtime.reload()` once when its own hash differs from the server's, with a 60-second cooldown kept in `chrome.storage.local` (`dsc_last_reload`), and skips a second reload for the same pair of hashes because the build on disk would be unchanged.
+
+**Beep:** yes, if the automatic reload does not clear it. Message: "extension and server builds differ — reload the extension in `brave://extensions`, hard-reload provider tabs, restart the server".
+
+**Details:** `{ server, extension }` — the two build hashes.
 
 ### Bucket E
 

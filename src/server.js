@@ -1,24 +1,80 @@
-// src/server.js — terminal-side HTTP server for deepseek-connect.
+// src/server.js -- terminal-side HTTP server for deepseek-connect.
 // Node 22, CommonJS, no external deps. Runs standalone (node src/server.js)
 // or required by the aggregator's batch paste phase.
 //
 // Protocol: see docs/PROTOCOL.md. Auth: Bearer token on every request.
 // Queue: FIFO, one in-flight per extension. /next is a long-poll (30s hold).
+//
+// Provider routing: every work request (/chat, /open, /reset, enqueue) MUST
+// name its provider. There is no default; a missing or unknown provider is
+// refused with bad_request.
 
 'use strict';
 
 const http = require('node:http');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const { httpStatusFor } = require('./errors.js');
 
 const DEFAULT_PORT = 7331;
 const LONG_POLL_MS = 30000;
 const DEFAULT_DELIMITERS = { start: 'START_', end: 'END_' };
+
+// Providers with a registered extension module. Mirrors shared.js
+// ROUTABLE_PROVIDERS. tongyi has a domain but no module, so it is excluded.
+const KNOWN_PROVIDERS = Object.freeze(['deepseek', 'qwen']);
+
+function makeErr(code, reason, details) {
+  const e = new Error(reason);
+  e.code = code;
+  e.reason = reason;
+  e.details = details;
+  return e;
+}
+
+// Returns an Error to refuse with, or null when the provider is acceptable.
+function checkProvider(provider) {
+  if (typeof provider !== 'string' || provider === '') {
+    return makeErr('bad_request', 'provider required; known: ' + KNOWN_PROVIDERS.join(', '),
+      { field: 'provider', known: KNOWN_PROVIDERS.slice() });
+  }
+  if (!KNOWN_PROVIDERS.includes(provider)) {
+    return makeErr('bad_request', 'unknown provider "' + provider + '"; known: ' + KNOWN_PROVIDERS.join(', '),
+      { field: 'provider', value: provider, known: KNOWN_PROVIDERS.slice() });
+  }
+  return null;
+}
+
+// Build stamp, read from the extension's shared.js so server and extension
+// compare against the same source of truth. null when unreadable (check off).
+function readBuildHash() {
+  try {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'shared.js'), 'utf8');
+    const m = src.match(/BUILD_HASH:\s*'([^']+)'/);
+    return m ? m[1] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function errorBody(e, fallbackCode) {
+  return {
+    ok: false,
+    error: e.code || fallbackCode || e.message,
+    reason: e.reason || e.message,
+    details: e.details,
+    trace: e.trace,
+  };
+}
 
 function createServer(opts) {
   const port = opts.port ?? DEFAULT_PORT;
   const token = opts.token;
   const host = opts.host ?? '127.0.0.1';
   const log = opts.log ?? defaultLog;
+  const buildHash = readBuildHash();
 
   if (!token) throw new Error('createServer: token required');
 
@@ -49,7 +105,7 @@ function createServer(opts) {
       const label = (entry.mode && entry.mode !== 'prompt')
         ? ('[' + entry.mode + '] ' + entry.chatName)
         : truncate(entry.prompt, 60);
-      log('-> dispatched', entry.requestId, '|', label);
+      log('-> dispatched', entry.requestId, '|', entry.provider, '|', label);
     }
   }
 
@@ -61,6 +117,8 @@ function createServer(opts) {
       if (mode === 'prompt' && (typeof req.prompt !== 'string' || !req.prompt)) {
         return reject(new Error('prompt required'));
       }
+      const providerErr = checkProvider(req.provider);
+      if (providerErr) return reject(providerErr);
       const requestId = crypto.randomUUID();
       const entry = {
         requestId,
@@ -69,7 +127,7 @@ function createServer(opts) {
         chatName: req.chatName || ('chat-' + requestId.slice(0, 8)),
         targetTabId: req.targetTabId,
         targetUrl: req.targetUrl,
-        provider: req.provider || 'deepseek',
+        provider: req.provider,
         delimiters: req.delimiters || DEFAULT_DELIMITERS,
         resolve,
         reject,
@@ -78,7 +136,7 @@ function createServer(opts) {
       };
       queue.push(entry);
       const label = mode === 'prompt' ? truncate(req.prompt, 60) : ('[' + mode + '] ' + entry.chatName);
-      log('<- enqueued', requestId, '|', label);
+      log('<- enqueued', requestId, '|', entry.provider, '|', label);
       pump();
     });
   }
@@ -126,13 +184,31 @@ function createServer(opts) {
       const method = req.method;
       const url = req.url;
 
+      if (method === 'GET' && url === '/version') {
+        return writeJson(res, 200, {
+          ok: true,
+          version: require('../package.json').version,
+          buildHash,
+        });
+      }
+
       if (method === 'POST' && url === '/hello') {
         const body = await readJson(req);
+        if (buildHash && body.buildHash !== buildHash) {
+          log('! version_mismatch | server', buildHash, '| extension', body.buildHash || '(none)');
+          return writeJson(res, httpStatusFor('version_mismatch'), {
+            ok: false,
+            error: 'version_mismatch',
+            reason: 'extension build ' + (body.buildHash || '(none)') + ' != server build ' + buildHash +
+                    '; reload the extension and hard-reload provider tabs',
+            details: { server: buildHash, extension: body.buildHash || null },
+          });
+        }
         sessionId = crypto.randomUUID();
         if (Array.isArray(body.tabs)) cachedTabs = body.tabs;
         log('extension connected (' + (body.version || '?') + ') | ' + (body.tabUrl || '?') +
             ' | ' + cachedTabs.length + ' tab(s)');
-        return writeJson(res, 200, { ok: true, sessionId });
+        return writeJson(res, 200, { ok: true, sessionId, buildHash });
       }
 
       if (method === 'GET' && url === '/tabs') {
@@ -211,9 +287,11 @@ function createServer(opts) {
         const body = await readJson(req);
         const chatName = body.chatName;
         const targetUrl = body.url;
-        if (!chatName) return writeJson(res, 400, { ok: false, error: 'chatName required' });
+        if (!chatName) return writeJson(res, 400, { ok: false, error: 'bad_request', reason: 'chatName required' });
+        const providerErr = checkProvider(body.provider);
+        if (providerErr) return writeJson(res, 400, errorBody(providerErr));
         try {
-          const result = await enqueue({ prompt: null, chatName, openOnly: true, targetUrl, provider: body.provider || 'deepseek' });
+          const result = await enqueue({ prompt: null, chatName, openOnly: true, targetUrl, provider: body.provider });
           return writeJson(res, 200, {
             ok: true,
             existing: !!(result && result.existing),
@@ -223,19 +301,21 @@ function createServer(opts) {
             chat: chatName,
           });
         } catch (e) {
-          return writeJson(res, 500, { ok: false, error: e.message || 'open_failed' });
+          return writeJson(res, httpStatusFor(e.code, 500), errorBody(e, 'open_failed'));
         }
       }
 
       if (method === 'POST' && url === '/reset') {
         const body = await readJson(req);
         const chatName = body.chatName;
-        if (!chatName) return writeJson(res, 400, { ok: false, error: 'chatName required' });
+        if (!chatName) return writeJson(res, 400, { ok: false, error: 'bad_request', reason: 'chatName required' });
+        const providerErr = checkProvider(body.provider);
+        if (providerErr) return writeJson(res, 400, errorBody(providerErr));
         try {
-          const result = await enqueue({ prompt: null, chatName, resetOnly: true });
+          const result = await enqueue({ prompt: null, chatName, resetOnly: true, provider: body.provider });
           return writeJson(res, 200, { ok: true, chat: chatName, result });
         } catch (e) {
-          return writeJson(res, 500, { ok: false, error: e.message || 'reset_failed' });
+          return writeJson(res, httpStatusFor(e.code, 500), errorBody(e, 'reset_failed'));
         }
       }
 
@@ -243,14 +323,16 @@ function createServer(opts) {
         const body = await readJson(req);
         const messages = Array.isArray(body.messages) ? body.messages : [];
         if (messages.length === 0) {
-          return writeJson(res, 400, { ok: false, error: 'messages_required' });
+          return writeJson(res, 400, { ok: false, error: 'bad_request', reason: 'messages required' });
         }
+        const providerErr = checkProvider(body.provider);
+        if (providerErr) return writeJson(res, 400, errorBody(providerErr));
         const prompt = messages.map((m) => m.content || '').join('\n\n');
         const chatName = body.chat || ('api-' + crypto.randomUUID().slice(0, 8));
         const targetTabId = body.targetTabId;
         const startedAt = Date.now();
         try {
-          const result = await enqueue({ prompt, chatName, targetTabId, provider: body.provider || 'deepseek' });
+          const result = await enqueue({ prompt, chatName, targetTabId, provider: body.provider });
           return writeJson(res, 200, {
             content: result.content,
             chat: chatName,
@@ -258,13 +340,7 @@ function createServer(opts) {
             elapsedMs: Date.now() - startedAt,
           });
         } catch (e) {
-          return writeJson(res, 500, {
-            ok: false,
-            error: e.code || e.message,
-            reason: e.reason,
-            details: e.details,
-            trace: e.trace,
-          });
+          return writeJson(res, httpStatusFor(e.code, 500), errorBody(e));
         }
       }
 
@@ -286,8 +362,20 @@ function createServer(opts) {
       });
     });
   }
-  // Backward-compatible alias — old callers use listen().
+  // Backward-compatible alias -- old callers use listen().
   const listen = start;
+
+  // Answer every held /next with a synthetic idle so the extension's fetch
+  // resolves instead of hanging on a socket the server is about to drop.
+  function answerAllWaiters() {
+    const n = waiting.length;
+    for (const w of waiting) {
+      if (w.timer) clearTimeout(w.timer);
+      writeJson(w.res, 200, { action: 'idle' });
+    }
+    waiting.length = 0;
+    return n;
+  }
 
   function stop() {
     return new Promise((resolve) => {
@@ -297,12 +385,19 @@ function createServer(opts) {
       for (const e of inFlight.values()) e.reject(err);
       queue.length = 0;
       inFlight.clear();
-      for (const w of waiting) { if (w.timer) clearTimeout(w.timer); }
-      waiting.length = 0;
-      httpServer.close(() => resolve());
+      const answered = answerAllWaiters();
+      if (answered > 0) log('stop: answered ' + answered + ' waiting /next poller(s)');
+      let killer = null;
+      httpServer.close(() => {
+        if (killer) clearTimeout(killer);
+        resolve();
+      });
+      httpServer.closeIdleConnections();
+      killer = setTimeout(() => httpServer.closeAllConnections(), 250);
+      killer.unref();
     });
   }
-  // Backward-compatible alias — old callers use close().
+  // Backward-compatible alias -- old callers use close().
   const close = stop;
 
   function status() {
@@ -315,6 +410,7 @@ function createServer(opts) {
       inFlight: inFlight.size,
       waitingPollers: waiting.length,
       tabs: cachedTabs.length,
+      buildHash,
     };
   }
 
@@ -326,6 +422,7 @@ function createServer(opts) {
     listen,   // alias for start
     close,    // alias for stop
     status,
+    buildHash,
     port: () => boundPort || port,
     get sessionId() { return sessionId; },
   };
@@ -362,8 +459,13 @@ async function main() {
   }
   const server = createServer({ port, token });
   await server.start();
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('');
+    // Failsafe: if stop() somehow hangs, still exit.
+    setTimeout(() => process.exit(0), 3000).unref();
     await server.stop();
     process.exit(0);
   };
@@ -375,4 +477,4 @@ if (require.main === module) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }
 
-module.exports = { createServer, DEFAULT_PORT, LONG_POLL_MS };
+module.exports = { createServer, DEFAULT_PORT, LONG_POLL_MS, KNOWN_PROVIDERS };

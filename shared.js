@@ -1,12 +1,18 @@
-// shared.js — constants and shapes used by both background.js (service worker)
+// shared.js -- constants and shapes used by both background.js (service worker)
 // and content.js (content script). Multi-provider aware. Must be a classic script: no ESM, no CJS.
 // Both contexts get `globalThis.DSC`.
+//
+// The server reads the build stamp below straight from this file (regex), so
+// keep the stamp on a single line in the form KEY: 'value'. Bump it on every
+// change to extension code; extension and server compare it on /hello.
 
 (function () {
   'use strict';
 
   const DSC = {
     VERSION: '0.2.0',
+
+    BUILD_HASH: 'p2-next-timeout-20261117a',
 
     STORAGE: {
       TOKEN: 'dsc_token',
@@ -15,10 +21,19 @@
 
     DEFAULT_PORT: 7331,
 
-    // PROVIDER_DOMAINS — single source of truth for URL -> provider mapping.
-    // background.js uses this to pick the correct tab per request. Adding a
-    // provider means adding one line here, plus the manifest entry and the
-    // provider file itself. Nothing else.
+    // Providers that have a registered module. tongyi has a domain below but
+    // no module, so it is not routable.
+    ROUTABLE_PROVIDERS: ['deepseek', 'qwen'],
+
+    // PROVIDER_HOSTS -- exact hostname per provider. Matching is hostname
+    // equality on a parsed URL, never a string prefix.
+    PROVIDER_HOSTS: {
+      deepseek: 'chat.deepseek.com',
+      qwen: 'chat.qwen.ai',
+      tongyi: 'tongyi.aliyun.com',
+    },
+
+    // PROVIDER_DOMAINS -- origin (with trailing slash) used for navigation.
     PROVIDER_DOMAINS: {
       deepseek: 'https://chat.deepseek.com/',
       qwen: 'https://chat.qwen.ai/',
@@ -49,6 +64,9 @@
       RESPONSE_TIMEOUT: 'response_timeout',
       SEND_FAILED: 'send_failed',
       INVALID_RESPONSE_FORMAT: 'invalid_response_format',
+      AMBIGUOUS_PROVIDER_TAB: 'ambiguous_provider_tab',
+      VERSION_MISMATCH: 'version_mismatch',
+      BAD_REQUEST: 'bad_request',
     },
 
     DELIMITER_RE: /^[ \t]*(\S+)[ \t]+START_(\S+)[ \t]*$([\s\S]*?)^[ \t]*\1[ \t]+END_\2[ \t]*$/m,
@@ -56,19 +74,38 @@
     FENCE_JS_RE: /```(?:js|javascript)\s*\n([\s\S]*?)```/g,
   };
 
-  // Provider name from a URL, or null if the URL isn't a supported
-  // provider (mock fixture counts as deepseek). Used by background.js
-  // when reporting tabs and picking a work tab.
+  // Lowercased hostname of a URL, or null if it does not parse.
+  DSC.hostnameOf = function hostnameOf(url) {
+    try {
+      return new URL(url).hostname.toLowerCase();
+    } catch (_) {
+      return null;
+    }
+  };
+
+  // Provider name from a URL, or null if the URL is not a supported
+  // provider. https + exact hostname equality. The mock fixture counts as
+  // deepseek.
   DSC.providerForUrl = function providerForUrl(url) {
     url = url || '';
-    for (const [name, prefix] of Object.entries(DSC.PROVIDER_DOMAINS)) {
-      if (url.startsWith(prefix)) return name;
+    let u = null;
+    try { u = new URL(url); } catch (_) { u = null; }
+    if (u && u.protocol === 'https:') {
+      const host = u.hostname.toLowerCase();
+      for (const [name, h] of Object.entries(DSC.PROVIDER_HOSTS)) {
+        if (host === h) return name;
+      }
     }
     if (/^file:\/\/.*mock-deepseek\.html/.test(url)) return 'deepseek';
     return null;
   };
 
-  // PROVIDER CONTRACT — a provider module must register itself as:
+  // True when `url` belongs to exactly this provider (exact hostname).
+  DSC.tabMatchesProvider = function tabMatchesProvider(url, provider) {
+    return !!provider && DSC.providerForUrl(url) === provider;
+  };
+
+  // PROVIDER CONTRACT -- a provider module must register itself as:
   //
   //   globalThis.DSC_PROVIDERS['<name>'] = {
   //     name: '<name>',
@@ -81,10 +118,11 @@
   // And must be added to:
   //   1. manifest.json content_scripts.js (loaded before content.js)
   //   2. background.js sendToTab re-injection files list
-  //   3. shared.js DSC.PROVIDER_DOMAINS (above)
+  //   3. shared.js PROVIDER_HOSTS + PROVIDER_DOMAINS (above), plus
+  //      ROUTABLE_PROVIDERS here and KNOWN_PROVIDERS in src/server.js
   //
-  // Nothing else needs to change. content.js routes blindly; server.js and
-  // client.js thread the provider string through without interpreting it.
+  // content.js routes blindly (and requires msg.provider); server.js and
+  // client.js thread the provider string through and refuse when it is missing.
 
   globalThis.DSC = DSC;
 })();

@@ -1,6 +1,14 @@
 // Qwen provider -- DOM manipulation for Qwen chat
 'use strict';
 
+// The "<token> START_<name>" / "<token> END_<name>" line protocol is parsed by
+// the two-pass extractor that providers/deepseek.js exports on DSC. It is
+// loaded before this file (manifest order and the re-injection list).
+function getExtractor() {
+  const fn = globalThis.DSC && globalThis.DSC.extractDelimited;
+  return typeof fn === 'function' ? fn : null;
+}
+
 const qwenProvider = {
   name: 'qwen',
   selectors: {
@@ -34,23 +42,26 @@ const qwenProvider = {
 
   async sendPrompt(prompt, delimiters) {
     dismissAgeModal();
-    
-    const delimiterStart = (delimiters && delimiters.start) || 'START_QWEN_REPLY';
-    const delimiterEnd = (delimiters && delimiters.end) || 'END_QWEN_REPLY';
-    const enforcedPrompt = prompt + `\n\nIMPORTANT: You MUST wrap your ENTIRE response between ${delimiterStart} and ${delimiterEnd}. Do not include any other text, thinking process, or greetings outside these markers.`;
 
     const DSC = globalThis.DSC;
     const startedAt = Date.now();
     const trace = [];
-    
+
     const T = function(phase, extra) {
       try { chrome.runtime.sendMessage({ type: 'dsc_phase', phase: phase, extra: extra }).catch(function() {}); } catch (_) {}
       trace.push(Object.assign({ t: Date.now() - startedAt, phase: phase }, extra || {}));
     };
-    
+
     const fail = function(error, reason, extra) {
       return Object.assign({ error: error, reason: reason, trace: trace, elapsedMs: Date.now() - startedAt }, extra || {});
     };
+
+    const extractor = getExtractor();
+    if (!extractor) return fail(DSC.ERR.INVALID_RESPONSE_FORMAT, 'extractor_unavailable');
+
+    const delimiterStart = (delimiters && delimiters.start) || 'START_';
+    const delimiterEnd = (delimiters && delimiters.end) || 'END_';
+    const enforcedPrompt = prompt + '\n\nIMPORTANT: Follow the output format above exactly, including the marker lines of the form `<token> ' + delimiterStart + '<name>` and `<token> ' + delimiterEnd + '<name>`, each on its own line. Do not add thinking, greetings, or any other text outside the marker lines.';
 
     T('step_1_dismiss_modal', { action: 'checking for age modal' });
     await sleep(1000); // Pace: wait for any modals to settle
@@ -60,14 +71,14 @@ const qwenProvider = {
       const el = qwenProvider.selectors.input();
       return el && visible(el) && !el.disabled ? el : null;
     }, { timeout: 10000 });
-    
+
     if (!input) return fail(DSC.ERR.INPUT_NOT_FOUND, 'input_not_found');
     await sleep(1000); // Pace: ensure UI is stable before typing
 
     T('step_3_type_prompt', { action: 'typing prompt' });
     setInputValue(input, enforcedPrompt);
     await sleep(1500); // Pace: let React register the input value
-    
+
     const typedLen = readInputValue(input).length;
     T('step_4_verify_input', { promptLen: enforcedPrompt.length, typedLen: typedLen });
     if (typedLen === 0) return fail(DSC.ERR.SEND_FAILED, 'input_empty_after_set');
@@ -76,7 +87,7 @@ const qwenProvider = {
     T('step_5_click_send', { action: 'clicking send button' });
     const sendBtn = qwenProvider.selectors.sendButton();
     if (!sendBtn) return fail(DSC.ERR.SEND_FAILED, 'send_button_not_found');
-    
+
     sendBtn.click();
     const sendClickedAt = Date.now();
     T('step_6_send_clicked', { ms: sendClickedAt - startedAt });
@@ -88,7 +99,7 @@ const qwenProvider = {
     T('step_7_wait_for_reply', { action: 'monitoring response' });
     while (Date.now() < deadline) {
       await sleep(1000); // Pace: check every 1 second
-      
+
       // Dismiss modal if it pops up mid-generation
       dismissAgeModal();
 
@@ -99,32 +110,30 @@ const qwenProvider = {
         T('step_7a_first_msg', { msgs: msgs.length, url: streamUrl });
       }
       if (!sawNew) continue;
-      
+
       const last = msgs[msgs.length - 1];
       const txt = (last.innerText || last.textContent || '').trim();
-      
-      // STRICT completion signals
+
+      // STRICT completion: a full marker-line pair must parse out of the
+      // reply, AND (copy button present OR text is substantial).
       const hasCopyBtn = !!last.querySelector('button[aria-label*="copy" i], .copy-btn, [data-icon="copy"]');
-      const hasStart = txt.includes(delimiterStart);
-      const hasEnd = txt.includes(delimiterEnd);
-      
-      // ONLY consider complete if delimiters are present AND (copy button exists OR text is substantial)
-      const isComplete = hasStart && hasEnd && (hasCopyBtn || txt.length > 50);
+      const parsedNow = extractor(txt, delimiterStart, delimiterEnd);
+      const isComplete = parsedNow !== null && (hasCopyBtn || txt.length > 50);
 
       if (!isComplete) {
-        T('step_7b_streaming', { len: txt.length, hasStart, hasEnd, hasCopyBtn });
+        T('step_7b_streaming', { len: txt.length, parsed: parsedNow !== null, hasCopyBtn });
         continue;
       }
 
       // Double-check stability
       await sleep(2000);
       const txtAfterDelay = (last.innerText || last.textContent || '').trim();
-      if (txtAfterDelay.includes(delimiterStart) && txtAfterDelay.includes(delimiterEnd)) {
+      if (extractor(txtAfterDelay, delimiterStart, delimiterEnd) !== null) {
         completedBy = 'strict_delimiters';
         break;
       }
     }
-    
+
     T('step_8_reply_done', { completedBy: completedBy, sawNew: sawNew });
     if (!sawNew) return fail(DSC.ERR.RESPONSE_TIMEOUT, 'no_new_message');
     if (!completedBy) return fail(DSC.ERR.RESPONSE_TIMEOUT, 'completion_timeout_missing_delimiters');
@@ -133,14 +142,12 @@ const qwenProvider = {
     const raw = (finalMsgs.length > 0 ? (finalMsgs[finalMsgs.length - 1].innerText || '').trim() : '');
     if (!raw) return fail(DSC.ERR.RESPONSE_TIMEOUT, 'empty_response');
 
-    // STRICT EXTRACTION: If delimiters are missing, REJECT.
-    const startIdx = raw.indexOf(delimiterStart);
-    const endIdx = raw.indexOf(delimiterEnd);
-    if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+    // STRICT EXTRACTION: if the marker lines do not parse, REJECT.
+    const content = extractor(raw, delimiterStart, delimiterEnd);
+    if (content === null) {
       return fail(DSC.ERR.INVALID_RESPONSE_FORMAT, 'Model did not follow delimiter instructions', { rawPreview: raw.slice(0, 200) });
     }
 
-    const content = raw.substring(startIdx + delimiterStart.length, endIdx).trim();
     return { content: content, raw: raw, source: 'strict_delimiter', elapsedMs: Date.now() - startedAt, url: streamUrl, trace: trace };
   },
 
