@@ -26,6 +26,7 @@ function createServer(opts) {
   const waiting = [];
   const inFlight = new Map();
   let sessionId = null;
+  let cachedTabs = [];
 
   function pump() {
     while (queue.length > 0 && waiting.length > 0 && inFlight.size === 0) {
@@ -37,24 +38,34 @@ function createServer(opts) {
       writeJson(waiter.res, 200, {
         action: 'next',
         requestId: entry.requestId,
+        mode: entry.mode || 'prompt',
         chatName: entry.chatName,
+        targetTabId: entry.targetTabId,
         prompt: entry.prompt,
         delimiters: entry.delimiters,
       });
-      log('-> dispatched', entry.requestId, '|', truncate(entry.prompt, 60));
+      const label = (entry.mode && entry.mode !== 'prompt')
+        ? ('[' + entry.mode + '] ' + entry.chatName)
+        : truncate(entry.prompt, 60);
+      log('-> dispatched', entry.requestId, '|', label);
     }
   }
 
   function enqueue(req) {
     return new Promise((resolve, reject) => {
-      if (typeof req.prompt !== 'string' || !req.prompt) {
+      const mode = req.openOnly ? 'open'
+                 : req.resetOnly ? 'reset'
+                 : 'prompt';
+      if (mode === 'prompt' && (typeof req.prompt !== 'string' || !req.prompt)) {
         return reject(new Error('prompt required'));
       }
       const requestId = crypto.randomUUID();
       const entry = {
         requestId,
+        mode,
         prompt: req.prompt,
         chatName: req.chatName || ('chat-' + requestId.slice(0, 8)),
+        targetTabId: req.targetTabId,
         delimiters: req.delimiters || DEFAULT_DELIMITERS,
         resolve,
         reject,
@@ -62,7 +73,8 @@ function createServer(opts) {
         startedAt: null,
       };
       queue.push(entry);
-      log('<- enqueued', requestId, '|', truncate(req.prompt, 60));
+      const label = mode === 'prompt' ? truncate(req.prompt, 60) : ('[' + mode + '] ' + entry.chatName);
+      log('<- enqueued', requestId, '|', label);
       pump();
     });
   }
@@ -113,8 +125,14 @@ function createServer(opts) {
       if (method === 'POST' && url === '/hello') {
         const body = await readJson(req);
         sessionId = crypto.randomUUID();
-        log('extension connected (' + (body.version || '?') + ') | ' + (body.tabUrl || '?'));
+        if (Array.isArray(body.tabs)) cachedTabs = body.tabs;
+        log('extension connected (' + (body.version || '?') + ') | ' + (body.tabUrl || '?') +
+            ' | ' + cachedTabs.length + ' tab(s)');
         return writeJson(res, 200, { ok: true, sessionId });
+      }
+
+      if (method === 'GET' && url === '/tabs') {
+        return writeJson(res, 200, { ok: true, tabs: cachedTabs });
       }
 
       if (method === 'GET' && url === '/next') {
@@ -134,6 +152,14 @@ function createServer(opts) {
         return;
       }
 
+      if (method === 'POST' && url === '/progress') {
+        const body = await readJson(req);
+        const id8 = String(body.requestId || '').slice(0, 8);
+        const extra = body.extra ? ' ' + JSON.stringify(body.extra) : '';
+        log('  ~ ' + id8 + ' ' + (body.phase || '?') + extra);
+        return writeJson(res, 200, { ok: true });
+      }
+
       if (method === 'POST' && url === '/reply') {
         const body = await readJson(req);
         const entry = inFlight.get(body.requestId);
@@ -144,17 +170,66 @@ function createServer(opts) {
         const elapsedMs = Date.now() - entry.startedAt;
         if (body.status === 'ok') {
           log('ok done', body.requestId, '| ' + elapsedMs + 'ms');
-          entry.resolve({ content: body.content, raw: body.raw, elapsedMs });
+          logTrace('ok', body.requestId, body.trace, 4);
+          entry.resolve({
+            content: body.content,
+            raw: body.raw,
+            elapsedMs,
+            trace: body.trace,
+            existing: body.existing,
+            mode: body.mode,
+            debug: body.debug,
+            chat: body.chat,
+          });
         } else {
-          log('x failed', body.requestId, '|', body.reason || body.error || 'unknown');
+          if (body.error === 'dom_drift') {
+            const names = Array.isArray(body.details) ? body.details.join(', ') : '?';
+            log('! DOM DRIFT', body.requestId, '| missing required:', names);
+          } else {
+            log('x failed', body.requestId, '|', body.reason || body.error || 'unknown');
+          }
+          logTrace('err', body.requestId, body.trace, 8);
           const err = new Error(body.reason || body.error || 'extension_error');
           err.code = body.error;
           err.reason = body.reason;
           err.retryAfter = body.retryAfter;
+          err.details = body.details;
+          err.probe = body.probe;
+          err.trace = body.trace;
           entry.reject(err);
         }
         pump();
         return writeJson(res, 200, { ok: true });
+      }
+
+      if (method === 'POST' && url === '/open') {
+        const body = await readJson(req);
+        const chatName = body.chatName;
+        if (!chatName) return writeJson(res, 400, { ok: false, error: 'chatName required' });
+        try {
+          const result = await enqueue({ prompt: null, chatName, openOnly: true });
+          return writeJson(res, 200, {
+            ok: true,
+            existing: !!(result && result.existing),
+            mode: result && result.mode,
+            debug: result && result.debug,
+            chat: chatName,
+          });
+        } catch (e) {
+          return writeJson(res, 500, { ok: false, error: e.message || 'open_failed' });
+        }
+      }
+
+      if (method === 'POST' && url === '/reset') {
+        const body = await readJson(req);
+        const chatName = body.chatName;
+        if (!chatName) return writeJson(res, 400, { ok: false, error: 'chatName required' });
+        try {
+          const result = await enqueue({ prompt: null, chatName, resetOnly: true });
+          return writeJson(res, 200, { ok: true, chat: chatName, result });
+        } catch (e) {
+          return writeJson(res, 500, { ok: false, error: e.message || 'reset_failed' });
+        }
       }
 
       if (method === 'POST' && url === '/chat') {
@@ -165,9 +240,10 @@ function createServer(opts) {
         }
         const prompt = messages.map((m) => m.content || '').join('\n\n');
         const chatName = body.chat || ('api-' + crypto.randomUUID().slice(0, 8));
+        const targetTabId = body.targetTabId;
         const startedAt = Date.now();
         try {
-          const result = await enqueue({ prompt, chatName });
+          const result = await enqueue({ prompt, chatName, targetTabId });
           return writeJson(res, 200, {
             content: result.content,
             chat: chatName,
@@ -178,6 +254,8 @@ function createServer(opts) {
             ok: false,
             error: e.code || e.message,
             reason: e.reason,
+            details: e.details,
+            trace: e.trace,
           });
         }
       }
@@ -230,6 +308,18 @@ function defaultLog() {
 function truncate(s, n) {
   s = String(s).replace(/\s+/g, ' ');
   return s.length > n ? s.slice(0, n) + '...' : s;
+}
+
+function logTrace(tag, id, trace, tail) {
+  if (!Array.isArray(trace) || trace.length === 0) return;
+  const shown = trace.slice(-(tail || 6));
+  for (const e of shown) {
+    const { t, phase, ...rest } = e;
+    console.log('  trace[' + tag + ']', id.slice(0, 8),
+      String(t).padStart(5) + 'ms',
+      phase,
+      Object.keys(rest).length ? JSON.stringify(rest) : '');
+  }
 }
 
 async function main() {

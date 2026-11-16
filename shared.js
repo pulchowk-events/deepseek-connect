@@ -29,6 +29,7 @@
     },
 
     ERR: {
+      DOM_DRIFT: 'dom_drift',
       INPUT_NOT_FOUND: 'input_not_found',
       DEEPTHINK_ENABLE_FAILED: 'deepthink_enable_failed',
       DEEPTHINK_OFF: 'deepthink_off',

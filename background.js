@@ -51,14 +51,40 @@ async function apiFetch(cfg, path, init) {
   return json;
 }
 
-async function getWorkTab() {
+async function getWorkTab(targetTabId) {
+  if (targetTabId) {
+    try {
+      const t = await chrome.tabs.get(targetTabId);
+      if (t && /^https:\/\/chat\.deepseek\.com\//.test(t.url || '')) return t;
+    } catch (_) { /* fall through to null */ }
+    // Caller explicitly named a tab. Do NOT silently fall back to another
+    // deepseek tab — that would type into the wrong chat (the one the user
+    // is reading) and poll a different tab for the reply. Hard-fail instead.
+    return null;
+  }
+  // Persistent work tab. First call picks one, then reuse the same tab for the
+  // whole session. Without this, selection flips based on which deepseek tab
+  // is `active`, and a batch run would type into whichever chat the user is
+  // reading the moment they click around mid-run.
+  const stored = await chrome.storage.local.get('workTabId');
+  if (stored && stored.workTabId) {
+    try {
+      const t = await chrome.tabs.get(stored.workTabId);
+      if (t && /^https:\/\/chat\.deepseek\.com\//.test(t.url || '')) return t;
+    } catch (_) { /* stale — clear and re-pick */ }
+    await chrome.storage.local.remove('workTabId');
+  }
   const ds = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
-  if (ds[0]) return ds[0];
-  const mock = await chrome.tabs.query({ url: 'file:///*mock-deepseek.html' });
-  return mock[0] || null;
+  if (ds.length === 0) {
+    const mock = await chrome.tabs.query({ url: 'file:///*mock-deepseek.html' });
+    return mock[0] || null;
+  }
+  const chosen = ds.find((t) => !t.active) || ds[0];
+  await chrome.storage.local.set({ workTabId: chosen.id });
+  return chosen;
 }
 
-function sendToTab(tabId, msg) {
+function sendOnce(tabId, msg) {
   return new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tabId, msg, (resp) => {
       const le = chrome.runtime.lastError;
@@ -68,26 +94,65 @@ function sendToTab(tabId, msg) {
   });
 }
 
+async function sendToTab(tabId, msg) {
+  try {
+    return await sendOnce(tabId, msg);
+  } catch (e) {
+    if (!/Receiving end does not exist/i.test(e.message)) throw e;
+    // Content script is orphaned (loaded before last extension reload, or
+    // lost after SW restart). Re-inject and retry once.
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['shared.js', 'selectors.js', 'content.js'],
+    });
+    return await sendOnce(tabId, msg);
+  }
+}
+
+let activeRequestId = null;
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'dsc_phase') return;
+  if (!activeRequestId) return;
+  const rid = activeRequestId;
+  (async () => {
+    const cfg = await loadConfig();
+    if (!cfg) return;
+    await apiFetch(cfg, '/progress', {
+      method: 'POST',
+      body: JSON.stringify({ requestId: rid, phase: msg.phase, extra: msg.extra }),
+    }).catch(() => {});
+  })();
+});
+
 function broadcast() {
   chrome.runtime.sendMessage({ type: 'state', state }).catch(() => {});
 }
 
 async function register(cfg) {
+  const tabs = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
+  const tabList = tabs.map((t) => ({
+    id: t.id,
+    url: t.url,
+    title: (t.title || '').slice(0, 80),
+    active: !!t.active,
+  }));
   const tab = await getWorkTab();
   const tabUrl = tab ? tab.url : null;
   const resp = await apiFetch(cfg, '/hello', {
     method: 'POST',
-    body: JSON.stringify({ version: DSC.VERSION, tabUrl }),
+    body: JSON.stringify({ version: DSC.VERSION, tabUrl, tabs: tabList }),
   });
   state.connected = true;
   state.lastHelloAt = Date.now();
   state.serverUrl = cfg.baseUrl;
+  state.tabs = tabList;
   broadcast();
   return resp;
 }
 
 async function handleNext(cfg, work) {
-  const tab = await getWorkTab();
+  const tab = await getWorkTab(work.targetTabId);
   if (!tab) {
     await apiFetch(cfg, '/reply', {
       method: 'POST',
@@ -102,17 +167,75 @@ async function handleNext(cfg, work) {
   }
 
   try {
-    const ensured = await sendToTab(tab.id, {
+    activeRequestId = work.requestId;
+    let ensured = await sendToTab(tab.id, {
       action: DSC.MSG.ENSURE_CHAT,
       name: work.chatName,
     });
+    if (ensured && ensured.needNewChat) {
+      // Content is on an existing chat with no sidebar match. Navigate to a
+      // fresh / and retry once. URL nav is robust; button text is not.
+      await chrome.tabs.update(tab.id, { url: 'https://chat.deepseek.com/' });
+      await new Promise((res) => {
+        const onUpd = (id, info) => {
+          if (id === tab.id && info.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(onUpd);
+            res();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(onUpd);
+        setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpd); res(); }, 15000);
+      });
+      await new Promise((r) => setTimeout(r, 800));
+      ensured = await sendToTab(tab.id, {
+        action: DSC.MSG.ENSURE_CHAT,
+        name: work.chatName,
+      });
+    }
     if (!ensured || !ensured.ok) {
       throw Object.assign(new Error('ensureChat failed'), {
         code: (ensured && ensured.error) || DSC.ERR.CHAT_NOT_FOUND,
+        details: ensured,
       });
     }
     state.currentChat = work.chatName;
     broadcast();
+
+    if (work.mode === 'open') {
+      activeRequestId = null;
+      await apiFetch(cfg, '/reply', {
+        method: 'POST',
+        body: JSON.stringify({
+          requestId: work.requestId,
+          status: 'ok',
+          content: null,
+          existing: !!(ensured && ensured.existing),
+          mode: ensured && ensured.mode,
+          debug: ensured && ensured.debug,
+          chat: work.chatName,
+        }),
+      });
+      return;
+    }
+
+    if (work.mode === 'reset') {
+      const reset = await sendToTab(tab.id, {
+        action: DSC.MSG.RESET_CHAT,
+        name: work.chatName,
+      });
+      activeRequestId = null;
+      await apiFetch(cfg, '/reply', {
+        method: 'POST',
+        body: JSON.stringify({
+          requestId: work.requestId,
+          status: (reset && reset.ok) ? 'ok' : 'error',
+          error: (reset && reset.error) || null,
+          reason: (reset && reset.reason) || null,
+          chat: work.chatName,
+        }),
+      });
+      return;
+    }
 
     const result = await sendToTab(tab.id, {
       action: DSC.MSG.SEND_PROMPT,
@@ -129,6 +252,9 @@ async function handleNext(cfg, work) {
           error: result.error,
           reason: result.reason,
           retryAfter: result.retryAfter,
+          details: result.details,
+          probe: result.probe,
+          trace: result.trace,
         }),
       });
       return;
@@ -136,6 +262,7 @@ async function handleNext(cfg, work) {
 
     state.promptsDone += 1;
     broadcast();
+    activeRequestId = null;
     await apiFetch(cfg, '/reply', {
       method: 'POST',
       body: JSON.stringify({
@@ -143,10 +270,12 @@ async function handleNext(cfg, work) {
         status: 'ok',
         content: result.content,
         raw: result.raw,
+        trace: result.trace,
       }),
     });
   } catch (e) {
     state.lastError = e.message;
+    activeRequestId = null;
     broadcast();
     await apiFetch(cfg, '/reply', {
       method: 'POST',
@@ -155,6 +284,7 @@ async function handleNext(cfg, work) {
         status: 'error',
         error: e.code || 'background_error',
         reason: e.message,
+        details: e.details,
       }),
     }).catch(() => {});
   }
@@ -217,6 +347,23 @@ function startLoop() {
 function stopLoop() {
   running = false;
 }
+
+let tabRefreshTimer = null;
+function refreshTabsSoon() {
+  if (tabRefreshTimer) return;
+  tabRefreshTimer = setTimeout(async () => {
+    tabRefreshTimer = null;
+    if (!state.connected) return;
+    const cfg = await loadConfig();
+    if (!cfg) return;
+    try { await register(cfg); } catch (_) {}
+  }, 1000);
+}
+chrome.tabs.onCreated.addListener(() => refreshTabsSoon());
+chrome.tabs.onRemoved.addListener(() => refreshTabsSoon());
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url || changeInfo.title) refreshTabsSoon();
+});
 
 chrome.runtime.onInstalled.addListener(() => { startLoop(); });
 chrome.runtime.onStartup.addListener(() => { startLoop(); });
