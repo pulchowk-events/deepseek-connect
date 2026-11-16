@@ -42,6 +42,8 @@
   }
 
   function findInput() {
+    const r = globalThis.DSC_SELECTORS && globalThis.DSC_SELECTORS.resolve('input');
+    if (r && r.el) return r.el;
     return (
       document.querySelector('textarea[placeholder]') ||
       document.querySelector('textarea') ||
@@ -50,6 +52,8 @@
   }
 
   function findSendButton() {
+    const r = globalThis.DSC_SELECTORS && globalThis.DSC_SELECTORS.resolve('sendButton');
+    if (r && r.el) return r.el;
     const candidates = [
       'button[aria-label*="Send" i]',
       'button[aria-label*="send" i]',
@@ -63,18 +67,14 @@
   }
 
   function findToggle(kind) {
-    // kind: 'deepthink' | 'search'
+    const logical = kind === 'deepthink' ? 'toggleDeepThink' : 'toggleSearch';
+    const r = globalThis.DSC_SELECTORS && globalThis.DSC_SELECTORS.resolve(logical);
+    if (r && r.el) return r.el;
     const re = kind === 'deepthink' ? /deep\s*think/i : /^search$/i;
-    const btn = findByText(document, 'button', re) || findByText(document, '[role="button"]', re);
-    if (btn) return btn;
-    const attrs = kind === 'deepthink'
-      ? ['[data-testid*="deepthink" i]', '[class*="deepthink" i]', '[class*="reasoning" i]']
-      : ['[data-testid*="search" i]', '[class*="search" i][role="button"]'];
-    for (const sel of attrs) {
-      const el = document.querySelector(sel);
-      if (el) return el;
+    for (const el of document.querySelectorAll('[aria-pressed]')) {
+      if (re.test((el.textContent || '').trim())) return el;
     }
-    return null;
+    return findByText(document, 'button, [role="button"]', re);
   }
 
   function toggleIsOn(el) {
@@ -115,16 +115,23 @@
     const input = findInput();
     const dt = findToggle('deepthink');
     const sr = findToggle('search');
+    const probe = globalThis.DSC_SELECTORS ? globalThis.DSC_SELECTORS.probeDom() : null;
     return {
       inputFound: !!input,
       deepThinkOn: toggleIsOn(dt),
       searchOn: toggleIsOn(sr),
       currentChatName: currentChatName(),
       loggedOut: detectLoggedOut(),
+      drift: probe ? { drifted: probe.drifted, degraded: probe.degraded } : null,
     };
   }
 
   function currentChatName() {
+    const r = globalThis.DSC_SELECTORS && globalThis.DSC_SELECTORS.resolve('headerTitle');
+    if (r && r.el) {
+      const t = (r.el.textContent || '').trim();
+      if (t) return t;
+    }
     const header = document.querySelector('header, [data-testid*="header" i], h1');
     if (!header) return null;
     const t = (header.textContent || '').trim();
@@ -140,15 +147,62 @@
     );
   }
 
+  function findSidebarContainer() {
+    // DeepSeek's sidebar no longer has semantic class names (only build
+    // hashes). Anchor on the "New chat" button text and walk up to a
+    // narrow-tall container — that's the sidebar.
+    const btn = findByText(document, 'button, div, a, span', /^new chat$/i);
+    if (btn) {
+      let el = btn;
+      for (let i = 0; i < 10; i++) {
+        const r = el.getBoundingClientRect();
+        if (r.height > 400 && r.width > 100 && r.width < 500) return el;
+        el = el.parentElement;
+        if (!el) break;
+      }
+    }
+    return document.querySelector('aside, nav, [class*="sidebar" i], [class*="sider" i]');
+  }
+
+  function listChatLeafItems() {
+    const side = findSidebarContainer();
+    if (!side) return [];
+    const skip = /^(new chat|today|yesterday|previous \d+ days?|older|archived?)$/i;
+    const out = [];
+    const vh = window.innerHeight;
+    for (const el of side.querySelectorAll('*')) {
+      if (el.children.length > 0) continue;
+      const txt = (el.textContent || '').trim();
+      if (txt.length < 2 || txt.length > 200) continue;
+      if (skip.test(txt)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 30 || r.height < 10 || r.height > 60) continue;
+      if (r.top > vh - 80) continue; // profile/settings at bottom
+      out.push(el);
+    }
+    return out;
+  }
+
+  function clickableAncestor(el) {
+    let cur = el;
+    for (let i = 0; i < 5 && cur; i++) {
+      const tag = cur.tagName;
+      const role = cur.getAttribute && cur.getAttribute('role');
+      if (tag === 'A' || role === 'link' || role === 'button') return cur;
+      try {
+        if (window.getComputedStyle(cur).cursor === 'pointer') return cur;
+      } catch (_) { /* detached */ }
+      cur = cur.parentElement;
+    }
+    return el;
+  }
+
   function findChatInSidebar(name) {
-    const side = findSidebar();
-    if (!side) return null;
     const re = new RegExp(escapeRe(name), 'i');
-    const items = side.querySelectorAll('a, button, li, [role="button"], [role="link"]');
-    for (const el of items) {
-      const t = (el.textContent || '').trim();
-      if (!t) continue;
-      if (t === name || re.test(t)) return el;
+    const leaves = listChatLeafItems();
+    for (const leaf of leaves) {
+      const t = (leaf.textContent || '').trim();
+      if (t === name || re.test(t)) return clickableAncestor(leaf);
     }
     return null;
   }
@@ -158,10 +212,9 @@
   }
 
   function findNewChatButton() {
-    const byText = findByText(document, 'button, a, [role="button"]', /new\s*chat/i);
-    if (byText) return byText;
-    return document.querySelector('[aria-label*="new chat" i]') ||
-           document.querySelector('[data-testid*="new-chat" i]');
+    const r = globalThis.DSC_SELECTORS && globalThis.DSC_SELECTORS.resolve('newChatButton');
+    if (r && r.el) return r.el;
+    return findByText(document, 'button, a, [role="button"]', /new\s*chat/i);
   }
 
   async function waitForInputReady(timeout) {
@@ -225,20 +278,33 @@
   async function ensureChat(name) {
     if (!name) return { ok: false, error: DSC.ERR.CHAT_NOT_FOUND, reason: 'no_name' };
 
+    const debug = { sideFound: false, leafCount: 0, leafPreview: [], name, path: location.pathname };
+    try {
+      const side = findSidebarContainer();
+      debug.sideFound = !!side;
+      if (side) {
+        const leaves = listChatLeafItems();
+        debug.leafCount = leaves.length;
+        debug.leafPreview = leaves.slice(0, 8).map((el) => (el.textContent || '').trim().slice(0, 40));
+      }
+    } catch (e) {
+      debug.debugError = String(e && e.message || e);
+    }
+
     const existing = findChatInSidebar(name);
     if (existing) {
       existing.click();
       const input = await waitForInputReady(5000);
-      if (!input) return { ok: false, error: DSC.ERR.INPUT_NOT_FOUND, reason: 'input_after_open_existing' };
-      return { ok: true, existing: true };
+      if (!input) return { ok: false, error: DSC.ERR.INPUT_NOT_FOUND, reason: 'input_after_open_existing', debug };
+      return { ok: true, existing: true, mode: 'existing', debug };
     }
 
-    const created = await openNewChat();
-    if (!created.ok) return created;
+    if (location.pathname === '/' || location.pathname === '') {
+      const input = await waitForInputReady(2000);
+      if (input) return { ok: true, existing: false, mode: 'fresh', debug };
+    }
 
-    const renamed = await renameCurrentChat(name);
-    // Rename failure is non-fatal: chat exists, just unnamed. Wizard can still proceed.
-    return { ok: true, existing: false, rename: renamed };
+    return { ok: false, needNewChat: true, mode: 'need_nav', path: location.pathname, debug };
   }
 
   async function resetChat(name) {
@@ -270,28 +336,33 @@
   }
 
   function findAssistantMessages() {
-    // DeepSeek assistant blocks. Order of specificity — first that yields >0 wins.
-    const sels = [
-      '[data-message-author-role="assistant"]',
-      '[data-testid*="assistant" i]',
-      '[class*="assistant" i]',
-      '[class*="markdown" i]',
-    ];
-    for (const sel of sels) {
-      const els = document.querySelectorAll(sel);
-      if (els.length > 0) return Array.from(els);
-    }
-    return [];
+    const r = globalThis.DSC_SELECTORS && globalThis.DSC_SELECTORS.resolve('assistantMessages');
+    if (r && r.el) return Array.isArray(r.el) ? r.el : [r.el];
+    // Fallback if selectors.js somehow didn't load (defensive).
+    return Array.from(document.querySelectorAll('.ds-message'))
+      .filter((m) => m.querySelector('.ds-markdown'));
   }
 
   function lastAssistantText() {
     const msgs = findAssistantMessages();
     if (msgs.length === 0) return null;
     const last = msgs[msgs.length - 1];
-    const clone = last.cloneNode(true);
-    // Strip buttons and copy affordances so extracted text is clean.
-    clone.querySelectorAll('button, [role="button"], svg').forEach((n) => n.remove());
-    return (clone.innerText || clone.textContent || '').trim();
+    let target = last.querySelector('.ds-assistant-message-main-content');
+    if (!target) {
+      const mds = Array.from(last.querySelectorAll('.ds-markdown'));
+      for (let i = mds.length - 1; i >= 0; i--) {
+        if (!mds[i].closest('[class*="think" i]')) { target = mds[i]; break; }
+      }
+      if (!target && mds.length === 0) target = last;
+      if (!target) return null;
+    }
+    // Must read innerText on the LIVE element. A detached cloneNode returns
+    // '' for innerText in Chromium (falls back to textContent, which loses
+    // newlines between block elements and breaks delimiter line anchors).
+    // Buttons inside assistant blocks carry aria-label, no text content, so
+    // innerText stays clean without stripping.
+    const txt = (target.innerText || target.textContent || '').trim();
+    return txt || null;
   }
 
   function hasCopyAndRegenerateButtons(root) {
@@ -313,17 +384,40 @@
 
   function extractDelimited(raw, start, end) {
     if (!raw) return null;
-    // Match "<source> START_<file>" ... "<source> END_<file>". Multi-block: take first.
-    const re = new RegExp(
-      '^[ \\t]*(\\S+)[ \\t]+' + escapeRe(start) + '(\\S+)[ \\t]*$[\\s\\S]*?^[ \\t]*\\1[ \\t]+' + escapeRe(end) + '\\2[ \\t]*$',
+    const s = escapeRe(start);
+    const e = escapeRe(end);
+    // Pass 1: line-anchored. Preferred when innerText preserved newlines.
+    const reAnchored = new RegExp(
+      '^[ \\t]*(\\S+)[ \\t]+' + s + '(\\S+)[ \\t]*$[\\s\\S]*?^[ \\t]*\\1[ \\t]+' + e + '\\2[ \\t]*$',
       'm'
     );
-    const m = raw.match(re);
-    if (!m) return null;
-    const lines = m[0].split('\n');
-    lines.shift();
-    lines.pop();
-    return lines.join('\n').trim();
+    let m = raw.match(reAnchored);
+    if (m) {
+      const lines = m[0].split('\n');
+      if (lines.length >= 2) { lines.shift(); lines.pop(); }
+      return lines.join('\n').trim();
+    }
+    // Pass 2: whitespace-tolerant. Handles collapsed single-line blobs where
+    // the model or DOM dropped the newlines. Match anywhere, no line anchors.
+    const reLoose = new RegExp(
+      '(\\w[\\w-]*)[ \\t\\n]*' + s + '([\\w.-]+)[\\s\\S]*?' +
+      '\\1[ \\t\\n]*' + e + '\\2',
+      'm'
+    );
+    m = raw.match(reLoose);
+    if (m) {
+      // Strip the header and footer from the full match, keep the middle.
+      const full = m[0];
+      const headerLen = m[1].length + s.length + m[2].length;
+      // Skip optional whitespace between header and body.
+      let bodyStart = headerLen;
+      while (bodyStart < full.length && /[\s]/.test(full[bodyStart])) bodyStart++;
+      const footerLen = m[1].length + e.length + m[2].length;
+      let bodyEnd = full.length - footerLen;
+      while (bodyEnd > bodyStart && /[\s]/.test(full[bodyEnd - 1])) bodyEnd--;
+      return full.slice(bodyStart, bodyEnd).trim();
+    }
+    return null;
   }
 
   function extractLastJsFence(raw) {
@@ -345,55 +439,151 @@
   }
 
   async function sendPrompt(prompt, delimiters) {
-    const input = await waitForInputReady(5000);
-    if (!input) return { error: DSC.ERR.INPUT_NOT_FOUND };
+    const startedAt = Date.now();
+    const trace = [];
+    const T = (phase, extra) => {
+      // Broadcast live so background can POST /progress; final trace below
+      // still carries the full sequence in the /reply payload.
+      try {
+        chrome.runtime.sendMessage({ type: 'dsc_phase', phase, extra }).catch(() => {});
+      } catch (_) { /* no-op if port closed */ }
+      trace.push(Object.assign({ t: Date.now() - startedAt, phase }, extra || {}));
+      if (trace.length > 60) trace.splice(1, 1);
+    };
+    const fail = (error, reason, extra) => Object.assign(
+      { error, reason, trace, elapsedMs: Date.now() - startedAt },
+      extra || {}
+    );
 
-    if (detectLoggedOut()) return { error: DSC.ERR.LOGGED_OUT };
-
-    const dt = await ensureToggleOn('deepthink', DSC.ERR.DEEPTHINK_ENABLE_FAILED);
-    if (!dt.ok) return { error: DSC.ERR.DEEPTHINK_ENABLE_FAILED, reason: dt.reason };
-    const sr = await ensureToggleOn('search', DSC.ERR.SEARCH_ENABLE_FAILED);
-    if (!sr.ok) return { error: DSC.ERR.SEARCH_ENABLE_FAILED, reason: sr.reason };
-
-    const before = findAssistantMessages().length;
-
-    setInputValue(input, prompt);
-    await sleep(100);
-    if (readInputValue(input).length === 0) {
-      return { error: DSC.ERR.SEND_FAILED, reason: 'input_empty_after_set' };
+    // Phase 1: DOM probe
+    const probe = globalThis.DSC_SELECTORS ? globalThis.DSC_SELECTORS.probeDom() : null;
+    if (probe) {
+      const requiredDrift = probe.drifted.filter((d) => d.required);
+      T('probe', {
+        healthy: probe.healthy,
+        degraded: probe.degraded,
+        requiredMissing: requiredDrift.map((d) => d.name),
+      });
+      if (requiredDrift.length > 0) {
+        return fail(DSC.ERR.DOM_DRIFT, 'required_elements_missing', {
+          details: requiredDrift.map((d) => d.name),
+          probe,
+        });
+      }
+    } else {
+      T('probe', { note: 'selectors_not_loaded' });
     }
 
-    const sendBtn = findSendButton();
-    if (!sendBtn) return { error: DSC.ERR.SEND_FAILED, reason: 'send_button_not_found' };
-    const startedAt = Date.now();
-    sendBtn.click();
+    // Phase 2: input
+    const input = await waitForInputReady(5000);
+    T('waitInput', { found: !!input });
+    if (!input) return fail(DSC.ERR.INPUT_NOT_FOUND, 'input_not_found');
 
-    // Wait for at least one new assistant message AND completion markers.
-    const deadline = startedAt + DSC.RESPONSE_TIMEOUT_MS;
+    if (detectLoggedOut()) return fail(DSC.ERR.LOGGED_OUT, 'logged_out');
+
+    // Phase 3: toggles
+    const dt = await ensureToggleOn('deepthink', DSC.ERR.DEEPTHINK_ENABLE_FAILED);
+    T('toggleDeepthink', { ok: dt.ok, reason: dt.reason });
+    if (!dt.ok) return fail(DSC.ERR.DEEPTHINK_ENABLE_FAILED, dt.reason);
+
+    const sr = await ensureToggleOn('search', DSC.ERR.SEARCH_ENABLE_FAILED);
+    T('toggleSearch', { ok: sr.ok, reason: sr.reason });
+    if (!sr.ok) return fail(DSC.ERR.SEARCH_ENABLE_FAILED, sr.reason);
+
+    // Phase 4: set input
+    const before = findAssistantMessages().length;
+    setInputValue(input, prompt);
+    await sleep(100);
+    const typedLen = readInputValue(input).length;
+    T('setInput', { promptLen: prompt.length, typedLen, msgBefore: before });
+    if (typedLen === 0) return fail(DSC.ERR.SEND_FAILED, 'input_empty_after_set');
+
+    // Phase 5: click send
+    const sendBtn = findSendButton();
+    if (!sendBtn) return fail(DSC.ERR.SEND_FAILED, 'send_button_not_found');
+    sendBtn.click();
+    const sendClickedAt = Date.now();
+    T('sendClick', { ms: sendClickedAt - startedAt });
+
+    // Phase 6: wait for reply.
+    // Real DeepSeek streams reasoning first (.ds-think-content), answer later
+    // (.ds-assistant-message-main-content). Reasoning text is NOT the answer;
+    // ignore it for completion detection, log its growth as 'reasoning'.
+    const deadline = sendClickedAt + DSC.RESPONSE_TIMEOUT_MS;
     let sawNew = false;
+    let streamUrl = null;
+    let answerStarted = false;
+    let stableLen = -1;
+    let stableSince = 0;
+    let completedBy = null;
+    let lastSample = 0;
+    let lastReasonLen = -1;
     while (Date.now() < deadline) {
       await sleep(400);
       const msgs = findAssistantMessages();
-      if (msgs.length > before) sawNew = true;
-      if (sawNew && responseLooksComplete()) break;
-    }
+      if (msgs.length > before && !sawNew) {
+        sawNew = true;
+        streamUrl = location.href;
+        T('firstMsg', { msgs: msgs.length, url: streamUrl.split('/').pop().slice(0, 8) });
+      }
+      if (!sawNew) continue;
+      if (streamUrl && location.href !== streamUrl) {
+        return fail(DSC.ERR.DOM_DRIFT, 'user_navigated', {
+          expected: streamUrl, actual: location.href,
+        });
+      }
+      if (responseLooksComplete()) { completedBy = 'buttons'; break; }
 
-    if (!sawNew) return { error: DSC.ERR.RESPONSE_TIMEOUT, reason: 'no_new_message' };
-    if (!responseLooksComplete()) return { error: DSC.ERR.RESPONSE_TIMEOUT, reason: 'completion_markers_missing' };
+      const last = msgs[msgs.length - 1];
+      const hasAnswer = !!(last && last.querySelector('.ds-assistant-message-main-content'));
+      if (!hasAnswer) {
+        const reasonLen = last ? (last.textContent || '').length : 0;
+        if (reasonLen !== lastReasonLen && Date.now() - lastSample > 1500) {
+          lastReasonLen = reasonLen;
+          lastSample = Date.now();
+          T('reasoning', { len: reasonLen });
+        }
+        continue;
+      }
+      if (!answerStarted) {
+        answerStarted = true;
+        T('answerStarted');
+      }
+
+      const txt = lastAssistantText() || '';
+      if (txt.length === 0) continue;
+      if (txt.length !== stableLen) {
+        stableLen = txt.length;
+        stableSince = Date.now();
+        if (Date.now() - lastSample > 1500) {
+          lastSample = Date.now();
+          T('answer', { len: stableLen });
+        }
+      } else if (stableSince > 0 && Date.now() - stableSince >= 2500) {
+        completedBy = 'stable';
+        break;
+      }
+    }
+    T('replyDone', { completedBy, sawNew, stableLen });
+    if (!sawNew) return fail(DSC.ERR.RESPONSE_TIMEOUT, 'no_new_message');
+    if (!completedBy) return fail(DSC.ERR.RESPONSE_TIMEOUT, 'completion_timeout');
 
     const raw = lastAssistantText();
-    if (!raw) return { error: DSC.ERR.RESPONSE_TIMEOUT, reason: 'empty_response' };
+    if (!raw) return fail(DSC.ERR.RESPONSE_TIMEOUT, 'empty_response');
 
     if (/too many requests|rate limit/i.test(raw)) {
-      return { error: DSC.ERR.RATE_LIMITED, retryAfter: 30 };
+      return fail(DSC.ERR.RATE_LIMITED, 'rate_limited', { retryAfter: 30 });
     }
 
+    // Phase 7: extract
     const extracted = extractContent(raw, delimiters);
+    T('extract', { source: extracted.source, contentLen: extracted.content.length, rawLen: raw.length });
     return {
       content: extracted.content,
       raw,
       source: extracted.source,
       elapsedMs: Date.now() - startedAt,
+      trace,
     };
   }
 

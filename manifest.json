@@ -3,11 +3,12 @@
   "name": "deepseek-connect",
   "version": "0.1.0",
   "description": "Drives a real DeepSeek chat tab over a local HTTP server.",
-  "permissions": ["storage", "alarms"],
+  "permissions": ["storage", "alarms", "scripting"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",
-    "file:///*"
+    "file:///*",
+    "https://chat.deepseek.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -18,7 +19,7 @@
         "https://chat.deepseek.com/*",
         "file:///*mock-deepseek.html"
       ],
-      "js": ["shared.js", "content.js"],
+      "js": ["shared.js", "selectors.js", "content.js"],
       "run_at": "document_idle"
     }
   ],
