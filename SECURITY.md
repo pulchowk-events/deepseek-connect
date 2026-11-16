@@ -17,7 +17,7 @@ Report privately via one of these channels:
 
 1. **GitHub Security Advisories** (preferred). Go to the [Security tab](https://github.com/pulchowk-events/deepseek-connect/security) and click "Report a vulnerability". This creates a private advisory visible only to the maintainer and yourself.
 
-2. **Email** — if Security Advisories are unavailable for any reason, email `security@pulchowk-events.in` (the address is monitored, though responses may take longer than the GitHub flow).
+2. **Email** — if Security Advisories are unavailable for any reason, email `pulchowkevents@gmail.com` (the address is monitored, though responses may take longer than the GitHub flow).
 
 Include in your report:
 
