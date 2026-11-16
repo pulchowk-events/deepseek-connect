@@ -4,6 +4,7 @@
 - **Date:** 2026-11-16
 - **Deciders:** maintainer
 - **Supersedes:** —
+- **Amended by:** [0008 — multi-provider plugin architecture](0008-multi-provider-plugin-architecture.md)
 - **Superseded by:** —
 
 ## Context
@@ -64,3 +65,22 @@ DeepSeek auto-names every chat from its first message. The batch prompt embeds t
 - [selector-maintenance.md#the-structural-sidebar-walk](../../selector-maintenance.md#the-structural-sidebar-walk)
 - `content.js` `ensureChat`, `findChatInSidebar`
 - `background.js` `handleNext` (the `needNewChat` branch)
+
+---
+
+## Amendment (2026-11-16)
+
+ADR 0008 changed the chat-identity mechanism from "sidebar fuzzy-match on chat title" to "URL-based direct navigation, with sidebar fuzzy-match as a fallback."
+
+The one-chat-per-source principle is unchanged. What changed is how the extension finds the chat on retry:
+
+- **Before:** `findChatInSidebar(name)` matched the chat title via substring. DeepSeek auto-named chats from the first message, and the batch prompt embedded the source name, so the title contained the source name — most of the time.
+- **After:** `/chat` returns the chat URL (e.g., `https://chat.deepseek.com/a/chat/s/<uuid>`), the wizard persists it (in `chat-map.json`, keyed by `<sourceName>::<provider>`), `/open { chatName, url }` navigates directly via `chrome.tabs.update`, and the sidebar walk never runs on retry.
+
+**Why the change:** DeepSeek paraphrases chat titles. A prompt starting with `reuse-test-1754824017022 — reply with just: alpha` became a chat titled **"Alpha reply"** — the `reuse-test-` prefix was completely dropped. No fuzzy match could find it. Every retry opened a fresh chat, the LLM never saw its prior turn, and the one-chat-per-source benefit was silently lost. Qwen paraphrases too. The sidebar title is not a stable identity mechanism; the URL is.
+
+**What remains:** the sidebar walk is still in `ensureChat` as a fallback for the first send per source (when no URL is persisted yet). It's used to find an existing chat from a prior batch run, or to reuse a chat by name. It is no longer the primary mechanism.
+
+**Multi-provider implications:** the `chat-map.json` keys are `<sourceName>::<provider>` pairs, not just `sourceName`, because a source can have one chat on DeepSeek and a different one on Qwen (via the provider-pivot pattern on rate limit). Each provider's URL is tracked independently.
+
+Reversing this amendment requires reversing ADR 0008.

@@ -1,6 +1,6 @@
 # Protocol
 
-The complete wire contract between the four participants — external caller, server, extension service worker, content script. Every route, every request shape, every response shape, every error shape. This is the reference doc — it does not teach, it specifies.
+The complete wire contract between the four participants — external caller, server, extension service worker, content script. Every route, every request shape, every response shape, every error shape. Multi-provider is a data field threaded through every layer; the wire shapes reflect it.
 
 **Contents**
 - [Participants and transport](#participants-and-transport)
@@ -20,6 +20,7 @@ The complete wire contract between the four participants — external caller, se
 - [Queue state machine](#queue-state-machine)
 - [Extension to content messages](#extension-to-content-messages)
 - [Content to extension messages](#content-to-extension-messages)
+- [Provider threading](#provider-threading)
 - [Error response shape](#error-response-shape)
 - [Version negotiation](#version-negotiation)
 - [Constraints](#constraints)
@@ -29,39 +30,50 @@ The complete wire contract between the four participants — external caller, se
 
 ## Participants and transport
 
-Four participants, three transport boundaries:
+Four participants, three transport boundaries, one provider-agnostic pipeline:
 
 ```
 [external caller]                    (curl, Node client, wizard)
         │
         │ HTTP/1.1 over 127.0.0.1
         │ Bearer token auth
+        │ body includes `provider` field
         ▼
 [terminal server]                    (src/server.js)
         │
         │ HTTP/1.1 over 127.0.0.1
         │ Bearer token auth
         │ caller routes + extension routes share the socket
+        │ provider threaded through queue entries
         ▼
 [extension service worker]           (background.js)
         │
         │ chrome.tabs.sendMessage (in-process, no HTTP)
         │ no auth — same extension context
+        │ provider field included in every message
         ▼
-[content script]                     (content.js, injected in chat.deepseek.com)
+[content script router]              (content.js)
+        │
+        │ dispatches to DSC_PROVIDERS[msg.provider]
+        ▼
+[provider module]                    (providers/deepseek.js, providers/qwen.js, ...)
         │
         │ direct DOM manipulation
         ▼
-[DeepSeek page]
+[provider chat page]
 ```
 
-Three rules that constrain everything else:
+Four rules that constrain everything else:
 
-1. **The server binds loopback only.** `host: '127.0.0.1'` is a hardcoded default in `createServer`. Binding to `0.0.0.0` is not supported by the current options — passing a different host works if you need it, but the intended deployment is loopback-only and the docs and quickstarts all assume it.
-2. **The server is one end of every HTTP conversation.** External callers and the extension both connect to it. There is no direct caller-to-extension path, no reverse channel, no push. The extension is a polling client with a long-poll hold, and everything the caller sends reaches the extension only because the server has queued it and the extension has asked for it via `GET /next`.
-3. **The extension is single-tab, single-server.** It pins exactly one `chat.deepseek.com` tab in `chrome.storage.local.workTabId` and registers against exactly one server URL. Two servers against one browser profile would fight over `/next` polling and produce interleaved `dispatched` lines for the same request. Not supported. See [Constraints](#constraints).
+1. **The server binds loopback only.** `host: '127.0.0.1'` is a hardcoded default in `createServer`. Binding to `0.0.0.0` is not supported by the current options — passing a different host works if you need it, but the intended deployment is loopback-only.
 
-All request and response bodies are JSON. All requests carry `Content-Type: application/json` when they have a body. All responses carry `Content-Type: application/json` unconditionally. Binary bodies and multipart forms are not used anywhere in this protocol.
+2. **The server is one end of every HTTP conversation.** External callers and the extension both connect to it. There is no direct caller-to-extension path, no reverse channel, no push. The extension is a polling client with a long-poll hold.
+
+3. **The provider field is opaque to the server.** The server reads `provider` from the request body, stores it on the queue entry, and includes it in the `/next` payload. It does not validate the value, does not default it beyond `'deepseek'`, does not branch on it. The only place `provider` has meaning is inside `content.js`'s router and inside the provider module that the router dispatches to.
+
+4. **The extension is single-tab-per-provider.** When a request specifies `provider`, the extension queries that provider's domain for candidate tabs and dispatches to the first non-active match. When no provider is specified, the extension uses its single pinned work tab (v0.1.x behavior). Two concurrent requests against the same provider serialize through the queue; two against different providers use different tabs but still serialize (one job in-flight at a time). See [Constraints](#constraints).
+
+All request and response bodies are JSON. All requests carry `Content-Type: application/json` when they have a body. All responses carry `Content-Type: application/json` unconditionally.
 
 ---
 
@@ -94,7 +106,7 @@ Content-Type: application/json
 
 `auth_failed` is a `DSCError` code with `retryable: false, userFixable: true` — the caller must supply the right token; retrying with the same wrong token produces the same 401. See [error-codes.md](error-codes.md).
 
-The token is checked before any route dispatch. A request with a bad token never reaches route logic, never appears in the queue, and never emits a `dispatched` log line — the only evidence is the server-side `! auth fail` log entry showing the method and URL. This is deliberate: unauthorized probes should be cheap to reject and easy to spot.
+The token is checked before any route dispatch. A request with a bad token never reaches route logic, never appears in the queue, and never emits a `dispatched` log line.
 
 There is no token rotation, no expiry, no refresh flow, no signature. The token is a shared secret on a loopback socket between processes that all trust each other. Anything more elaborate would be ceremony.
 
@@ -106,21 +118,21 @@ Nine routes, split into two groups:
 
 **Caller routes** — invoked by external callers. Return success payloads or error responses. Wait for the extension round-trip before responding.
 
-| Method | Path | Auth | Blocking | Returns |
-|---|---|---|---|---|
-| `POST` | `/chat` | ✓ | yes — waits for extension reply | `{ content, chat, elapsedMs }` |
-| `POST` | `/open` | ✓ | yes — waits for extension reply | `{ ok, existing, mode, debug, chat }` |
-| `POST` | `/reset` | ✓ | yes — waits for extension reply | `{ ok, chat, result }` |
-| `GET` | `/tabs` | ✓ | no — reads cached tab list | `{ ok, tabs }` |
+| Method | Path | Auth | Blocking | Provider field | Returns |
+|---|---|---|---|---|---|
+| `POST` | `/chat` | ✓ | yes — waits for extension reply | request: `provider` (optional, default `'deepseek'`) | `{ content, chat, url, elapsedMs }` |
+| `POST` | `/open` | ✓ | yes — waits for extension reply | request: `provider` (optional, default `'deepseek'`) | `{ ok, existing, mode, url, debug, chat }` |
+| `POST` | `/reset` | ✓ | yes — waits for extension reply | request: `provider` (optional, default `'deepseek'`) | `{ ok, chat, result }` |
+| `GET` | `/tabs` | ✓ | no — reads cached tab list | response: `provider` per tab | `{ ok, tabs }` |
 
 **Extension routes** — invoked by the extension service worker. Most are fire-and-forget or long-poll; none wait on the caller.
 
-| Method | Path | Auth | Blocking | Returns |
-|---|---|---|---|---|
-| `POST` | `/hello` | ✓ | no | `{ ok, sessionId }` |
-| `GET` | `/next` | ✓ | yes — 30s long-poll hold | `{ action: 'next', ... }` or `{ action: 'idle' }` |
-| `POST` | `/reply` | ✓ | no | `{ ok }` |
-| `POST` | `/progress` | ✓ | no | `{ ok }` |
+| Method | Path | Auth | Blocking | Provider field | Returns |
+|---|---|---|---|---|---|
+| `POST` | `/hello` | ✓ | no | not present in v0.2.0 (see [Extending the protocol](#extending-the-protocol)) | `{ ok, sessionId }` |
+| `GET` | `/next` | ✓ | yes — 30s long-poll hold | response: `provider` (echoed from queue entry) | `{ action: 'next', provider, ... }` or `{ action: 'idle' }` |
+| `POST` | `/reply` | ✓ | no | not present (reply body has `requestId`; provider implicit) | `{ ok }` |
+| `POST` | `/progress` | ✓ | no | not present (phase messages don't carry provider; the phase name itself is provider-specific, see [POST /progress](#post-progress)) | `{ ok }` |
 
 Unknown routes return:
 
@@ -130,15 +142,13 @@ HTTP/1.1 404 Not Found
 { "ok": false, "error": "not_found" }
 ```
 
-The distinction between caller and extension routes is not enforced — a caller could technically call `/next` and a badly-written extension could call `/chat`. The split is documentation, not security. The one rule that *is* enforced is auth, and only because a leaked token on a loopback socket is still a token leak.
-
 ---
 
 ## Caller routes
 
 ### POST /chat
 
-The main entry point. Send messages, receive the assistant's reply.
+The main entry point. Send messages plus an optional provider; receive the assistant's reply plus the stable chat URL.
 
 **Request:**
 
@@ -148,17 +158,19 @@ The main entry point. Send messages, receive the assistant's reply.
     { "role": "user", "content": "Reply with just: hello" }
   ],
   "chat": "my-chat-name",
+  "provider": "qwen",
   "targetTabId": 1234567890
 }
 ```
 
 | Field | Type | Required | Meaning |
 |---|---|---|---|
-| `messages` | array | ✓ | One or more `{ role, content }` objects. Only `content` is used; `role` is preserved for future multi-turn use but not currently sent to DeepSeek as anything other than a blank-line-joined blob. |
-| `chat` | string | ✗ | The DeepSeek chat name to open before sending. If omitted, the server generates `api-<uuid8>`. |
-| `targetTabId` | number | ✗ | Explicit tab ID to target. **Deprecated** — the extension uses its sticky work tab instead. Passing this pins the request to that tab if it still exists, and returns `input_not_found` if it doesn't (rather than silently falling back). |
+| `messages` | array | ✓ | One or more `{ role, content }` objects. Only `content` is used; `role` is preserved for future multi-turn use but not currently sent to providers as anything other than a blank-line-joined blob. |
+| `chat` | string | ✗ | The chat name to open before sending. If omitted, the server generates `api-<uuid8>`. |
+| `provider` | string | ✗ | Which provider to route to. Defaults to `'deepseek'` when omitted. Valid values are the keys in `DSC.PROVIDER_DOMAINS` (`deepseek`, `qwen`, `tongyi`). An unknown provider produces `no_provider_loaded` from the content router. |
+| `targetTabId` | number | ✗ | Explicit tab ID to target. Validated against the requested `provider` — if `provider: 'qwen'` and the tab is a DeepSeek tab, returns `input_not_found`. **Deprecated** — the extension's provider-scoped `getWorkTab` handles tab selection automatically; passing this is rarely needed. |
 
-All messages are concatenated with `"\n\n"` between them and sent as a single prompt. The DeepSeek chat gets one turn per `/chat` call; multi-turn conversations are expressed by reusing the same `chat` name across calls, not by sending a `messages` array with history — the extension opens the named chat, which already has prior turns in it, and adds the new prompt as the next turn. See [architecture.md#one-chat-per-source](architecture.md#one-chat-per-source).
+All messages are concatenated with `"\n\n"` between them and sent as a single prompt. The chat gets one turn per `/chat` call; multi-turn conversations are expressed by reusing the same `chat` name across calls, not by sending a `messages` array with history — the extension opens the named chat (or navigates to its URL), which already has prior turns in it, and adds the new prompt as the next turn. See [architecture.md#3-one-chat-per-source-url-primary-identity](architecture.md#3-one-chat-per-source-url-primary-identity).
 
 **Success:**
 
@@ -166,21 +178,31 @@ All messages are concatenated with `"\n\n"` between them and sent as a single pr
 {
   "content": "hello",
   "chat": "my-chat-name",
-  "elapsedMs": 4300
+  "url": "https://chat.qwen.ai/c/ae834e91-aed2-4254-bb12-6b8b7c1dc7d5",
+  "elapsedMs": 8123
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `content` | Extracted reply. See [Extraction](#extraction) below for how delimiters and code fences are handled. |
+| `content` | Extracted reply. The extraction pass is provider-specific — see [Extraction](#extraction) below. |
 | `chat` | The chat name actually used. Echoed back so callers who relied on the generated `api-<uuid8>` default can reuse it for follow-up calls. |
+| `url` | **The stable chat URL.** This is the primary identity for retry — persist it and pass it to `/open { chatName, url }` on the next call to the same source. Provider-specific format: DeepSeek uses `/a/chat/s/<uuid>`, Qwen uses `/c/<uuid>`. `null` if the provider couldn't capture it (rare; both shipped providers always return a URL on success). |
 | `elapsedMs` | Wall clock from server receipt of `/chat` to server receipt of `/reply`. Includes queue time plus extension round-trip. |
 
-**Errors:** every `DSCError` code can appear here. The HTTP status is determined by the code's `http` metadata (see [error-codes.md](error-codes.md)). The client library (`src/client.js`) throws `DSCError` on any non-2xx with the code preserved.
+**Errors:** every `DSCError` code can appear here, plus the router-specific `no_provider_loaded`. The HTTP status is determined by the code's `http` metadata (see [error-codes.md](error-codes.md)). The client library (`src/client.js`) throws `DSCError` on any non-2xx with the code preserved.
 
-**Timeout:** the caller's HTTP client times out at `DEFAULT_CHAT_TIMEOUT_MS` (180s) by default. The server holds the connection open for the full extension round-trip; there is no server-side per-request timeout in v0.1. A wedged extension produces a client timeout, not a server error — the request stays queued or in-flight on the server and its `/reply` (when it eventually arrives) resolves to a `DSCError('extension_timeout')` that nothing is listening for.
+**Provider-specific errors:**
 
-**Worked example:**
+| Code | Raised by | Meaning |
+|---|---|---|
+| `deepthink_enable_failed` | `providers/deepseek.js` | DeepThink toggle couldn't be verified on. DeepSeek only; Qwen doesn't have this toggle. |
+| `search_enable_failed` | `providers/deepseek.js` | Search toggle couldn't be verified on. DeepSeek only. |
+| `invalid_response_format` | `providers/qwen.js` | Qwen's reply didn't include the required `START_QWEN_REPLY` / `END_QWEN_REPLY` delimiters. Qwen only; DeepSeek uses a DOM-signal completion detector. |
+
+**Timeout:** the caller's HTTP client times out at `DEFAULT_CHAT_TIMEOUT_MS` (180s) by default. The server holds the connection open for the full extension round-trip; there is no server-side per-request timeout in v0.2.0.
+
+**Worked example (DeepSeek):**
 
 ```bash
 curl -s -X POST http://127.0.0.1:7331/chat \
@@ -188,7 +210,8 @@ curl -s -X POST http://127.0.0.1:7331/chat \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role":"user","content":"Reply with just: hello"}],
-    "chat": "quickstart"
+    "chat": "quickstart",
+    "provider": "deepseek"
   }' | python3 -m json.tool
 ```
 
@@ -196,25 +219,83 @@ curl -s -X POST http://127.0.0.1:7331/chat \
 {
   "content": "hello",
   "chat": "quickstart",
+  "url": "https://chat.deepseek.com/a/chat/s/ae834e91-...",
   "elapsedMs": 4300
 }
 ```
 
-### POST /open
+**Worked example (Qwen):**
 
-Find or create a chat by name, without sending a prompt. Used by batch wizards to establish the chat before the prompt is ready — for example, to discover whether a chat exists from a prior retry so the LLM sees its own prior turns.
-
-**Request:**
+```bash
+curl -s -X POST http://127.0.0.1:7331/chat \
+  -H "Authorization: Bearer $EXTENSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role":"user","content":"Reply with just: hello"}],
+    "chat": "quickstart-qwen",
+    "provider": "qwen"
+  }' | python3 -m json.tool
+```
 
 ```json
 {
-  "chatName": "src-alpha"
+  "content": "hello",
+  "chat": "quickstart-qwen",
+  "url": "https://chat.qwen.ai/c/ae834e91-...",
+  "elapsedMs": 8123
+}
+```
+
+The `elapsedMs` difference is real — Qwen's anti-bot pacing adds ~5 seconds of pre-send overhead per prompt. Both providers are serialized through the same queue; a batch that mixes providers will see per-source timing reflecting this.
+
+### POST /open
+
+Find or create a chat by name, without sending a prompt. **Or** navigate directly to a persisted chat URL. Two modes, distinguished by whether `url` is present.
+
+**Request (mode A — find/create by name):**
+
+```json
+{
+  "chatName": "src-alpha",
+  "provider": "qwen"
+}
+```
+
+**Request (mode B — navigate to persisted URL):**
+
+```json
+{
+  "chatName": "src-alpha",
+  "url": "https://chat.qwen.ai/c/ae834e91-aed2-4254-bb12-6b8b7c1dc7d5",
+  "provider": "qwen"
 }
 ```
 
 | Field | Type | Required | Meaning |
 |---|---|---|---|
-| `chatName` | string | ✓ | The chat to find or create. Empty string or missing → `400 { error: 'chatName required' }`. |
+| `chatName` | string | ✓ | The chat name. Used as the response's `chat` field and, in mode A, as the sidebar fuzzy-match target. In mode B, `chatName` is metadata — the navigation is driven by `url`. |
+| `url` | string | ✗ | **The primary identity mechanism.** When present, the extension navigates directly to this URL via `chrome.tabs.update`, skipping the sidebar walk entirely. This is the retry path — persist the URL from `/chat`'s response and pass it here. |
+| `provider` | string | ✗ | Defaults to `'deepseek'`. |
+
+**Mode A behavior (no `url`):**
+
+1. `getWorkTab(provider)` finds the provider's tab.
+2. `content.js` dispatches to `provider.ensureChat(chatName)`.
+3. The provider's `ensureChat` tries to find a chat matching `chatName`. DeepSeek does a structural sidebar walk; Qwen has no sidebar walk and returns `existing: false, mode: 'fresh'` unconditionally.
+4. If a chat is found → navigates to it, returns `{existing: true, mode: 'existing'}`.
+5. If not found and the tab is on `/` → uses the fresh page, returns `{existing: false, mode: 'fresh'}`.
+6. If not found and the tab is on an existing chat → background navigates to the provider's origin, retries `ensureChat`, returns `{existing: false, mode: 'fresh'}`.
+
+**Mode B behavior (with `url`):**
+
+1. `getWorkTab(provider)` finds the provider's tab.
+2. Background navigates directly to `url` via `chrome.tabs.update`.
+3. Waits for `chrome.tabs.onUpdated` with `status: 'complete'` (up to 15s).
+4. Waits 800ms for React mount.
+5. Calls `checkState` on the provider to verify `inputFound: true`.
+6. Returns `{existing: true, mode: 'existing', url}`.
+
+**Mode B does not use `ensureChat` at all.** This is the whole point — the sidebar walk is fragile and unnecessary when you already know the URL. If the URL is stale (chat deleted, provider relocated the UUID), the tab navigation succeeds but `checkState` returns `inputFound: false`, and mode B falls through to mode A as a safety net. The fallback is silent (the response reflects what actually happened), but the `mode` field distinguishes: `'existing'` means URL navigation worked; `'fresh'` means it fell back.
 
 **Success:**
 
@@ -223,12 +304,13 @@ Find or create a chat by name, without sending a prompt. Used by batch wizards t
   "ok": true,
   "existing": true,
   "mode": "existing",
+  "url": "https://chat.qwen.ai/c/ae834e91-aed2-4254-bb12-6b8b7c1dc7d5",
   "debug": {
-    "sideFound": true,
-    "leafCount": 13,
-    "leafPreview": ["src-alpha", "src-beta", "..."],
+    "sideFound": false,
+    "leafCount": 0,
+    "leafPreview": [],
     "name": "src-alpha",
-    "path": "/a/chat/s/d3545c8f-b493-4ee3-a727-a554a3d44232"
+    "path": "/c/ae834e91-aed2-4254-bb12-6b8b7c1dc7d5"
   },
   "chat": "src-alpha"
 }
@@ -236,9 +318,10 @@ Find or create a chat by name, without sending a prompt. Used by batch wizards t
 
 | Field | Meaning |
 |---|---|
-| `existing` | `true` if a sidebar chat matched `chatName` (fuzzy — contains, case-insensitive); `false` if a fresh `/` chat was used. |
-| `mode` | `'existing'` — clicked a sidebar item. `'fresh'` — already on `/`, no navigation needed. `'need_nav'` — content requested navigation, background did it, retried. |
-| `debug` | Diagnostic snapshot from the content script: whether the sidebar was found, how many chat leaf items were listed, and the first 8 previews. Useful for debugging fuzzy-match misses without F12. |
+| `existing` | `true` if the chat was found (mode A) or a URL was navigated to successfully (mode B). `false` if a fresh `/` was used. |
+| `mode` | `'existing'` — found/navigated. `'fresh'` — fresh page used. `'need_nav'` — content requested navigation, background did it, retried. |
+| `url` | The chat's URL if it could be captured. In mode B, echoes back the URL that was navigated to. In mode A, comes from the provider's `ensureChat` return (may be `null` if the provider can't determine it, though both shipped providers do). |
+| `debug` | Provider-specific diagnostic snapshot. DeepSeek returns `{sideFound, leafCount, leafPreview, name, path}`. Qwen returns `{name, path}`. Presence and shape vary by provider. |
 | `chat` | Echo of `chatName`. |
 
 **Errors:**
@@ -249,17 +332,21 @@ Find or create a chat by name, without sending a prompt. Used by batch wizards t
 | Server queue rejected the enqueue | 500 | `{ ok: false, error: <message> }` |
 | Extension reported a failure | 500 | `{ ok: false, error: <DSCError code> }` |
 
-`/open` is not the same as checking if a chat exists — it *navigates* to the chat if it exists. If you want a read-only existence check without navigation, wait for a future `/exists` route (see [Extending the protocol](#extending-the-protocol)).
+**`/open` is not a read-only existence check.** In mode A, it *navigates* to the chat if it exists. If you want a read-only check without navigation, wait for a future `/exists` route (see [Extending the protocol](#extending-the-protocol)).
 
 ### POST /reset
 
-Reset a chat. In v0.1, "reset" means re-running the `/open` flow — DeepSeek's delete UI is fragile, and forcing a delete-and-recreate would break the sidebar fuzzy match on every retry, defeating the per-source chat design.
+Reset a chat. In v0.2.0, "reset" means re-running the `/open` flow — DeepSeek's delete UI is fragile, and Qwen doesn't have one. Both providers' `resetChat` are effectively no-ops:
+
+- DeepSeek's `resetChat(name)` delegates to `ensureChat(name)` — behaviorally identical to `/open` mode A.
+- Qwen's `resetChat(name)` returns `{ok: true, reason: 'qwen_reset_not_implemented'}` immediately.
 
 **Request:**
 
 ```json
 {
-  "chatName": "src-alpha"
+  "chatName": "src-alpha",
+  "provider": "qwen"
 }
 ```
 
@@ -276,9 +363,7 @@ Reset a chat. In v0.1, "reset" means re-running the `/open` flow — DeepSeek's 
 }
 ```
 
-The `result` field mirrors what `/open` would have returned, minus the `debug` payload (which is dropped by `/reset` — use `/open` directly if you need it).
-
-**Semantics note:** calling `/reset` in v0.1 leaves the chat's history intact and opens it if it exists. A caller who needs to actually clear the history should click through DeepSeek's UI manually, or wait for a future `delete: true` flag on `/reset` (see [Extending the protocol](#extending-the-protocol)). The `/reset` route is provided so that future behavior has a stable URL to hang off — the current behavior is a placeholder.
+**Semantics note:** calling `/reset` in v0.2.0 leaves the chat's history intact and opens it if it exists. A caller who needs to actually clear the history should click through the provider's UI manually, or wait for a future `delete: true` flag on `/reset` (see [Extending the protocol](#extending-the-protocol)).
 
 **Errors:** identical to `/open`.
 
@@ -296,9 +381,17 @@ Returns the tab inventory the extension reported on its last `/hello`. Does not 
   "tabs": [
     {
       "id": 1695700080,
-      "url": "https://chat.deepseek.com/a/chat/s/d3545c8f-b493-4ee3-a727-a554a3d44232",
+      "url": "https://chat.deepseek.com/a/chat/s/d3545c8f-...",
       "title": "DeepSeek connect continue - DeepSeek",
-      "active": true
+      "active": true,
+      "provider": "deepseek"
+    },
+    {
+      "id": 1695700091,
+      "url": "https://chat.qwen.ai/c/ae834e91-...",
+      "title": "Qwen Chat",
+      "active": false,
+      "provider": "qwen"
     }
   ]
 }
@@ -307,11 +400,14 @@ Returns the tab inventory the extension reported on its last `/hello`. Does not 
 | Field | Meaning |
 |---|---|
 | `id` | Chrome tab ID. Stable within a browser session, invalidated on tab close. |
-| `url` | Full URL. Always matches `https://chat.deepseek.com/*` — non-DeepSeek tabs are filtered out before the list is sent. |
+| `url` | Full URL. Always matches one of the domains in `DSC.PROVIDER_DOMAINS` (or the mock fixture). |
 | `title` | First 80 chars of the page title. |
 | `active` | Whether the tab is the focused tab in its window at `/hello` time. |
+| `provider` | **New in v0.2.0.** The provider name for this tab, derived from `DSC.providerForUrl(url)`. `null` if the URL isn't a recognized provider (shouldn't happen — non-provider tabs are filtered out before the list is sent). |
 
-**Staleness:** the cache updates on every `/hello` (extension registration). The extension re-registers on startup, on server reconnect, and on tab URL change. A tab that has been closed but not detected by a `/hello` still appears in `/tabs` until the next registration. Callers who need a fresh list should not rely on `/tabs` alone — they should ensure the extension is polling by checking `/status` (when available; see [Extending the protocol](#extending-the-protocol)), or they should just try `/open` and accept the inevitable `input_not_found` if the tab is gone.
+**Usage:** the `provider` field is what makes multi-provider state visible without URL parsing. A caller can check "is there a Qwen tab open?" via `tabs.some(t => t.provider === 'qwen')` instead of pattern-matching URLs. `/tabs` alone doesn't tell you if the extension is *currently* routing to a Qwen tab for a specific request — that's determined at dispatch time by `getWorkTab(provider)`. But for pre-flight checks and debugging, `/tabs` is the surface.
+
+**Staleness:** the cache updates on every `/hello` (extension registration). The extension re-registers on startup, on server reconnect, and on tab URL change. A tab that has been closed but not detected by a `/hello` still appears in `/tabs` until the next registration.
 
 ---
 
@@ -325,19 +421,19 @@ The extension's registration. Sent on startup, on server reconnect (with backoff
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "tabUrl": "https://chat.deepseek.com/",
   "tabs": [
-    { "id": 1695700080, "url": "https://chat.deepseek.com/", "title": "DeepSeek - Into the Unknown", "active": true }
+    { "id": 1695700080, "url": "https://chat.deepseek.com/", "title": "DeepSeek - Into the Unknown", "active": true, "provider": "deepseek" }
   ]
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `version` | Extension version, from `shared.js` `DSC.VERSION`. Currently `'0.1.0'`. See [Version negotiation](#version-negotiation) for what the server does with it. |
-| `tabUrl` | The URL of the work tab (the one pinned in `chrome.storage.local.workTabId`, or the one just pinned if this is a first registration). Not necessarily `tabUrl` in `tabs[]` — the work tab is always in the list, but so are other DeepSeek tabs. |
-| `tabs` | Snapshot of every `chat.deepseek.com/*` tab currently open. Cached by the server; served by `GET /tabs`. |
+| `version` | Extension version, from `shared.js` `DSC.VERSION`. Currently `'0.2.0'`. See [Version negotiation](#version-negotiation). |
+| `tabUrl` | The URL of the pinned work tab (`chrome.storage.local.workTabId`), or the first-registered tab. This is informational — the server doesn't use it for routing. The per-tab `provider` fields are the routing signal. |
+| `tabs` | Snapshot of every supported provider tab currently open, each with its `provider` name. Cached by the server; served by `GET /tabs`. |
 
 **Success:**
 
@@ -348,7 +444,7 @@ The extension's registration. Sent on startup, on server reconnect (with backoff
 }
 ```
 
-`sessionId` is a fresh UUID on every `/hello`. The server uses it for logging correlation only — it's not checked on subsequent requests, not required by anything, and rotates on every reconnect. A caller who wants "which extension generation am I talking to" should compare `sessionId` values across `/hello` events rather than assume it's stable.
+`sessionId` is a fresh UUID on every `/hello`. The server uses it for logging correlation only.
 
 **Side effects on the server:**
 
@@ -356,7 +452,9 @@ The extension's registration. Sent on startup, on server reconnect (with backoff
 2. Generates a new `sessionId`
 3. Logs `extension connected (<version>) | <tabUrl> | <N> tab(s)`
 
-**Not a queue entry.** `/hello` is not enqueued — it returns immediately, in parallel with any in-flight `/chat`. The extension sends `/hello` frequently (URL changes trigger it), and serializing those against the queue would deadlock the queue during navigation.
+**Not a queue entry.** `/hello` returns immediately, in parallel with any in-flight `/chat`.
+
+**Not provider-scoped.** In v0.2.0, `/hello` reports the entire tab inventory in one registration. There is no per-provider `/hello`. A future version might split this (see [Extending the protocol](#extending-the-protocol)), but for now the extension registers once with all its tabs.
 
 ### GET /next
 
@@ -373,6 +471,8 @@ The extension's long-poll. Holds for 30 seconds waiting for a queued job; return
   "mode": "prompt",
   "chatName": "my-chat",
   "targetTabId": null,
+  "targetUrl": null,
+  "provider": "qwen",
   "prompt": "Reply with just: hello",
   "delimiters": { "start": "START_", "end": "END_" }
 }
@@ -380,12 +480,14 @@ The extension's long-poll. Holds for 30 seconds waiting for a queued job; return
 
 | Field | Meaning |
 |---|---|
-| `requestId` | UUID. The extension must echo this back in `/reply` and `/progress`. |
-| `mode` | `'prompt'` — send a prompt. `'open'` — just ensure the chat exists. `'reset'` — ensure the chat exists, current behavior is identical to `'open'`. See [Modes](#modes) below. |
+| `requestId` | UUID. Echo in `/reply` and `/progress`. |
+| `mode` | `'prompt'` — send a prompt. `'open'` — ensure the chat exists. `'reset'` — reset the chat. See [Modes](#modes) below. |
 | `chatName` | The chat name to open before dispatching. Always non-null. |
-| `targetTabId` | Deprecated passthrough of what the caller sent. The extension's `getWorkTab()` honors this only if the tab still exists *and* has a `chat.deepseek.com` URL; otherwise it hard-fails with `input_not_found` rather than silently falling back. |
+| `targetTabId` | Deprecated passthrough. Validated against the requested `provider`; hard-fails if the tab doesn't match. |
+| `targetUrl` | **New in v0.2.0.** If set, background navigates directly to this URL and skips `ensureChat`. Used by retry-with-persisted-URL. |
+| `provider` | **New in v0.2.0.** Which provider module to dispatch to. `background.js` passes this to `getWorkTab(targetTabId, provider)` and to `content.js` via `sendMessage`'s `provider` field. |
 | `prompt` | The prompt text. `null` when `mode !== 'prompt'`. |
-| `delimiters` | `{ start, end }` boundaries for extraction. Defaults are `'START_'` / `'END_'` — the boundary tokens that the caller embeds in the prompt so the extension can extract just the code block. See [Extraction](#extraction). |
+| `delimiters` | `{ start, end }` boundaries for extraction. Defaults are `'START_'` / `'END_'`. Providers may override (Qwen does — see [POST /chat's provider-specific errors](#post-chat)). |
 
 **Success (no job, timeout after 30s):**
 
@@ -393,7 +495,7 @@ The extension's long-poll. Holds for 30 seconds waiting for a queued job; return
 { "action": "idle" }
 ```
 
-**No error responses.** `/next` is the polling channel — a `500` here would force the extension to back off, which is exactly what we don't want during a transient server hiccup. Every outcome is either a job or `idle`. If the connection dies mid-poll (extension crashes, browser closes the tab), the server sees `req.on('close')` and removes the waiter from the waiting list.
+**No error responses.** Every outcome is either a job or `idle`. If the connection dies mid-poll (extension crashes), the server sees `req.on('close')` and removes the waiter.
 
 ### POST /reply
 
@@ -407,11 +509,16 @@ The extension's result delivery. Resolves the `/chat` or `/open` or `/reset` pro
   "status": "ok",
   "content": "hello",
   "raw": "hello",
+  "url": "https://chat.qwen.ai/c/ae834e91-...",
   "trace": [
-    { "t": 921, "phase": "reasoning", "len": 20 },
-    { "t": 2123, "phase": "answerStarted" },
-    { "t": 4930, "phase": "replyDone", "completedBy": "stable", "sawNew": true, "stableLen": 32 },
-    { "t": 4931, "phase": "extract", "source": "raw", "contentLen": 32, "rawLen": 32 }
+    { "t": 1023, "phase": "step_1_dismiss_modal" },
+    { "t": 2014, "phase": "step_2_find_input" },
+    { "t": 3512, "phase": "step_3_type_prompt" },
+    { "t": 5043, "phase": "step_4_verify_input", "promptLen": 156, "typedLen": 156 },
+    { "t": 6042, "phase": "step_5_click_send" },
+    { "t": 7541, "phase": "step_6_send_clicked" },
+    { "t": 8023, "phase": "step_7_wait_for_reply" },
+    { "t": 12087, "phase": "step_8_reply_done", "len": 5 }
   ]
 }
 ```
@@ -422,10 +529,9 @@ The extension's result delivery. Resolves the `/chat` or `/open` or `/reset` pro
 {
   "requestId": "a4ad2ed9-da51-4410-95fb-085462b5da81",
   "status": "error",
-  "error": "input_not_found",
-  "reason": "input_after_new_chat",
-  "details": ["input"],
-  "probe": { "healthy": [], "degraded": [], "requiredMissing": ["input"] },
+  "error": "invalid_response_format",
+  "reason": "Model did not follow delimiter instructions",
+  "details": { "rawPreview": "..." },
   "trace": [...]
 }
 ```
@@ -434,18 +540,20 @@ The extension's result delivery. Resolves the `/chat` or `/open` or `/reset` pro
 |---|---|---|
 | `requestId` | ✓ | The ID from `/next`. |
 | `status` | ✓ | `'ok'` or `'error'`. |
-| `content` | when ok + prompt | Extracted reply. See [Extraction](#extraction). |
-| `raw` | when ok + prompt | Full assistant message text, before delimiter extraction. Preserved for debugging. |
-| `existing` | when ok + open | `true` if a sidebar chat matched, `false` if a fresh `/` was used. |
+| `content` | when ok + prompt | Extracted reply. |
+| `raw` | when ok + prompt | Full assistant message text, before extraction. |
+| `url` | when ok | **New in v0.2.0.** The chat URL the reply landed in. Required for URL-based retry — persist this. |
+| `existing` | when ok + open | `true` if a chat matched or was navigated to. |
 | `mode` | when ok + open/reset | Same semantics as `/open`'s response. |
 | `debug` | when ok + open | Same payload as `/open`'s response. |
 | `chat` | when ok | The chat name actually used. |
-| `error` | when error | `DSCError` code. Must be one of the 20 registered codes — unknown codes collapse to `internal_error` on the client side. |
-| `reason` | when error | Free-form human-readable reason. More specific than the code's generic `human` string. |
-| `retryAfter` | when error, retryable | Milliseconds. Used by the caller's retry policy. |
-| `details` | when error | Structured details — for `dom_drift`, an array of missing required selector names; for `input_not_found`, the phase where the input was missed. |
-| `probe` | when error | The selector-probe snapshot at failure time. Populated by the content script's `fail()` helper. Useful when the error is `dom_drift`. |
-| `trace` | always | Array of `{ t, phase, ... }` timing entries from the content script. Preserved for debugging; the server truncates to the last 4 (success) or 8 (failure) lines when logging. |
+| `error` | when error | `DSCError` code. Must be one of the 21 registered codes. |
+| `reason` | when error | Free-form human-readable reason. |
+| `retryAfter` | when error, retryable | Milliseconds. |
+| `details` | when error | Structured details — e.g., `dom_drift`'s missing required selectors, `invalid_response_format`'s `rawPreview`. |
+| `trace` | always | Array of `{ t, phase, ... }` timing entries. **Phase names are provider-specific** — `probe` / `waitInput` / `toggleDeepthink` indicate DeepSeek; `step_1_dismiss_modal` / `step_2_find_input` etc. indicate Qwen. See [POST /progress](#post-progress) for the full phase table. |
+
+**Provider field is not echoed in `/reply`.** The reply body carries `requestId`, which the server uses to look up the original queue entry — the provider is implicit from that entry. Adding `provider` to `/reply` would be redundant.
 
 **Response:**
 
@@ -453,27 +561,19 @@ The extension's result delivery. Resolves the `/chat` or `/open` or `/reset` pro
 { "ok": true }
 ```
 
-**Behavior:**
-
-1. Looks up `requestId` in `inFlight`. Not found → `404 { error: 'unknown_request' }` (double-reply, stale reply after server restart, or tampered reply).
-2. Removes from `inFlight`.
-3. On `status: 'ok'`: resolves the pending promise with `{ content, raw, elapsedMs, trace, existing, mode, debug, chat }`. Logs `ok done <requestId> | <N>ms` and the last 4 trace lines.
-4. On `status: 'error'`: rejects the pending promise with a `DSCError`-shaped error carrying `{ code, reason, retryAfter, details, probe, trace }`. Logs `x failed <requestId> | <reason>` (or `! DOM DRIFT` for `dom_drift`) and the last 8 trace lines.
-5. Calls `pump()` to dispatch the next queued job if there is one.
-
-**`/reply` is not enqueued.** Like `/hello`, it must respond immediately — enqueueing it would deadlock the pump, since pump only advances when `inFlight.size === 0` and `inFlight.size` only drops when `/reply` is processed.
+**Behavior:** identical to v0.1.x. Looks up `requestId` in `inFlight`, resolves or rejects, calls `pump()`. Not enqueued (would deadlock the pump).
 
 ### POST /progress
 
-The extension's live phase telemetry. Fire-and-forget, logged but not stored.
+The extension's live phase telemetry. Fire-and-forget, logged but not stored. **Phase names are provider-specific.**
 
 **Request:**
 
 ```json
 {
   "requestId": "a4ad2ed9-da51-4410-95fb-085462b5da81",
-  "phase": "reasoning",
-  "extra": { "len": 20 }
+  "phase": "step_3_type_prompt",
+  "extra": { "action": "typing prompt" }
 }
 ```
 
@@ -483,32 +583,49 @@ The extension's live phase telemetry. Fire-and-forget, logged but not stored.
 { "ok": true }
 ```
 
-**Behavior:** logs `  ~ <id8> <phase> <json(extra)>` to the server console. No storage, no state, no queue interaction, no auth failure path beyond the global 401.
+**Behavior:** logs `  ~ <id8> <phase> <json(extra)>` to the server console. No storage, no state, no queue interaction.
 
-The `extra` field is free-form. Known phases and their `extra` payloads:
+**Phase table — DeepSeek (`providers/deepseek.js`):**
 
-| Phase | `extra` | Emitted when |
+| Phase | `extra` | Meaning |
 |---|---|---|
-| `probe` | `{ healthy: [...], degraded: [...], requiredMissing: [...] }` | After selector probe at the start of `sendPrompt` |
-| `waitInput` | `{ found: boolean }` | After waiting for the input box |
-| `toggleDeepthink` | `{ ok: boolean, reason?: string }` | After the DeepThink auto-enable attempt |
-| `toggleSearch` | `{ ok: boolean, reason?: string }` | After the Search auto-enable attempt |
-| `setInput` | `{ promptLen: number, typedLen: number, msgBefore: number }` | After typing the prompt |
-| `sendClick` | `{ ms: number }` | After clicking send |
-| `firstMsg` | `{ msgs: number, url: string }` | First time a new assistant message is detected |
-| `reasoning` | `{ len: number }` | Periodic — reasoning stream has grown |
-| `answerStarted` | *(none)* | First time the answer block (`.ds-assistant-message-main-content`) appears |
-| `answer` | `{ len: number }` | Periodic — answer stream has grown |
-| `replyDone` | `{ completedBy: string, sawNew: boolean, stableLen: number }` | After the completion detector fires |
-| `extract` | `{ source: 'delimiter'\|'fence'\|'raw', contentLen: number, rawLen: number }` | After delimiter extraction |
+| `probe` | `{healthy, degraded, requiredMissing}` | Every required selector resolved |
+| `waitInput` | `{found: bool}` | Chat input found within 5s |
+| `toggleDeepthink` | `{ok: bool, reason?}` | DeepThink verified on |
+| `toggleSearch` | `{ok: bool, reason?}` | Search verified on |
+| `setInput` | `{promptLen, typedLen, msgBefore}` | Prompt typed into input |
+| `sendClick` | `{ms}` | Send button clicked |
+| `firstMsg` | `{msgs, url}` | First assistant message appeared |
+| `reasoning` | `{len}` | Reasoning stream growing |
+| `answerStarted` | *(none)* | Answer block appeared |
+| `answer` | `{len}` | Answer stream growing |
+| `replyDone` | `{completedBy, sawNew, stableLen}` | Completion detected |
+| `extract` | `{source, contentLen, rawLen}` | Extraction ran |
 
-`/progress` is best-effort — the extension does not retry, does not block, and does not care if the server is down. A caller whose server doesn't implement `/progress` sees normal behavior; the extension's `chrome.runtime.sendMessage({ type: 'dsc_phase' })` just goes nowhere.
+**Phase table — Qwen (`providers/qwen.js`):**
+
+| Phase | `extra` | Meaning |
+|---|---|---|
+| `step_1_dismiss_modal` | `{action: 'checking for age modal'}` | Age modal dismisser ran |
+| `step_2_find_input` | `{action: 'locating input field'}` | Searching for textarea |
+| `step_3_type_prompt` | `{action: 'typing prompt'}` | Prompt injected into input |
+| `step_4_verify_input` | `{promptLen, typedLen}` | Input value read back |
+| `step_5_click_send` | `{action: 'clicking send button'}` | Send button clicked |
+| `step_6_send_clicked` | *(none)* | Click registered |
+| `step_7_wait_for_reply` | *(none)* | Polling for delimiters |
+| `step_7a_first_msg` | *(none)* | First assistant message appeared |
+| `step_7b_streaming` | `{len}` | Stream growing (used for timeout diagnostics) |
+| `step_8_reply_done` | `{len}` | Both delimiters detected |
+
+**Phase names are not validated by the server.** A new provider can emit any phase names it wants; the server logs them as-is. The wizard's live status rendering must be provider-aware (or generic over phase names) — see [integration-guide.md](integration-guide.md) for the aggregator's approach, which ignores phase names and just uses the "any phase arrived" signal for liveness.
+
+**`/progress` is best-effort** — the extension does not retry, does not block, does not care if the server is down.
 
 ---
 
 ## Long-poll lifecycle
 
-The `/next` state machine on the server. This is the one place in the protocol where timing is load-bearing — every other route is either immediate (fire-and-forget) or waits on something else.
+Unchanged from v0.1.x except the payload includes `provider` and `targetUrl`. The state machine itself is provider-agnostic.
 
 ```mermaid
 sequenceDiagram
@@ -522,17 +639,17 @@ sequenceDiagram
     Note over Srv: timer set for 30s
 
     alt Job arrives before timeout
-        Caller->>Srv: POST /chat
-        Srv->>Srv: enqueue, push to queue[]
+        Caller->>Srv: POST /chat {provider: "qwen", ...}
+        Srv->>Srv: enqueue, push to queue[]<br/>provider: "qwen" stamped on entry
         Srv->>Srv: pump()
-        Srv-->>Ext: { action: 'next', requestId, ... }
+        Srv-->>Ext: { action: 'next', requestId, provider: "qwen", ... }
         Srv->>Srv: clearTimeout(timer)
         Srv->>Srv: move entry queue→inFlight
-        Note over Ext: dispatch to content
-        Ext->>Srv: POST /progress (multiple)
+        Note over Ext: getWorkTab(provider="qwen")<br/>dispatch to content.js with provider
+        Ext->>Srv: POST /progress (multiple, provider-specific phases)
         Ext->>Srv: POST /reply
         Srv->>Srv: resolve pending /chat promise
-        Srv-->>Caller: { content, chat, elapsedMs }
+        Srv-->>Caller: { content, chat, url, elapsedMs }
         Srv->>Srv: pump() — no queued job, loop ends
         Ext->>Srv: GET /next (long-poll again)
     else No job within 30s
@@ -543,26 +660,20 @@ sequenceDiagram
     end
 ```
 
-**Three invariants:**
+**Three invariants** (unchanged):
 
-1. **Every waiter gets exactly one response.** Either a `next` action, or `idle` at 30s, or `idle` at socket close (if the extension hung up mid-poll, the server treats it as a no-op — the waiter is removed, the pending timeout is cleared, and the extension's next `/next` starts a new waiter). A waiter never appears twice in `waiting[]`, never gets two responses, and never leaks.
-
-2. **`pump()` is the only place jobs leave `queue[]`.** It's called at three points: after every `enqueue`, after every `/reply`, and after every `waiting.push`. It's the single serialization point for dispatch. There is no path where a job appears in a caller's response without having passed through `pump()` and `inFlight`.
-
-3. **`inFlight.size <= 1` always.** The `while` condition in `pump()` is `queue.length > 0 && waiting.length > 0 && inFlight.size === 0` — the third clause means only one job can be in-flight at a time. If two jobs are queued and two pollers are waiting, only one dispatches; the second dispatches when the first `/reply` calls `pump()` again. This is what makes the queue serialization work without a mutex — the invariant is structural, not cooperative.
-
-**Why 30 seconds?** `LONG_POLL_MS = 30000` in `src/server.js`. The extension re-polls immediately on `idle`, so the effective polling rate is one request every 30 seconds when idle. Shorter (10s) would be chattier with no benefit; longer (60s) would make the first job after idle wait up to 60s for the poll to return. 30s is a compromise that keeps the queue responsive without filling the server log with idle loops.
-
----
+1. Every waiter gets exactly one response — `next`, `idle` at 30s, or `idle` at socket close.
+2. `pump()` is the only place jobs leave `queue[]`.
+3. `inFlight.size <= 1` always — one job in-flight regardless of provider.
 
 ## Queue state machine
 
-The internal queue `queue[]`, `waiting[]`, `inFlight` map. Understand this if you're modifying `/next`, `/reply`, or `/chat`; skip if you're just calling the API.
+Unchanged from v0.1.x. The queue doesn't care about provider — it's a FIFO of entries, each carrying its `provider` field for the eventual dispatch, but the ordering and serialization are provider-blind.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Empty
-    Empty --> Queued: POST /chat enqueues<br/>entry pushed to queue[]
+    Empty --> Queued: POST /chat enqueues<br/>entry pushed to queue[]<br/>provider stamped on entry
     Queued --> Dispatched: GET /next arrives<br/>AND queue.length > 0<br/>AND inFlight empty
     Queued --> Queued: additional<br/>POST /chat
     Dispatched --> InFlight: entry moved<br/>queue → inFlight
@@ -573,53 +684,47 @@ stateDiagram-v2
     Dispatched --> [*]: extension dies mid-flight
     note right of Dispatched
         server-side state stays Dispatched forever
-        no timeout in v0.1
+        no timeout in v0.2.0
         caller times out at client level
         next /chat for same requestId would 404
     end note
 ```
 
-**The "extension dies mid-flight" case is the one hole.** If the extension crashes after `/next` returned a job but before `/reply` posts back, the server's `inFlight` map keeps the entry forever. `pump()` never advances because `inFlight.size === 1`. Subsequent `/chat` calls queue up behind it and never dispatch. The caller's HTTP client times out at 180s; the server has no per-request timeout.
-
-Recovery requires restarting the server. This is documented as a v0.1 limitation, not a designed behavior — see [Extending the protocol](#extending-the-protocol) for the planned fix (per-request server-side timeout that auto-cancels and pumps the next queued entry).
-
-Until that fix lands, the mitigation is: if the extension terminal shows a crashed service worker (brave://extensions → the "service worker" link is greyed out) while `/chat` calls are hanging, restart the server. The extension will reconnect on its next startup, but the old `inFlight` entry stays — no restart, no recovery.
-
----
+**"Extension dies mid-flight" is still the one hole.** If the extension crashes after `/next` returns a job but before `/reply` posts back, the server's `inFlight` map keeps the entry forever. Recovery requires restarting the server. Documented as a v0.2.0 limitation; see [Extending the protocol](#extending-the-protocol) for the planned fix.
 
 ## Extension to content messages
 
-`chrome.tabs.sendMessage` payloads, dispatched from `background.js` to `content.js` via the service worker. These never touch the HTTP protocol — they're in-process between two extension contexts — but they're documented here because the internal contract must match the external one or the queue silently stalls.
+`chrome.tabs.sendMessage` payloads, dispatched from `background.js` to `content.js` via the service worker. **Every message carries a `provider` field** — this is what the router uses to dispatch. Missing `provider` means the router falls back to `'deepseek'` (backward compat for callers that predate v0.2.0, though background always sets it now).
 
 ### ensureChat
 
-Find or create a chat by name. Called before every prompt and for every `/open` and `/reset`.
+Find or create a chat by name, or verify a URL navigation landed on a valid page.
 
 **Message:**
 
 ```json
-{ "action": "ensureChat", "name": "src-alpha" }
+{ "action": "ensureChat", "name": "src-alpha", "provider": "qwen" }
 ```
 
 **Response (found):**
 
 ```json
-{ "ok": true, "existing": true, "mode": "existing" }
+{ "ok": true, "existing": true, "mode": "existing", "url": "https://chat.qwen.ai/c/..." }
 ```
 
-**Response (fresh, already on `/`):**
+**Response (fresh):**
 
 ```json
-{ "ok": true, "existing": false, "mode": "fresh" }
+{ "ok": true, "existing": false, "mode": "fresh", "url": null }
 ```
 
 **Response (needs navigation):**
 
 ```json
-{ "ok": false, "needNewChat": true, "mode": "need_nav", "path": "/a/chat/s/d3545c8f..." }
+{ "ok": false, "needNewChat": true, "mode": "need_nav", "path": "/a/chat/s/..." }
 ```
 
-When the response has `needNewChat: true`, `background.js` navigates the work tab to `https://chat.deepseek.com/` via `chrome.tabs.update`, waits for `chrome.tabs.onUpdated` with `status: 'complete'` (or 15s, whichever comes first), waits an additional 800ms, and retries the `ensureChat` once. If the retry also fails, `input_not_found` is raised.
+When `needNewChat: true`, `background.js` navigates the work tab to the provider's origin (`new URL(tab.url).origin + '/'`), waits for `status: 'complete'` (or 15s), waits 800ms, and retries `ensureChat` **with the same `provider`**. If the retry also fails, the provider's error code is raised.
 
 **Response (failure):**
 
@@ -627,7 +732,7 @@ When the response has `needNewChat: true`, `background.js` navigates the work ta
 { "ok": false, "error": "input_not_found", "reason": "input_after_open_existing", "debug": { ... } }
 ```
 
-The `debug` payload is always included on failure and on success when `mode !== 'need_nav'`. It contains `{ sideFound, leafCount, leafPreview, name, path }` — everything needed to reproduce the sidebar fuzzy match by hand.
+The `debug` shape is provider-specific. DeepSeek returns `{sideFound, leafCount, leafPreview, name, path}`; Qwen returns `{name, path}`.
 
 ### sendPrompt
 
@@ -639,7 +744,8 @@ Type a prompt into the current chat, click send, wait for completion, extract th
 {
   "action": "sendPrompt",
   "prompt": "Reply with just: hello",
-  "delimiters": { "start": "START_", "end": "END_" }
+  "delimiters": { "start": "START_", "end": "END_" },
+  "provider": "qwen"
 }
 ```
 
@@ -649,35 +755,36 @@ Type a prompt into the current chat, click send, wait for completion, extract th
 {
   "content": "hello",
   "raw": "hello",
-  "trace": [ ... ]
+  "url": "https://chat.qwen.ai/c/...",
+  "source": "strict_delimiter",
+  "trace": [...]
 }
 ```
+
+The `source` field is provider-specific — DeepSeek returns `'delimiter'`, `'fence'`, or `'raw'`; Qwen returns `'strict_delimiter'` on success (it doesn't have a fence or raw fallback — if the delimiters aren't there, it fails).
 
 **Response (failure):**
 
 ```json
 {
-  "error": "response_timeout",
-  "reason": "no_new_message",
-  "details": null,
-  "probe": { ... },
-  "trace": [ ... ]
+  "error": "invalid_response_format",
+  "reason": "Model did not follow delimiter instructions",
+  "details": { "rawPreview": "..." },
+  "trace": [...]
 }
 ```
 
-Any content-script-side error is a failure response — the background never sees a thrown exception from `sendToTab`, only `{ error, ... }` payloads. This is by design: the content script owns the DOM and must translate DOM failures into structured errors before they cross the `sendMessage` boundary. A thrown exception in content.js produces a `Receiving end does not exist` error in background, which is treated as "content script crashed" and retried once with `executeScript` re-injection. Two failures in a row → `input_not_found`.
-
 ### checkState
 
-Return the current state of the work tab without changing it. Used by the popup's status display, and would be used by a future `/status` route.
+Return the current state of the work tab without changing it.
 
 **Message:**
 
 ```json
-{ "action": "checkState" }
+{ "action": "checkState", "provider": "deepseek" }
 ```
 
-**Response:**
+**Response (DeepSeek):**
 
 ```json
 {
@@ -688,23 +795,35 @@ Return the current state of the work tab without changing it. Used by the popup'
 }
 ```
 
+**Response (Qwen):**
+
+```json
+{
+  "inputFound": true,
+  "currentChatName": "Qwen Chat",
+  "loggedOut": false
+}
+```
+
+Field sets vary by provider. `inputFound` is the only field the router/background rely on — it's the "is this page usable" check after URL navigation.
+
 ### resetChat
 
-Reset the named chat. In v0.1, delegates to `ensureChat` — same semantics as `/reset` at the HTTP layer.
+Reset the named chat.
 
 **Message:**
 
 ```json
-{ "action": "resetChat", "name": "src-alpha" }
+{ "action": "resetChat", "name": "src-alpha", "provider": "qwen" }
 ```
 
-**Response:** identical to `ensureChat`.
+**Response (DeepSeek):** identical to `ensureChat`.
 
----
+**Response (Qwen):** `{ "ok": true, "reason": "qwen_reset_not_implemented" }`.
 
 ## Content to extension messages
 
-`chrome.runtime.sendMessage` payloads, dispatched from `content.js` to `background.js`. Two types:
+`chrome.runtime.sendMessage` payloads, dispatched from the provider modules (via the router context) to `background.js`. Two types:
 
 ### dsc_phase
 
@@ -715,16 +834,16 @@ Live phase telemetry. Forwarded to `POST /progress` if there's an active request
 ```json
 {
   "type": "dsc_phase",
-  "phase": "reasoning",
-  "extra": { "len": 20 }
+  "phase": "step_7b_streaming",
+  "extra": { "len": 456 }
 }
 ```
 
-The background tracks `activeRequestId` (set at the start of `handleNext`, cleared on both success and failure). If `activeRequestId` is null — because the content script emits a phase during `checkState` or after a reply has already posted — the message is dropped silently. The `dsc_phase` listener is the *only* `chrome.runtime.onMessage` listener in background.js; a malformed message is ignored.
+The background tracks `activeRequestId` (set at the start of `handleNext`, cleared on both success and failure). If `activeRequestId` is null, the message is dropped silently. The phase name and `extra` shape are entirely provider-defined — background does not validate them, just forwards the whole message to `/progress`.
 
 ### state
 
-The popup's live state broadcast. Not part of the protocol — this is internal UI plumbing. Included here so the message type namespace is documented.
+The popup's live state broadcast. Not part of the protocol — internal UI plumbing.
 
 **Message:**
 
@@ -743,29 +862,50 @@ The popup's live state broadcast. Not part of the protocol — this is internal 
 }
 ```
 
-The popup renders from this. There is no request-response between popup and background — the popup reads `chrome.storage.local` on mount and listens for `state` broadcasts thereafter.
+---
+
+## Provider threading
+
+Where `provider` appears and where it doesn't. Useful for understanding which layer is responsible for what when a multi-provider request fails.
+
+| Layer | Field | Direction | Required | Behavior |
+|---|---|---|---|---|
+| **Caller → Server** | `provider` on `/chat` | request | ✗ (default `'deepseek'`) | Server defaults; doesn't validate the value. |
+| **Caller → Server** | `provider` on `/open` | request | ✗ (default `'deepseek'`) | Same. |
+| **Server queue** | `provider` on queue entry | internal | always set | Stamped at `enqueue()`; used only for `/next` payload. |
+| **Server → Extension** | `provider` on `/next` | response | always present | Echoed from queue entry. |
+| **Extension → Content** | `provider` on `sendMessage` | request | always present | `handleNext` reads from `work.provider` and passes to every `sendToTab` call. |
+| **Content router** | `msg.provider` | dispatcher | always present (falls back to `'deepseek'` for backward compat) | `DSC_PROVIDERS[provider]` lookup; `no_provider_loaded` if missing. |
+| **Extension → Server** | — | n/a | — | `/reply` and `/progress` don't carry `provider` — the `requestId` identifies the original entry, which has the provider. |
+| **Server → Caller** | — | n/a | — | `/chat` response doesn't echo `provider` — the caller knows what they sent. If you need to verify, check `url`'s domain. |
+
+**The `provider` string is never transformed.** Whatever the caller sends is what reaches `DSC_PROVIDERS[provider]`. No case normalization, no aliasing, no fallback at intermediate layers. If the caller sends `'DeepSeek'` (capital D), the router looks up `DSC_PROVIDERS['DeepSeek']`, finds nothing, and returns `no_provider_loaded`. This is intentional — silent normalization would hide caller typos. If you need case-insensitivity, add it in `src/client.js`'s `chat()` method (normalize before sending), not in the server or the router.
+
+**`provider` is a data field, not control flow.** No module except `content.js` and `background.getWorkTab` branches on it. `src/server.js` threads it through without inspecting it. If you're tempted to add `if (provider === 'qwen') { ... }` to the server, that's a design signal — the behavior belongs in the provider module or in `content.js`'s dispatch, not in the queue.
 
 ---
 
 ## Extraction
 
-Between the raw assistant reply and the `content` field of `/chat`, there are three extraction passes. They run in order; the first one that produces non-empty content wins.
+Between the raw assistant reply and the `content` field of `/chat`, each provider applies its own extraction passes. **The extraction strategy is provider-specific** — there is no shared "extract the answer" function.
 
-**Pass 1 — delimiter extraction.** The caller embeds the delimiters in the prompt. When the LLM replies, its reply contains the delimiters in the text:
+**DeepSeek** — three passes, first non-empty wins:
 
-```
-<sourceName> START_<filename>
-[code here]
-<sourceName> END_<filename>
-```
+1. **Delimiter** — matches `START_<file>` / `END_<file>` boundaries the caller embedded in the prompt. Two regex passes: line-anchored (preferred, preserves newlines), then whitespace-tolerant (for single-line collapsed blobs).
+2. **Last JS fence** — falls back to the last ```js block if delimiters are missing.
+3. **Raw** — returns the whole `.ds-assistant-message-main-content` text if no delimiters and no fence.
 
-The content script matches with a regex anchored on line boundaries. Two passes: line-anchored first (preferred — preserves newlines in the extracted content), then whitespace-tolerant (for collapsed single-line blobs where the model or the DOM dropped the newlines).
+The `extract` trace shows `source: 'delimiter' | 'fence' | 'raw'`.
 
-**Pass 2 — last JS code fence.** If the delimiters are missing (LLM ignored the instruction, or replied without embedding them), the content script falls back to the last ```js or ```javascript fenced block in the reply. This is the original convention the aggregator's `extractCodeFromClipboard` uses.
+**Qwen** — one pass, no fallback:
 
-**Pass 3 — raw.** If neither delimiters nor a JS fence is present (LLM replied with prose, or with a non-JS fenced block), the raw assistant message text is returned as `content`. The `extract` trace phase shows `source: 'raw'` — the caller can distinguish "the extraction fell through" from "the LLM replied with code as expected".
+1. **Strict delimiter** — requires both `START_QWEN_REPLY` and `END_QWEN_REPLY` to appear in the DOM. If missing, fails with `invalid_response_format` rather than returning partial content.
 
-The `trace` array captures which pass fired in the `extract` phase: `{ source: 'delimiter' | 'fence' | 'raw', contentLen, rawLen }`.
+The `extract` trace shows `source: 'strict_delimiter'` on success. There's no `source: 'raw'` for Qwen — the provider never returns raw content.
+
+The reason for the difference is documented in [architecture.md#6-answer-block-extraction-over-whole-message](architecture.md#6-answer-block-extraction-over-whole-message): DeepSeek has a reliable DOM signal (`.ds-assistant-message-main-content`) that distinguishes answer from reasoning; Qwen doesn't, so it uses content delimiters. Each provider chose the strategy its DOM can support.
+
+**Callers who need consistent extraction** across providers should embed the delimiters in the prompt. DeepSeek will find them via pass 1; Qwen requires them. Both return `source: 'delimiter'`-family on success.
 
 ---
 
@@ -786,63 +926,84 @@ Every caller-route error response is `{ ok: false, error: <code>, ... }`. The fu
 }
 ```
 
-Not every field is present on every error — `retryAfter` only appears for `rate_limited`, `details` only appears when the content script produces structured data, `trace` only appears when the error originated from the content script. The `error` field is always one of the 20 registered codes; unknown codes are collapsed to `internal_error` by the client library. See [error-codes.md](error-codes.md) for the full table.
+Not every field is present on every error — `retryAfter` only appears for `rate_limited`, `details` only appears when the provider produces structured data, `trace` only appears when the error originated from a provider module. The `error` field is always one of the 21 registered codes; unknown codes are collapsed to `internal_error` by the client library.
+
+**Two provider-specific codes added in v0.2.0:**
+
+- `invalid_response_format` — Qwen's delimiters not present. `retryable: true, userFixable: false, http: 502`. Bucket A (retry silently).
+- `no_provider_loaded` — router couldn't find the provider module. Raised by `content.js`, not by a provider. This is a **registration bug**, not a runtime failure — the fix is to add the provider to `manifest.json` and reload. The router returns it as a **content-script-level error**, which background.js surfaces as `input_not_found` (since it doesn't recognize the code) — but the `reason` field carries `no_provider_loaded` and the `hostname`. See [providers.md#the-registration-checklist](providers.md#the-registration-checklist).
+
+See [error-codes.md](error-codes.md) for the full table.
 
 ---
 
 ## Version negotiation
 
-`/hello` carries a `version` field from `shared.js` `DSC.VERSION`, currently `'0.1.0'`. The server logs it:
+`/hello` carries a `version` field from `shared.js` `DSC.VERSION`, currently `'0.2.0'`. The server logs it:
 
 ```
-extension connected (0.1.0) | https://chat.deepseek.com/ | 1 tab(s)
+extension connected (0.2.0) | https://chat.deepseek.com/ | 2 tab(s)
 ```
 
-The server does **not** reject mismatched versions in v0.1. A `0.0.1` extension against a `0.1.0` server gets normal service, and vice versa. The version field is informational only.
+The server does **not** reject mismatched versions in v0.2.0. The version field is informational only. `PROTOCOL_VERSION_MISMATCH` exists in `src/errors.js` and its metadata describes the intent, but the check itself is deferred — see [Extending the protocol](#extending-the-protocol).
 
-The `PROTOCOL_VERSION_MISMATCH` error code exists in `src/errors.js` and its metadata describes the intent (server rejects mismatched major versions, extension displays a reload prompt), but the check itself is deferred — see [Extending the protocol](#extending-the-protocol).
+**Cross-version compatibility** (informational, not enforced):
 
-Until then: operators upgrading the server without upgrading the extension (or vice versa) should expect silent behavior changes, not errors. The mitigation is the same as for any pre-1.0 project — treat server and extension as a single versioned unit, upgrade both at the same time.
+| Client | Server | Extension | DeepSeek works | Qwen works |
+|---|---|---|---|---|
+| v0.1.x (no provider field) | v0.2.0 | v0.2.0 | ✓ (defaults to deepseek) | ✗ (client can't request it) |
+| v0.2.0 | v0.1.x | v0.2.0 | ✓ (v0.1 server ignores provider) | ✗ (v0.1 server can't route) |
+| v0.2.0 | v0.2.0 | v0.1.x | ✓ | ✗ (old extension has no qwen module) |
+
+**Upgrade both sides together.** The `provider` field and the `url` field on `/chat` are additive to the v0.1.x wire format — nothing breaks, but the multi-provider features require both sides at v0.2.0+.
 
 ---
 
 ## Constraints
 
-Four constraints that are not obvious from the routes alone:
+Five constraints that are not obvious from the routes alone. Two are v0.1.x; three are new in v0.2.0.
 
-**1. One work tab.** The extension pins `chrome.storage.local.workTabId` on first use and reuses it for the entire browser session. If that tab closes, `getWorkTab()` returns null and the next request fails with `input_not_found`. There is no tab-rotation, no multi-tab parallelism, no fallback to a different tab. This is a design choice — see [adr/0004-sticky-work-tab-over-target-tab-id.md](adr/0004-sticky-work-tab-over-target-tab-id.md).
+**1. One work tab per provider.** When `provider` is specified, `getWorkTab(provider)` queries that provider's domain and returns the first non-active match. If two Qwen tabs are open, the request goes to the non-active one; if all Qwen tabs are active (rare — only one can be focused), it goes to the first. There is no tab-rotation, no multi-tab parallelism per provider. Two requests against the same provider serialize through the queue.
 
-**2. One server, one extension, one browser profile.** Two servers on the same profile would each receive half the `/hello` polls and race for `/next`. Not supported. The intended deployment is one server + one extension + one browser profile per machine.
+**2. One server, one extension, one browser profile.** Two servers on the same profile would each receive half the `/hello` polls and race for `/next`. Not supported.
 
-**3. No per-request server-side timeout.** If the extension dies after `/next` returns a job, the server's `inFlight` map blocks the queue forever. Recovery requires restarting the server. See [Queue state machine](#queue-state-machine) for the details and [Extending the protocol](#extending-the-protocol) for the fix.
+**3. No per-request server-side timeout.** If the extension dies after `/next` returns a job, the server's `inFlight` map blocks the queue forever. Recovery requires restarting the server. See [Queue state machine](#queue-state-machine).
 
-**4. Loopback only.** The server binds `127.0.0.1` by default. Passing a different `host` works if you have a reason, but the token is the only auth and it's not TLS — running this on a public interface would expose the token and the tab. Don't.
+**4. Loopback only.** The server binds `127.0.0.1` by default. The token is the only auth and it's not TLS.
+
+**5. Provider names are case-sensitive and exact.** `'deepseek'`, not `'DeepSeek'`. `'qwen'`, not `'Qwen'`. `'tongyi'`, not `'tongyi.aliyun.com'`. The lookup in `content.js` is `DSC_PROVIDERS[msg.provider]` — JavaScript object key semantics apply.
+
+**6. A provider's domain must be in three places.** `DSC.PROVIDER_DOMAINS` (shared.js), `manifest.json` `host_permissions` + `content_scripts.matches`, and `background.js` `sendToTab` re-injection list. Missing any of them produces a specific, diagnosable error — see [providers.md#the-registration-checklist](providers.md#the-registration-checklist).
 
 ---
 
 ## Extending the protocol
 
-Three routes and two flags are designed but not shipped in v0.1. The shape of each is documented here so that a future integrator doesn't invent an incompatible one.
+Five routes and four behaviors are designed but not shipped in v0.2.0. The shape of each is documented here so that a future integrator doesn't invent an incompatible one.
 
-**`GET /status`** — introspection, no blocking. Response: `{ connected, sessionId, currentChat, queued, processing }`. Would replace the ad-hoc `curl /tabs` check that currently serves the same purpose. Deferred because no caller has needed it yet.
+**`GET /status`** — introspection, no blocking. Response: `{ connected, sessionId, providers: ['deepseek', 'qwen'], queued, processing, currentChat }`. Would replace the ad-hoc `curl /tabs` check. Deferred because no caller has needed it yet.
 
-**`POST /cancel/:requestId`** — abort an in-flight or queued request. Response: `{ ok, cancelled: boolean }`. Sets `entry.cancelled = true`; `pump()` skips cancelled entries; a reply for a cancelled request is discarded. Returns `{ cancelled: false }` if the request already completed. Deferred because the extension cannot actually abort mid-send — the content script would need a `chrome.runtime.onMessage` listener for an `abort` action, and DeepSeek's send button has no "undo" affordance. The route would cancel the queue slot but not the in-flight DOM operation.
+**`POST /cancel/:requestId`** — abort an in-flight or queued request. Response: `{ ok, cancelled: boolean }`. Sets `entry.cancelled = true`; `pump()` skips cancelled entries; a reply for a cancelled request is discarded. Deferred because the extension cannot actually abort mid-send — the provider would need a `chrome.runtime.onMessage` listener for an `abort` action, and none of the shipped providers implement one.
 
-**`GET /health`** — server readiness, no auth. Returns `{ ok: true, version, uptime }` if the server is listening and the extension has polled within 60s, `{ ok: false, error: 'extension_stale' }` otherwise. Intended for a supervisor (systemd `ExecStartPost`, k8s liveness probe) that needs to distinguish "server up" from "extension connected". Deferred because the current deployment model (systemd + manual restart) doesn't use a readiness check.
+**`GET /health`** — server readiness, no auth. Returns `{ ok: true, version, uptime, providers }` if the server is listening and the extension has polled within 60s, `{ ok: false, error: 'extension_stale' }` otherwise. Deferred because the current deployment model (systemd + manual restart) doesn't use a readiness check.
 
-**Per-request server-side timeout.** Not a route, a behavior change. Every `inFlight` entry gets a `deadline` (default 180s, matching the client timeout). A background timer clears expired entries with `DSCError('extension_timeout')` and calls `pump()`. This is the fix for the "extension dies mid-flight" hole described in [Queue state machine](#queue-state-machine). Deferred because in practice the extension doesn't crash often enough for the queue-blocking bug to bite — when it does, restarting the server is a 2-second fix that doesn't require a protocol change.
+**Per-request server-side timeout.** Every `inFlight` entry gets a `deadline` (default 180s). A background timer clears expired entries with `DSCError('extension_timeout')` and calls `pump()`. Fixes the "extension dies mid-flight" hole. Deferred because restart is a 2-second fix that doesn't require a protocol change.
 
-**`/reset` with `delete: true`.** Current `/reset` is an alias for `/open` — it doesn't delete the chat. A future `/reset { chatName, delete: true }` would actually delete the chat via DeepSeek's three-dot menu. Deferred because the delete UI is fragile (same reason rename was deferred in stage 3) and no caller has needed a real reset yet.
+**`/reset` with `delete: true`.** Current `/reset` is a no-op alias. A future `/reset { chatName, delete: true }` would actually delete the chat via the provider's UI. Requires each provider to implement `deleteChat(name)` — DeepSeek via three-dot menu (fragile), Qwen via whatever Qwen's delete UI is (currently none observed). Deferred.
 
-**Version negotiation.** The `PROTOCOL_VERSION_MISMATCH` error exists in the taxonomy but is never raised. A future version bump to `0.2.0` would introduce a `protocol` field on `/hello`, a matching field on every response, and a rule that major-version mismatch produces `PROTOCOL_VERSION_MISMATCH` on the first request rather than silent behavior drift. Deferred until there's a breaking change to negotiate about.
+**Per-provider `/hello`.** Current `/hello` registers the whole tab inventory in one call. A future version might split by provider so that a Qwen tab change doesn't invalidate the DeepSeek tab's registration. Deferred because two providers don't justify it; three or more would.
+
+**Version negotiation enforcement.** A future bump to `0.3.0` would add a `protocol` field on `/hello`, a matching field on every response, and a rule that major-version mismatch produces `PROTOCOL_VERSION_MISMATCH` on the first request rather than silent behavior drift. Deferred until there's a breaking change to negotiate about.
+
+**Rate-limit auto-pivot.** A future flag on `/chat` — `pivotOnRateLimit: ['qwen', 'tongyi']` — would retry the request on the next provider in the list when the current provider returns `rate_limited`. Deferred because it's a policy decision, not a protocol concern. The wizard layer (aggregator `paste-extension.js`) can implement pivot by catching `rate_limited` and re-sending with a different `provider` field — no protocol change required. This is the recommended approach for now.
 
 **Adding a new route — checklist:**
 
 1. Decide: caller route (blocks) or extension route (fire-and-forget or long-poll).
 2. If caller: add the route to `src/server.js`, enqueue a `mode`, extend the `pump()` payload if needed, extend `/reply` to resolve the new fields, extend `src/client.js` with a method.
-3. If extension: add the route to `src/server.js` and `background.js`, ensure it never calls `pump()` in a way that could re-enter (the queue serialization depends on `pump()` being the only state mover).
+3. If extension: add the route to `src/server.js` and `background.js`, ensure it never calls `pump()` in a way that could re-enter.
 4. Add the response shape to this doc under the appropriate section.
-5. If the route can fail in a new way, add a code to `src/errors.js` first, then update [error-codes.md](error-codes.md), then raise it from the content or background code.
-6. If the change touches an invariant (long-poll, queue serialization, one-tab-per-extension), add an ADR under `docs/adr/` before touching the code.
+5. If the route can fail in a new way, add a code to `src/errors.js` first, then update [error-codes.md](error-codes.md), then raise it from the provider or background code.
+6. If the change touches an invariant (long-poll, queue serialization, one-tab-per-provider, provider threading), add an ADR under `docs/adr/` before touching the code.
 
 The order matters: errors before routes, routes before docs, docs before code in a different layer. A route that raises an unregistered error is worse than a route that doesn't exist.
