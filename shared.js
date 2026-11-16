@@ -12,7 +12,7 @@
   const DSC = {
     VERSION: '0.2.0',
 
-    BUILD_HASH: 'p2-auto-reload-20261117a',
+    BUILD_HASH: 'p2-next-timeout-20261117a',
 
     STORAGE: {
       TOKEN: 'dsc_token',

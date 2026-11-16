@@ -37,6 +37,7 @@ async function loadConfig() {
 
 async function apiFetch(cfg, path, init) {
   init = init || {};
+  const timeoutMs = init.timeoutMs || 0;
   const headers = Object.assign(
     { 'Authorization': 'Bearer ' + cfg.token },
     init.headers || {}
@@ -44,15 +45,36 @@ async function apiFetch(cfg, path, init) {
   if (init.body && !headers['Content-Type']) {
     headers['Content-Type'] = 'application/json';
   }
-  const res = await fetch(cfg.baseUrl + path, Object.assign({}, init, { headers }));
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(json.error || ('http_' + res.status));
-    err.status = res.status;
-    err.body = json;
-    throw err;
+  const fetchInit = Object.assign({}, init, { headers });
+  delete fetchInit.timeoutMs;
+  let controller = null;
+  let timer = null;
+  if (timeoutMs > 0) {
+    controller = new AbortController();
+    fetchInit.signal = controller.signal;
+    timer = setTimeout(() => controller.abort(), timeoutMs);
   }
-  return json;
+  try {
+    const res = await fetch(cfg.baseUrl + path, fetchInit);
+    const json = await res.json().catch(() => ({}));
+    if (controller && controller.signal.aborted) throw new Error('aborted');
+    if (!res.ok) {
+      const err = new Error(json.error || ('http_' + res.status));
+      err.status = res.status;
+      err.body = json;
+      throw err;
+    }
+    return json;
+  } catch (e) {
+    if (controller && controller.signal.aborted) {
+      const err = new Error('timeout_' + path.slice(1));
+      err.code = 'timeout';
+      throw err;
+    }
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 // Resolve the single tab for `provider`. Returns { tab } or
@@ -427,7 +449,8 @@ async function pollLoop() {
 
     let work;
     try {
-      work = await apiFetch(cfg, '/next', { method: 'GET' });
+      // Bounded: server holds 30s; a dead socket must not wedge the loop.
+      work = await apiFetch(cfg, '/next', { method: 'GET', timeoutMs: DSC.LONG_POLL_MS + 10000 });
     } catch (e) {
       state.connected = false;
       state.lastError = e.message;
