@@ -1,8 +1,20 @@
-// selectors.js — central registry of DOM knowledge for DeepSeek chat UI and
-// the local mock fixture. content.js asks this module for elements by logical
-// name; the module tries each tier in order and reports which tier matched.
-// This is the ONLY place DOM knowledge lives — update it, not content.js,
-// when DeepSeek ships a redesign.
+// selectors.js — DeepSeek-specific DOM selector registry (and the mock fixture,
+// which mirrors DeepSeek's shape).
+//
+// PROVIDER SCOPE: This file is DeepSeek's. It is not provider-neutral shared
+// infrastructure, despite living at the top level.
+//
+// Each provider is expected to own its own selector strategy:
+//   - DeepSeek: this file, loaded before providers/deepseek.js, exposes
+//     globalThis.DSC_SELECTORS. providers/deepseek.js calls
+//     DSC_SELECTORS.resolve(name).
+//   - Qwen: providers/qwen.js declares its selectors inline and ignores
+//     this file entirely.
+//
+// When a THIRD provider needs shared selector infrastructure, extract the
+// genuinely shared parts into a new module (e.g. selector-tiers.js) and
+// keep each provider's selectors in its own provider file. Do not add
+// provider-specific selectors here.
 //
 // Tier kinds:
 //   healthy  — the primary/stable selector matched.
@@ -10,6 +22,15 @@
 //   drifted  — nothing matched. Required elements block sendPrompt.
 //
 // DeepSeek is a React SPA with CSS-module hashes in class names. Do not rely
+// on hash-bearing classes; do rely on semantic anchors: placeholder text,
+// role, aria-*, href patterns, and relative DOM position.
+//
+// Tier kinds:
+//   healthy  — the primary/stable selector matched.
+//   degraded — a fallback matched. Log it; feature may still work.
+//   drifted  — nothing matched. Required elements block sendPrompt.
+//
+// Target UIs are React SPAs with CSS-module hashes in class names. Do not rely
 // on hash-bearing classes; do rely on semantic anchors: placeholder text,
 // role, aria-*, href patterns, and relative DOM position.
 

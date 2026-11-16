@@ -136,7 +136,7 @@ test('decision buckets match the documented counts', () => {
     else if (meta.userFixable) buckets.D++;
     else buckets.E++;
   }
-  assert.strictEqual(buckets.A, 4, 'bucket A (retry silently)');
+  assert.strictEqual(buckets.A, 5, 'bucket A (retry silently)');
   assert.strictEqual(buckets.B, 1, 'bucket B (retry delayed)');
   assert.strictEqual(buckets.C, 2, 'bucket C (retry then beep)');
   assert.strictEqual(buckets.D, 7, 'bucket D (beep)');

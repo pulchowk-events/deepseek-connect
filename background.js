@@ -51,35 +51,58 @@ async function apiFetch(cfg, path, init) {
   return json;
 }
 
-async function getWorkTab(targetTabId) {
+async function getWorkTab(targetTabId, provider) {
+  const providerDomains = DSC.PROVIDER_DOMAINS;
+  const isWorkUrl = (url) => DSC.providerForUrl(url) !== null;
+
+  // Caller-supplied tab ID: honour it only if it matches the requested
+  // provider (or no provider was requested). No silent fallback — a stale
+  // tab ID plus a provider mismatch is a caller bug.
   if (targetTabId) {
     try {
       const t = await chrome.tabs.get(targetTabId);
-      if (t && /^https:\/\/chat\.deepseek\.com\//.test(t.url || '')) return t;
-    } catch (_) { /* fall through to null */ }
-    // Caller explicitly named a tab. Do NOT silently fall back to another
-    // deepseek tab — that would type into the wrong chat (the one the user
-    // is reading) and poll a different tab for the reply. Hard-fail instead.
-    return null;
+      if (!t) return null;
+      if (provider) {
+        const prefix = providerDomains[provider];
+        if (!prefix || !(t.url || '').startsWith(prefix)) return null;
+      } else if (!isWorkUrl(t.url)) {
+        return null;
+      }
+      return t;
+    } catch (_) { return null; }
   }
-  // Persistent work tab. First call picks one, then reuse the same tab for the
-  // whole session. Without this, selection flips based on which deepseek tab
-  // is `active`, and a batch run would type into whichever chat the user is
-  // reading the moment they click around mid-run.
+
+  // Provider-scoped: query that provider's domain directly, bypass the
+  // pinned work tab. Without this, a single pinned tab ID would route
+  // every provider through the same tab, which breaks the multi-provider
+  // contract the moment two tabs are open.
+  if (provider) {
+    const prefix = providerDomains[provider];
+    if (!prefix) return null;
+    const candidates = await chrome.tabs.query({ url: prefix + '*' });
+    if (candidates.length === 0) return null;
+    return candidates.find((t) => !t.active) || candidates[0];
+  }
+
+  // Default (no provider): existing behaviour — pinned tab first, else
+  // first non-active across all supported domains, else mock fixture.
   const stored = await chrome.storage.local.get('workTabId');
   if (stored && stored.workTabId) {
     try {
       const t = await chrome.tabs.get(stored.workTabId);
-      if (t && /^https:\/\/chat\.deepseek\.com\//.test(t.url || '')) return t;
+      if (t && isWorkUrl(t.url)) return t;
     } catch (_) { /* stale — clear and re-pick */ }
     await chrome.storage.local.remove('workTabId');
   }
   const ds = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
-  if (ds.length === 0) {
+  const qwen = await chrome.tabs.query({ url: 'https://chat.qwen.ai/*' });
+  const tongyi = await chrome.tabs.query({ url: 'https://tongyi.aliyun.com/*' });
+  const candidates = [...ds, ...qwen, ...tongyi];
+  if (candidates.length === 0) {
     const mock = await chrome.tabs.query({ url: 'file:///*mock-deepseek.html' });
     return mock[0] || null;
   }
-  const chosen = ds.find((t) => !t.active) || ds[0];
+  const chosen = candidates.find((t) => !t.active) || candidates[0];
   await chrome.storage.local.set({ workTabId: chosen.id });
   return chosen;
 }
@@ -103,7 +126,7 @@ async function sendToTab(tabId, msg) {
     // lost after SW restart). Re-inject and retry once.
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ['shared.js', 'selectors.js', 'content.js'],
+      files: ['shared.js', 'selectors.js', 'providers/deepseek.js', 'providers/qwen.js', 'content.js'],
     });
     return await sendOnce(tabId, msg);
   }
@@ -130,12 +153,16 @@ function broadcast() {
 }
 
 async function register(cfg) {
-  const tabs = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
+  const dsTabs = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
+  const qwenTabs = await chrome.tabs.query({ url: 'https://chat.qwen.ai/*' });
+  const tongyiTabs = await chrome.tabs.query({ url: 'https://tongyi.aliyun.com/*' });
+  const tabs = [...dsTabs, ...qwenTabs, ...tongyiTabs];
   const tabList = tabs.map((t) => ({
     id: t.id,
     url: t.url,
     title: (t.title || '').slice(0, 80),
     active: !!t.active,
+    provider: DSC.providerForUrl(t.url),
   }));
   const tab = await getWorkTab();
   const tabUrl = tab ? tab.url : null;
@@ -152,7 +179,7 @@ async function register(cfg) {
 }
 
 async function handleNext(cfg, work) {
-  const tab = await getWorkTab(work.targetTabId);
+  const tab = await getWorkTab(work.targetTabId, work.provider);
   if (!tab) {
     await apiFetch(cfg, '/reply', {
       method: 'POST',
@@ -160,7 +187,7 @@ async function handleNext(cfg, work) {
         requestId: work.requestId,
         status: 'error',
         error: DSC.ERR.INPUT_NOT_FOUND,
-        reason: 'no_deepseek_tab',
+        reason: 'no_work_tab',
       }),
     });
     return;
@@ -168,14 +195,53 @@ async function handleNext(cfg, work) {
 
   try {
     activeRequestId = work.requestId;
-    let ensured = await sendToTab(tab.id, {
-      action: DSC.MSG.ENSURE_CHAT,
-      name: work.chatName,
-    });
+    // If the caller supplied a persisted chat URL (retry path), navigate
+    // directly and skip the sidebar walk entirely. The URL contains the
+    // UUID, which is stable for the chat's lifetime — no fuzzy matching
+    // needed, no dependence on provider's title auto-generation.
+    let ensured;
+    if (work.targetUrl) {
+      try {
+        await chrome.tabs.update(tab.id, { url: work.targetUrl });
+        await new Promise((resolve) => {
+          const onUpd = (id, info) => {
+            if (id === tab.id && info.status === 'complete') {
+              chrome.tabs.onUpdated.removeListener(onUpd);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(onUpd);
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(onUpd);
+            resolve();
+          }, 15000);
+        });
+        await new Promise((r) => setTimeout(r, 800));
+        const state = await sendToTab(tab.id, { action: DSC.MSG.CHECK_STATE, provider: work.provider });
+        if (!state || !state.inputFound) {
+          throw Object.assign(new Error('url-nav: input not found after navigate'), {
+            code: DSC.ERR.INPUT_NOT_FOUND,
+          });
+        }
+        ensured = { ok: true, existing: true, mode: 'existing', url: work.targetUrl };
+      } catch (e) {
+        // Fall through to ensureChat as a safety net — the URL might be
+        // stale (chat deleted, provider relocated the UUID).
+        ensured = null;
+      }
+    }
+    if (!ensured) {
+      ensured = await sendToTab(tab.id, {
+        action: DSC.MSG.ENSURE_CHAT,
+        name: work.chatName,
+        provider: work.provider,
+      });
+    }
     if (ensured && ensured.needNewChat) {
       // Content is on an existing chat with no sidebar match. Navigate to a
       // fresh / and retry once. URL nav is robust; button text is not.
-      await chrome.tabs.update(tab.id, { url: 'https://chat.deepseek.com/' });
+      const baseUrl = tab.url ? new URL(tab.url).origin : 'https://chat.deepseek.com';
+        await chrome.tabs.update(tab.id, { url: baseUrl + '/' });
       await new Promise((res) => {
         const onUpd = (id, info) => {
           if (id === tab.id && info.status === 'complete') {
@@ -212,6 +278,7 @@ async function handleNext(cfg, work) {
           existing: !!(ensured && ensured.existing),
           mode: ensured && ensured.mode,
           debug: ensured && ensured.debug,
+          url: (ensured && ensured.url) || work.targetUrl || null,
           chat: work.chatName,
         }),
       });
@@ -222,6 +289,7 @@ async function handleNext(cfg, work) {
       const reset = await sendToTab(tab.id, {
         action: DSC.MSG.RESET_CHAT,
         name: work.chatName,
+        provider: work.provider,
       });
       activeRequestId = null;
       await apiFetch(cfg, '/reply', {
@@ -241,6 +309,7 @@ async function handleNext(cfg, work) {
       action: DSC.MSG.SEND_PROMPT,
       prompt: work.prompt,
       delimiters: work.delimiters,
+      provider: work.provider,
     });
 
     if (result && result.error) {
@@ -270,6 +339,7 @@ async function handleNext(cfg, work) {
         status: 'ok',
         content: result.content,
         raw: result.raw,
+        url: result.url,
         trace: result.trace,
       }),
     });
