@@ -126,8 +126,11 @@ function createClient(opts) {
     if (!params || !params.chatName) {
       throw new DSCError(CODES.BAD_REQUEST, { reason: 'chatName required' });
     }
+    if (!params.provider) {
+      throw new DSCError(CODES.BAD_REQUEST, { reason: 'provider required' });
+    }
     const timeoutMs = params.timeoutMs || DEFAULT_OPEN_TIMEOUT_MS;
-    return await request('POST', '/reset', { chatName: params.chatName }, timeoutMs);
+    return await request('POST', '/reset', { chatName: params.chatName, provider: params.provider }, timeoutMs);
   }
 
   async function tabs() {

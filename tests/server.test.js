@@ -55,7 +55,7 @@ test('rejects requests with wrong token', async () => {
 test('/hello returns sessionId', async () => {
   const { server, baseUrl } = await startServer();
   try {
-    const r = await postJson(baseUrl, '/hello', { version: '0.1.0', tabUrl: 'x' });
+    const r = await postJson(baseUrl, '/hello', { version: '0.1.0', tabUrl: 'x', buildHash: server.buildHash });
     assert.equal(r.status, 200);
     const j = await r.json();
     assert.equal(j.ok, true);
@@ -69,7 +69,7 @@ test('/next returns idle after long-poll timeout when queue empty', async () => 
     // Shorten wait by not using the real 30s. Skip — just assert it doesn't hang
     // forever by racing against a 500ms guard. We don't actually trigger timeout.
     // Instead: enqueue, then /next should return immediately.
-    const enq = server.enqueue({ prompt: 'hello world', chatName: 'chat-x' });
+    const enq = server.enqueue({ prompt: 'hello world', chatName: 'chat-x', provider: 'deepseek' });
     const r = await fetch(baseUrl + '/next', { headers: authHeaders() });
     assert.equal(r.status, 200);
     const j = await r.json();
@@ -92,7 +92,7 @@ test('/next returns idle after long-poll timeout when queue empty', async () => 
 test('/reply error rejects the enqueue promise', async () => {
   const { server, baseUrl } = await startServer();
   try {
-    const enq = server.enqueue({ prompt: 'boom', chatName: 'chat-x' });
+    const enq = server.enqueue({ prompt: 'boom', chatName: 'chat-x', provider: 'deepseek' });
     const nextR = await fetch(baseUrl + '/next', { headers: authHeaders() });
     const work = await nextR.json();
 
@@ -128,8 +128,8 @@ test('/reply with unknown requestId returns 404', async () => {
 test('queue serves FIFO, one in-flight at a time', async () => {
   const { server, baseUrl } = await startServer();
   try {
-    const a = server.enqueue({ prompt: 'first', chatName: 'A' });
-    const b = server.enqueue({ prompt: 'second', chatName: 'B' });
+    const a = server.enqueue({ prompt: 'first', chatName: 'A', provider: 'deepseek' });
+    const b = server.enqueue({ prompt: 'second', chatName: 'B', provider: 'deepseek' });
 
     // First /next must return 'first'.
     const n1 = await (await fetch(baseUrl + '/next', { headers: authHeaders() })).json();
@@ -165,7 +165,7 @@ test('enqueue rejects empty prompt', async () => {
   const { server } = await startServer();
   try {
     await assert.rejects(
-      server.enqueue({ prompt: '', chatName: 'x' }),
+      server.enqueue({ prompt: '', chatName: 'x', provider: 'deepseek' }),
       /prompt required/
     );
   } finally { await server.close(); }
@@ -173,7 +173,7 @@ test('enqueue rejects empty prompt', async () => {
 
 test('close() rejects queued and in-flight enqueues', async () => {
   const { server } = await startServer();
-  const q = server.enqueue({ prompt: 'queued-but-not-dispatched', chatName: 'Q' });
+  const q = server.enqueue({ prompt: 'queued-but-not-dispatched', chatName: 'Q', provider: 'deepseek' });
   await server.close();
   await assert.rejects(q, /server_closed/);
 });
