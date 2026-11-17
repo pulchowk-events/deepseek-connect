@@ -12,7 +12,7 @@
   const DSC = {
     VERSION: '0.2.0',
 
-    BUILD_HASH: 'cfg-providers-20261117d',
+    BUILD_HASH: 'cfg-providers-20261117e',
 
     STORAGE: {
       TOKEN: 'dsc_token',
@@ -153,7 +153,7 @@
   };
 
   // ---- config providers: definition validation (pure; also used by the server)
-  const TOP_KEYS = ['schema', 'name', 'label', 'domains', 'selectors', 'dismiss', 'timeouts',
+  const TOP_KEYS = ['schema', 'name', 'label', 'domains', 'selectors', 'dismiss', 'exclude', 'timeouts',
     'pacingMs', 'extraction', 'delimiter', 'completionMode', 'completionStableMs'];
   const SEL_KEYS = ['input', 'send', 'stop', 'response', 'code'];
   const EXTRACTIONS = ['rawText', 'codeBlock', 'delimiter'];
@@ -212,6 +212,7 @@
       }
     }
     if (def.dismiss !== undefined && !isStrArr(def.dismiss, 0)) errors.push('dismiss must be an array of selector strings');
+    if (def.exclude !== undefined && !isStrArr(def.exclude, 0)) errors.push('exclude must be an array of selector strings');
 
     const to = def.timeouts === undefined ? {} : def.timeouts;
     if (!to || typeof to !== 'object' || Array.isArray(to)) {
@@ -264,6 +265,7 @@
       completionStableMs: def.completionStableMs === undefined ? 4000 : def.completionStableMs,
     };
     if (def.dismiss && def.dismiss.length) value.dismiss = def.dismiss.slice();
+    if (def.exclude && def.exclude.length) value.exclude = def.exclude.slice();
     if (def.delimiter) value.delimiter = { prefix: def.delimiter.prefix, suffix: def.delimiter.suffix };
     return { ok: true, value };
   };
@@ -278,6 +280,7 @@
     DSC.registerDynamicProvider(def.name, def.domains);
 
     const S = def.selectors;
+    const EXCLUDE = def.exclude || [];
     const E = DSC.ERR;
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     let lastSendAt = 0; // tab-local: a tab reload resets pacing
@@ -295,13 +298,26 @@
       }
       return null;
     }
+    // exclude: a response match that is, or sits inside, a match of these selectors is never a candidate.
+    function isExcluded(el) {
+      for (const x of EXCLUDE) {
+        try { if (el.closest(x)) return true; } catch (_) { /* bad selector */ }
+      }
+      return false;
+    }
+    // The single place response selectors are read, so before/now counts and candidates always agree.
+    function responseAll(s) {
+      let l = [];
+      try { l = Array.from(document.querySelectorAll(s)); } catch (_) { l = []; }
+      return EXCLUDE.length ? l.filter((el) => !isExcluded(el)) : l;
+    }
     function countOf(sel) {
-      try { return document.querySelectorAll(sel).length; } catch (_) { return 0; }
+      return responseAll(sel).length;
     }
     function qAll(sels) {
       for (const s of sels) {
         let l = [];
-        try { l = Array.from(document.querySelectorAll(s)); } catch (_) { l = []; }
+        l = responseAll(s);
         if (l.length) return l;
       }
       return [];
@@ -428,7 +444,7 @@
       function newResponseEls() {
         for (const s of S.response) {
           let cur = [];
-          try { cur = Array.from(document.querySelectorAll(s)); } catch (_) { cur = []; }
+          cur = responseAll(s);
           if (cur.length > (before[s] || 0)) return cur;
         }
         return [];
@@ -437,7 +453,7 @@
       function candidateEls() {
         for (const s of S.response) {
           let cur = [];
-          try { cur = Array.from(document.querySelectorAll(s)); } catch (_) { cur = []; }
+          cur = responseAll(s);
           if (cur.length <= (before[s] || 0)) continue;
           const live = cur.filter((el) => { const t = textOf(el); return t !== '' && !isEcho(t); });
           if (live.length) return { sel: s, els: live };
@@ -502,7 +518,7 @@
         if (!sawMsg) {
           sawMsg = true; streamUrl = location.href; T('cfg_first', { msgs: els.length, sel: cand.sel });
           const f0 = els[els.length - 1];
-          let all = []; try { all = Array.from(document.querySelectorAll(cand.sel)); } catch (_) { all = []; }
+          let all = responseAll(cand.sel);
           const idx = all.indexOf(f0); const b0 = before[cand.sel] || 0;
           T('cfg_first_dom', { sel: cand.sel, idx, before: b0, now: all.length, isNew: idx >= b0, tagName: f0.tagName.toLowerCase(), className: String(f0.className || '').slice(0, 120), innerText: String(f0.innerText || f0.textContent || '').slice(0, 100), innerHTML: String(f0.innerHTML || '').slice(0, 300) });
         }

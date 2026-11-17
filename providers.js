@@ -53,6 +53,7 @@ function readForm() {
     completionMode: $('f-mode').value,
   };
   if (lines('f-dismiss').length) def.dismiss = lines('f-dismiss');
+  if (lines('f-exclude').length) def.exclude = lines('f-exclude');
   const to = {};
   if (num('f-sendMs') !== undefined) to.sendMs = num('f-sendMs');
   if (num('f-responseMs') !== undefined) to.responseMs = num('f-responseMs');
@@ -71,6 +72,7 @@ function fillForm(d) {
   $('f-input').value = (s.input || []).join('\n'); $('f-send').value = (s.send || []).join('\n');
   $('f-stop').value = (s.stop || []).join('\n'); $('f-response').value = (s.response || []).join('\n');
   $('f-code').value = (s.code || []).join('\n'); $('f-dismiss').value = (d.dismiss || []).join('\n');
+  $('f-exclude').value = (d.exclude || []).join('\n');
   $('f-sendMs').value = t.sendMs === undefined ? '' : t.sendMs;
   $('f-responseMs').value = t.responseMs === undefined ? '' : t.responseMs;
   $('f-pacing').value = d.pacingMs === undefined ? '' : d.pacingMs;
@@ -222,17 +224,26 @@ async function testSelectors() {
   const origins = v.value.domains.map((d) => 'https://' + d + '/*');
   const tabs = await chrome.tabs.query({ url: origins });
   if (tabs.length === 0) { setMsg('No open tab on ' + v.value.domains.join(', '), true); return; }
-  const map = Object.assign({}, v.value.selectors, { dismiss: v.value.dismiss || [] });
+  const map = Object.assign({}, v.value.selectors, { dismiss: v.value.dismiss || [], exclude: v.value.exclude || [] });
   let out = '';
   for (const t of tabs) {
     try {
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: t.id },
-        args: [map],
-        func: (m) => {
+        args: [map, v.value.exclude || []],
+        func: (m, ex) => {
           const o = {};
           for (const [k, sels] of Object.entries(m)) {
             o[k] = sels.map((s) => { try { return [s, document.querySelectorAll(s).length]; } catch (_) { return [s, 'invalid']; } });
+            if (k === 'response' && ex.length) {
+              o[k] = sels.map((s) => {
+                try {
+                  const all = Array.from(document.querySelectorAll(s));
+                  const kept = all.filter((el) => !ex.some((x) => { try { return !!el.closest(x); } catch (_) { return false; } }));
+                  return [s + '   [after exclude: ' + kept.length + ' of ' + all.length + ']' + (kept.length === 0 && all.length > 0 ? ' WARNING: exclude discards every match' : ''), all.length];
+                } catch (_) { return [s, 'invalid']; }
+              });
+            }
           }
           return o;
         },
@@ -248,7 +259,7 @@ async function testSelectors() {
 // ---- selector picker --------------------------------------------------------
 // Pick button -> inject picker.js into the provider tab -> picker.js reports back
 // with a dsc_picker_result message. Main frame only (see the TODO in picker.js).
-const PICK_FIELDS = ['input', 'send', 'stop', 'response', 'code'];
+const PICK_FIELDS = ['input', 'send', 'stop', 'response', 'code', 'exclude'];
 let currentPick = null; // { id, tabId }
 let pendingField = null;
 
