@@ -1,4 +1,4 @@
-<p align="center"><a href="assets/banner.mp4"><img src="assets/banner-thumbnail.png" alt="deepseek-connect" width="100%"></a></p>
+<p align="center"><a href="assets/banner.mp4"><img src="assets/banner.gif" alt="deepseek-connect" width="100%"></a></p>
 
 # deepseek-connect
 
