@@ -1,3 +1,5 @@
+<p align="center"><a href="assets/banner.mp4"><img src="assets/banner-thumbnail.png" alt="deepseek-connect" width="100%"></a></p>
+
 # deepseek-connect
 
 A Chromium extension and a Node server that drives real AI chat tabs — DeepSeek, Qwen, and future providers — over a local HTTP API. Any caller can use these chats as a free LLM endpoint without clipboard round-trips, Puppeteer fingerprinting, or credential handling.
