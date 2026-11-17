@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>deepseek-connect providers</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; max-width: 980px; margin: 16px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 18px; margin: 0 0 4px; } h2 { font-size: 15px; margin: 22px 0 8px; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #888; margin-right: 6px; }
+    .dot.green { background: #22c55e; } .dot.red { background: #ef4444; }
+    .row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #ddd; border-radius: 6px; margin: 4px 0; }
+    .row .grow { flex: 1; } .sub { font-size: 12px; color: #666; }
+    .badge { font-size: 11px; background: #eee; border-radius: 4px; padding: 1px 6px; }
+    button { font: inherit; padding: 4px 10px; cursor: pointer; }
+    label { display: block; font-size: 12px; color: #555; margin-top: 8px; }
+    input[type=text], input[type=number], textarea, select { width: 100%; box-sizing: border-box; font: inherit; padding: 4px 6px; }
+    textarea { font-family: ui-monospace, monospace; font-size: 12px; min-height: 44px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+    #msg { white-space: pre-wrap; margin-top: 10px; font-size: 13px; } #msg.bad { color: #b91c1c; }
+    #results { white-space: pre-wrap; font: 12px ui-monospace, monospace; margin-top: 8px; }
+    .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <h1>Providers</h1>
+  <div><span id="dot" class="dot"></span><span id="status">checking server...</span></div>
+  <div class="actions">
+    <button id="rescan">Rescan</button>
+    <button id="seed" hidden>Seed GLM</button>
+    <button id="reload">Reload extension</button>
+  </div>
+
+  <h2>Built-in</h2>
+  <div id="builtin"></div>
+
+  <h2>Custom</h2>
+  <div id="custom"></div>
+
+  <h2 id="form-title">Add provider</h2>
+  <div class="grid">
+    <div>
+      <label for="f-name">name (file stem, a-z 0-9 _ -)</label><input type="text" id="f-name">
+      <label for="f-label">label</label><input type="text" id="f-label">
+      <label for="f-domains">domains (hostnames, one per line)</label><textarea id="f-domains"></textarea>
+      <label for="f-input">selectors.input (one per line, first match wins)</label><textarea id="f-input"></textarea>
+      <label for="f-send">selectors.send</label><textarea id="f-send"></textarea>
+      <label for="f-stop">selectors.stop (optional, recommended)</label><textarea id="f-stop"></textarea>
+      <label for="f-response">selectors.response</label><textarea id="f-response"></textarea>
+      <label for="f-code">selectors.code (optional, default: pre code / pre)</label><textarea id="f-code"></textarea>
+      <label for="f-dismiss">dismiss (optional, click-if-present selectors)</label><textarea id="f-dismiss"></textarea>
+    </div>
+    <div>
+      <label for="f-sendMs">timeouts.sendMs (default 15000)</label><input type="number" id="f-sendMs">
+      <label for="f-responseMs">timeouts.responseMs (default 180000; aggregator allows 300000)</label><input type="number" id="f-responseMs">
+      <label for="f-pacing">pacingMs (default 0)</label><input type="number" id="f-pacing">
+      <label for="f-extraction">extraction</label>
+      <select id="f-extraction"><option>rawText</option><option>codeBlock</option><option>delimiter</option></select>
+      <div id="delim-box" hidden>
+        <label for="f-prefix">delimiter.prefix</label><input type="text" id="f-prefix">
+        <label for="f-suffix">delimiter.suffix</label><input type="text" id="f-suffix">
+      </div>
+      <label for="f-mode">completionMode</label>
+      <select id="f-mode"><option>whichever</option><option>stopGone</option><option>textStable</option><option>delimiter</option></select>
+      <label for="f-stable">completionStableMs (default 4000)</label><input type="number" id="f-stable">
+    </div>
+  </div>
+  <div class="actions">
+    <button id="save">Save</button>
+    <button id="test">Test selectors</button>
+    <button id="clear">New / clear</button>
+  </div>
+  <div id="msg"></div>
+  <div id="results"></div>
+  <script src="shared.js"></script>
+  <script src="providers.js"></script>
+</body>
+</html>

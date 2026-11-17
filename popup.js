@@ -58,6 +58,9 @@ async function refreshState() {
 }
 
 $('save').addEventListener('click', saveConfig);
+$('providers').addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('providers.html') });
+});
 
 $('skip').addEventListener('click', async () => {
   const tabs = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
