@@ -143,7 +143,20 @@ function createClient(opts) {
     return await request(method, path, body, timeoutMs || DEFAULT_SHORT_TIMEOUT_MS);
   }
 
-  return { chat, open, reset, tabs, raw };
+  async function providers() {
+    return await request('GET', '/providers', null, DEFAULT_SHORT_TIMEOUT_MS);
+  }
+  async function addProvider(name, definition) {
+    return await request('POST', '/providers', { name, definition }, DEFAULT_SHORT_TIMEOUT_MS);
+  }
+  async function updateProvider(name, definition) {
+    return await request('PUT', '/providers/' + name, { definition }, DEFAULT_SHORT_TIMEOUT_MS);
+  }
+  async function deleteProvider(name) {
+    return await request('DELETE', '/providers/' + name, null, DEFAULT_SHORT_TIMEOUT_MS);
+  }
+
+  return { chat, open, reset, tabs, providers, addProvider, updateProvider, deleteProvider, raw };
 }
 
 module.exports = {

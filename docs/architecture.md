@@ -471,3 +471,15 @@ When a bug appears at one of these boundaries, the fix belongs on the side that 
 The single hardest boundary to debug is `providers/*.js` → `content.js` → `background.js` → `server.js` → `client.js` for the same failure. When a prompt "fails silently," the failure could be: provider threw an uncaught exception (background gets `Receiving end does not exist`, retries, fails, reports `input_not_found`); provider returned `{error: 'dom_drift'}` (background reports `dom_drift` cleanly); or background's `sendToTab` timed out (background reports `input_not_found` after two attempts). Three different root causes, one visible symptom. The `trace` array on the `/reply` payload is the way to tell them apart — it carries the provider-side phases, so a trace that ends at `probe` means the provider got that far and stopped; a trace that's empty means the provider never ran (registration bug). Check the trace first when a source fails for a non-obvious reason.
 
 For provider-specific failures, the trace phase names are the diagnostic: `probe` / `waitInput` / `toggleDeepthink` / `toggleSearch` indicate DeepSeek; `step_1_dismiss_modal` / `step_2_find_input` / `step_3_type_prompt` indicate Qwen. If a trace mixes both, something is wrong with the routing — the provider that ran doesn't match the provider that was requested.
+
+
+## Config providers (addendum)
+
+Providers can also be data-driven files: `providers/<name>.js` calling `DSC.makeConfigProvider({...})`
+(factory in `shared.js`, same four-method interface as the code modules). The server exposes
+`GET/POST/PUT/DELETE /providers`, derives its provider whitelist from `providers/*.js`, and renders
+files from a fixed template. `background.js` reconciles the files on disk against
+`chrome.scripting` registered content scripts (`dsc-provider-<name>`) and keeps the per-machine
+`enabled` flag in `dsc_registered`. The router lookup is still only `globalThis.DSC_PROVIDERS[name]`.
+Completion detection for config providers is `whichever` of stop-selector-gone or text-stable, so a
+marker parse is never the sole gate.

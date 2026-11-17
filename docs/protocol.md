@@ -1007,3 +1007,19 @@ Five routes and four behaviors are designed but not shipped in v0.2.0. The shape
 6. If the change touches an invariant (long-poll, queue serialization, one-tab-per-provider, provider threading), add an ADR under `docs/adr/` before touching the code.
 
 The order matters: errors before routes, routes before docs, docs before code in a different layer. A route that raises an unregistered error is worse than a route that doesn't exist.
+
+
+## Provider management endpoints (config providers)
+
+All require the Bearer token.
+
+| Route | Body | Result |
+|---|---|---|
+| `GET /providers` | | `{ ok, providers: [{ name, file, kind: 'built-in' or 'config', definition or null }] }` |
+| `POST /providers` | `{ name, definition }` | `{ ok, written }`. 400 on invalid name/definition/built-in/reserved name/domain clash, 409 if the file exists. |
+| `PUT /providers/:name` | `{ definition }` | Rewrites a generated file (tmp + rename). 400 for built-ins or hand-written files. |
+| `DELETE /providers/:name` | | Removes a generated file. 400 for built-ins or hand-written files, 404 if missing. |
+
+`name` must match `^[a-z][a-z0-9_-]{0,30}$`. The server renders the file from a fixed template and
+compile-checks it without executing. Every work request's `provider` must be a built-in or a
+`providers/*.js` stem.

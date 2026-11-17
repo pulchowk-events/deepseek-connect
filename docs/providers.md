@@ -1,5 +1,30 @@
 # Providers
 
+> **Current flow (config providers).** A provider is a file, `providers/<name>.js`, containing one
+> `DSC.makeConfigProvider({...})` call. Adding one needs **zero edits to existing files**:
+> open the extension popup, click **Providers...**, fill the form (or click **Seed GLM**), and Save.
+> The Providers page POSTs the definition to the local server (`POST /providers`), which validates it,
+> renders the file from a fixed template (no caller-supplied JS is ever written), and writes it with
+> `wx` (never overwrites). The page then requests the host permission, registers a content script
+> (`dsc-provider-<name>`), and injects into matching open tabs. The file is a normal committable
+> artifact. If the server is down, Save falls back to a file picker/download and skips registration.
+>
+> If injection reports the file was not found, click **Reload extension** once (Chrome may not serve
+> files added after load on some setups).
+>
+> Schema (`schema: 1`): `name`, `label`, `domains` (plain hostnames), `selectors.{input,send,response}`
+> (arrays, first match wins), optional `selectors.{stop,code}`, `dismiss`, `timeouts.{sendMs,responseMs}`
+> (defaults 15000/180000), `pacingMs`, `extraction` (`rawText` | `codeBlock` | `delimiter`),
+> `delimiter.{prefix,suffix}`, `completionMode` (`whichever` | `stopGone` | `textStable` | `delimiter`),
+> `completionStableMs`. `enabled` is per-machine state in `chrome.storage.local` (`dsc_registered`),
+> not part of the file.
+>
+> DeepSeek and Qwen remain code modules (DeepThink toggle, age modal). The **five steps** and
+> **three registrations** sections below describe the legacy code-module flow only. Corrections to the
+> text below: `providerForUrl` matches exact hostnames (not `startsWith`); there is no default provider
+> (the server refuses a missing one); the server whitelist is `providers/*.js` plus the built-ins.
+
+
 How to add a new provider, understand the plugin contract, and debug a provider that isn't routing correctly. This is the doc that makes `deepseek-connect` extensible — without it, "add a provider" means reverse-engineering `qwen.js` and hoping.
 
 Companion docs: [architecture.md](architecture.md) explains the plugin registry as a load-bearing decision; [protocol.md](protocol.md) has the wire shapes that `provider` travels through; [selector-maintenance.md](selector-maintenance.md) is the recovery playbook when a provider's DOM changes.

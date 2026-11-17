@@ -3,10 +3,17 @@
 (function () {
   const DSC = globalThis.DSC;
   const log = (...a) => console.debug('[dsc:router]', ...a);
+
+  // Idempotent: re-injection (executeScript after Save, sendToTab recovery) must
+  // not add a second onMessage listener, which would double-send prompts.
+  const loadKey = DSC.BUILD_HASH + ':' + (chrome.runtime && chrome.runtime.id);
+  if (globalThis.__dsc_content_loaded === loadKey) return;
+  globalThis.__dsc_content_loaded = loadKey;
+
   // Provider contract lives in shared.js (search for "PROVIDER CONTRACT").
   // This router is deliberately blind to provider internals -- it looks up
   // the module by name, calls one of four methods, and returns the result.
-  // Anything provider-specific belongs in providers/<name>.js, not here.
+  // The only lookup is globalThis.DSC_PROVIDERS[name]: no storage fallback.
   //
   // msg.provider is required. There is no default provider.
 
@@ -26,7 +33,6 @@
         }
 
         // This tab must belong to the requested provider (exact hostname).
-        // Mismatch is a tab-selection fault: surface ambiguous_provider_tab.
         const hostProvider = DSC.providerForUrl(location.href);
         if (hostProvider !== providerName) {
           log('provider/tab mismatch', providerName, location.hostname);
