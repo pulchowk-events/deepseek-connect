@@ -19,6 +19,8 @@
     #msg { white-space: pre-wrap; margin-top: 10px; font-size: 13px; } #msg.bad { color: #b91c1c; }
     #results { white-space: pre-wrap; font: 12px ui-monospace, monospace; margin-top: 8px; }
     .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+    .pick { margin-top: 4px; }
+    #pick-choose { margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -42,11 +44,11 @@
       <label for="f-name">name (file stem, a-z 0-9 _ -)</label><input type="text" id="f-name">
       <label for="f-label">label</label><input type="text" id="f-label">
       <label for="f-domains">domains (hostnames, one per line)</label><textarea id="f-domains"></textarea>
-      <label for="f-input">selectors.input (one per line, first match wins)</label><textarea id="f-input"></textarea>
-      <label for="f-send">selectors.send</label><textarea id="f-send"></textarea>
-      <label for="f-stop">selectors.stop (optional, recommended)</label><textarea id="f-stop"></textarea>
-      <label for="f-response">selectors.response</label><textarea id="f-response"></textarea>
-      <label for="f-code">selectors.code (optional, default: pre code / pre)</label><textarea id="f-code"></textarea>
+      <label for="f-input">selectors.input (one per line, first match wins)</label><textarea id="f-input"></textarea><button type="button" class="pick" data-pick-field="input">Pick</button>
+      <label for="f-send">selectors.send</label><textarea id="f-send"></textarea><button type="button" class="pick" data-pick-field="send">Pick</button>
+      <label for="f-stop">selectors.stop (optional, recommended; to Pick, start a long reply first and click Pick while it generates)</label><textarea id="f-stop"></textarea><button type="button" class="pick" data-pick-field="stop">Pick</button>
+      <label for="f-response">selectors.response (to Pick, scroll an assistant reply into view, click inside it, then Up/Down to select the whole bubble)</label><textarea id="f-response"></textarea><button type="button" class="pick" data-pick-field="response">Pick</button>
+      <label for="f-code">selectors.code (optional, default: pre code / pre; to Pick, click the code block)</label><textarea id="f-code"></textarea><button type="button" class="pick" data-pick-field="code">Pick</button>
       <label for="f-dismiss">dismiss (optional, click-if-present selectors)</label><textarea id="f-dismiss"></textarea>
     </div>
     <div>
@@ -69,6 +71,7 @@
     <button id="test">Test selectors</button>
     <button id="clear">New / clear</button>
   </div>
+  <div id="pick-choose" hidden><select id="pick-tab"></select> <button type="button" id="pick-go">Pick in this tab</button></div>
   <div id="msg"></div>
   <div id="results"></div>
   <script src="shared.js"></script>

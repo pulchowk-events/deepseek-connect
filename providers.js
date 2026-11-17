@@ -245,6 +245,90 @@ async function testSelectors() {
   setMsg('Selector counts above (0 = no match; for stop, 0 is expected while idle).');
 }
 
+// ---- selector picker --------------------------------------------------------
+// Pick button -> inject picker.js into the provider tab -> picker.js reports back
+// with a dsc_picker_result message. Main frame only (see the TODO in picker.js).
+const PICK_FIELDS = ['input', 'send', 'stop', 'response', 'code'];
+let currentPick = null; // { id, tabId }
+let pendingField = null;
+
+async function runPick(field, tabId) {
+  if (currentPick && currentPick.tabId !== tabId) {
+    await chrome.scripting.executeScript({
+      target: { tabId: currentPick.tabId },
+      func: () => { if (globalThis.__dsc_picker_cancel) globalThis.__dsc_picker_cancel(); },
+    }).catch(() => {});
+  }
+  const id = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now() + Math.random());
+  currentPick = { id, tabId };
+  try {
+    const target = await chrome.tabs.get(tabId);
+    await chrome.windows.update(target.windowId, { focused: true }).catch(() => {});
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [id, field],
+      func: (pid, f) => { globalThis.__dsc_pick = { id: pid, field: f }; },
+    });
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['picker.js'] });
+  } catch (e) {
+    currentPick = null;
+    setMsg('Pick failed: ' + e.message, true);
+    return;
+  }
+  setMsg('Picking "' + field + '": click the element in the target tab (Up/Down = parent/child, Enter = confirm, Esc = cancel).');
+}
+
+async function startPick(field) {
+  const domains = lines('f-domains').map((d) => d.toLowerCase());
+  if (domains.length === 0 || domains.some((d) => !DSC.HOST_RE.test(d))) {
+    setMsg('Enter valid domains first (plain hostnames, one per line).', true);
+    return;
+  }
+  const origins = domains.map((d) => 'https://' + d + '/*');
+  let ok = false;
+  try { ok = await chrome.permissions.contains({ origins }); } catch (_) { ok = false; }
+  if (!ok) {
+    try { ok = await chrome.permissions.request({ origins }); } catch (_) { ok = false; }
+  }
+  if (!ok) { setMsg('Host permission for ' + domains.join(', ') + ' was not granted.', true); return; }
+  const tabs = await chrome.tabs.query({ url: origins });
+  if (tabs.length === 0) { setMsg('open a chat tab on ' + domains[0] + ' first', true); return; }
+  if (tabs.length === 1) { $('pick-choose').hidden = true; await runPick(field, tabs[0].id); return; }
+  pendingField = field;
+  const sel = $('pick-tab'); sel.textContent = '';
+  for (const t of tabs) sel.append(Object.assign(el('option', '#' + t.id + ' ' + (t.title || t.url).slice(0, 60)), { value: String(t.id) }));
+  $('pick-choose').hidden = false;
+  setMsg('Several matching tabs: choose one, then click "Pick in this tab".');
+}
+
+for (const b of document.querySelectorAll('[data-pick-field]')) {
+  b.addEventListener('click', () => startPick(b.dataset.pickField));
+}
+$('pick-go').addEventListener('click', async () => {
+  if (!pendingField) return;
+  const f = pendingField; pendingField = null;
+  $('pick-choose').hidden = true;
+  await runPick(f, Number($('pick-tab').value));
+});
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'dsc_picker_result') return;
+  if (!currentPick || msg.pickId !== currentPick.id || !PICK_FIELDS.includes(msg.field)) return;
+  currentPick = null;
+  chrome.tabs.getCurrent().then((me) => {
+    if (!me) return;
+    chrome.windows.update(me.windowId, { focused: true }).catch(() => {});
+    chrome.tabs.update(me.id, { active: true }).catch(() => {});
+  }).catch(() => {});
+  const list = Array.isArray(msg.candidates) ? msg.candidates : null;
+  if (!list) { setMsg('Pick cancelled.'); return; }
+  if (list.length === 0) { setMsg('No stable selector found for that element. Try Up/Down to pick a different level.', true); return; }
+  $('f-' + msg.field).value = list.map((c) => c.selector).join('\n');
+  setMsg('Picked ' + list.length + ' candidate(s) for ' + msg.field + ' (match count in the tab):\n' +
+    list.map((c) => c.count + 'x  ' + c.selector).join('\n') + '\nReview, then Save.');
+});
+
 $('f-extraction').addEventListener('change', () => { $('delim-box').hidden = $('f-extraction').value !== 'delimiter'; });
 $('save').addEventListener('click', () => saveDefinition(readForm(), !!editing));
 $('test').addEventListener('click', testSelectors);
