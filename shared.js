@@ -12,7 +12,7 @@
   const DSC = {
     VERSION: '0.2.0',
 
-    BUILD_HASH: 'cfg-providers-20261117a',
+    BUILD_HASH: 'cfg-providers-20261117d',
 
     STORAGE: {
       TOKEN: 'dsc_token',
@@ -424,7 +424,7 @@
       const sentAt = lastSendAt;
       T('cfg_sent', { ms: sentAt - startedAt });
 
-      // New response elements: first selector whose match count grew.
+      // Unfiltered: first selector whose count grew. Used only as send evidence.
       function newResponseEls() {
         for (const s of S.response) {
           let cur = [];
@@ -432,6 +432,28 @@
           if (cur.length > (before[s] || 0)) return cur;
         }
         return [];
+      }
+      const textOf = (el) => ((el.innerText || el.textContent) || '').trim();
+      function candidateEls() {
+        for (const s of S.response) {
+          let cur = [];
+          try { cur = Array.from(document.querySelectorAll(s)); } catch (_) { cur = []; }
+          if (cur.length <= (before[s] || 0)) continue;
+          const live = cur.filter((el) => { const t = textOf(el); return t !== '' && !isEcho(t); });
+          if (live.length) return { sel: s, els: live };
+        }
+        return null;
+      }
+      function diag(els) {
+        const last = els && els.length ? els[els.length - 1] : null;
+        const counts = {};
+        for (const s of S.response) counts[s] = { before: before[s] || 0, now: countOf(s) };
+        return {
+          rawPreview: last ? String(last.outerHTML || '').slice(0, 200) : null,
+          lastTag: last ? last.tagName.toLowerCase() : null,
+          lastClass: last ? String(last.className || '').slice(0, 120) : null,
+          counts,
+        };
       }
       const evidence = await waitFor(() => {
         const cur = findInput();
@@ -453,6 +475,7 @@
       let completedBy = null; let sawMsg = false; let text = '';
       const deadline = sentAt + def.timeouts.responseMs;
       let lastLog = 0;
+      let emptyPolls = 0;
 
       while (Date.now() < deadline) {
         await sleep(500);
@@ -460,9 +483,29 @@
         if (stop) seenStop = true;
         noStopPolls = stop ? 0 : noStopPolls + 1;
 
-        const els = newResponseEls();
-        if (els.length === 0) continue;
-        if (!sawMsg) { sawMsg = true; streamUrl = location.href; T('cfg_first', { msgs: els.length }); }
+        const cand = candidateEls();
+        if (!cand) {
+          const grown = newResponseEls();
+          const over = (seenStop && noStopPolls >= 2) || (!seenStop && Date.now() - sentAt >= 15000);
+          if (grown.length > 0 && over) {
+            emptyPolls += 1;
+            if (emptyPolls >= 3) {
+              T('cfg_empty', { emptyPolls, seenStop, matched: grown.length });
+              return fail(E.DOM_DRIFT, 'response_element_empty', { details: diag(grown) });
+            }
+          } else emptyPolls = 0;
+          if (Date.now() - lastLog > 3000) { lastLog = Date.now(); T('cfg_stream', { len: 0, stop, seenStop, grown: grown.length }); }
+          continue;
+        }
+        emptyPolls = 0;
+        const els = cand.els;
+        if (!sawMsg) {
+          sawMsg = true; streamUrl = location.href; T('cfg_first', { msgs: els.length, sel: cand.sel });
+          const f0 = els[els.length - 1];
+          let all = []; try { all = Array.from(document.querySelectorAll(cand.sel)); } catch (_) { all = []; }
+          const idx = all.indexOf(f0); const b0 = before[cand.sel] || 0;
+          T('cfg_first_dom', { sel: cand.sel, idx, before: b0, now: all.length, isNew: idx >= b0, tagName: f0.tagName.toLowerCase(), className: String(f0.className || '').slice(0, 120), innerText: String(f0.innerText || f0.textContent || '').slice(0, 100), innerHTML: String(f0.innerHTML || '').slice(0, 300) });
+        }
         if (location.href !== streamUrl) {
           if (!urlHop && isRootToChat(streamUrl, location.href)) { streamUrl = location.href; urlHop = true; }
           else return fail(E.DOM_DRIFT, 'user_navigated', { expected: streamUrl, actual: location.href });
@@ -492,13 +535,13 @@
         if (completedBy) break;
       }
       T('cfg_done', { completedBy, sawMsg, len: text.length });
-      if (!sawMsg) return fail(E.RESPONSE_TIMEOUT, 'no_new_message');
+      if (!sawMsg) return fail(E.RESPONSE_TIMEOUT, 'no_new_message', { details: diag(newResponseEls()) });
       if (!completedBy) return fail(E.RESPONSE_TIMEOUT, 'completion_timeout');
 
       // EXTRACT
-      const finalEls = newResponseEls();
-      const lastEl = finalEls.length ? finalEls[finalEls.length - 1] : null;
-      const raw = lastEl ? ((lastEl.innerText || lastEl.textContent) || '').trim() : text;
+      const fin = candidateEls();
+      const lastEl = fin ? fin.els[fin.els.length - 1] : null;
+      const raw = lastEl ? textOf(lastEl) : text;
       if (!raw || isEcho(raw)) return fail(E.RESPONSE_TIMEOUT, 'empty_response');
       if (raw.length < 300 && /too many requests|rate limit/i.test(raw)) {
         return fail(E.RATE_LIMITED, 'rate_limited', { retryAfter: 30000 });
@@ -520,6 +563,8 @@
           content = (verdictLine ? verdictLine + '\n' : '') + '```js\n' + code + '\n```';
         } else if (verdictLine) {
           content = verdictLine;
+        } else if (raw.length < 500) {
+          content = raw;
         } else {
           return fail(E.INVALID_RESPONSE_FORMAT, 'no_code_block', { rawPreview: raw.slice(0, 200) });
         }
