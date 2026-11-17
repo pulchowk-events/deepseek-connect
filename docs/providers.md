@@ -13,7 +13,7 @@
 > files added after load on some setups).
 >
 > Schema (`schema: 1`): `name`, `label`, `domains` (plain hostnames), `selectors.{input,send,response}`
-> (arrays, first match wins), optional `selectors.{stop,code}`, `dismiss`, `timeouts.{sendMs,responseMs}`
+> (arrays, first match wins), optional `selectors.{stop,code}`, `dismiss`, `exclude`, `timeouts.{sendMs,responseMs}`
 > (defaults 15000/180000), `pacingMs`, `extraction` (`rawText` | `codeBlock` | `delimiter`),
 > `delimiter.{prefix,suffix}`, `completionMode` (`whichever` | `stopGone` | `textStable` | `delimiter`),
 > `completionStableMs`. `enabled` is per-machine state in `chrome.storage.local` (`dsc_registered`),
@@ -554,3 +554,45 @@ Reference table for the two shipped providers. Useful when debugging or when wri
 | `resetChat` is a no-op | Qwen has no delete-chat UI the provider can drive reliably. Returns `{ ok: true, reason: 'qwen_reset_not_implemented' }`. |
 
 When a provider's DOM changes and the recovery playbook in [selector-maintenance.md](selector-maintenance.md) doesn't cover it, the fix is usually a new tier in the provider's own selector logic, not a change to `selectors.js` (which is DeepSeek-specific). See [selector-maintenance.md#adding-a-new-tier](selector-maintenance.md#adding-a-new-tier) for the general procedure.
+
+---
+
+## Picking selectors: rating guide
+
+The Providers page **Pick** buttons inject `picker.js` into the provider tab. Move over the page, click to lock an element, Up/Down walks to the parent/child, and a card at the top right lists up to four candidate selectors, each with a rating badge and a one-line reason.
+
+Keys: `click` locks, `1`-`4` or clicking a row chooses a candidate, `Enter` confirms, `Esc` cancels.
+
+| Rating | Meaning |
+|---|---|
+| recommended | `#id` that is not generated (React `:r..:`, radix and uuid-like ids are rejected); `[aria-label]`; a stable `data-*` that is not uuid-like or hex; a class combination with at least one named class that is not a bare Tailwind utility. |
+| might break | A single volatile `data-*` (`data-state`, `data-v-*`, `data-radix-*`); a combination made only of Tailwind utilities, such as `div.group`; a loose `[attr*=...]` match; a chain of more than 2 compound selectors (counted on top-level combinators, ignoring brackets, parentheses and quotes). |
+| will break | Any `:nth-of-type` / `:nth-child` chain; anything containing a uuid or a 6+ character hex run that includes a digit; a generated id; for `response` and `code`, any selector that also matches the input bar (see Exclude). |
+
+The worst applicable rating wins. The "also matches the input bar" check uses the lowest common ancestor of the first visible `input` and `send` matches, so fill those two fields in before picking `response` or `code`; otherwise the card says the check was skipped.
+
+**What gets written.** Picking only fills the form field; nothing is saved until you click Save. The chosen selector is written first, then the other candidates that are not rated will break. A will-break candidate is written only if you choose it and press Enter a second time at the warning.
+
+## Exclude selectors
+
+`exclude` is an optional top-level array of selectors. The runner discards any response match that is, or sits inside, a match of an exclude selector, before it applies the non-empty and echo filters. It is applied everywhere the runner reads `selectors.response` (the before snapshot, new-message detection, candidates, diagnostics), so counts and candidates always agree.
+
+Scope: whole elements are discarded. Text inside a kept bubble is not stripped, so a "Thought Process" label inside a reply stays in `raw` (`codeBlock` extraction already copes with it).
+
+Typical use: a loose response selector such as `[class*="message"]` can also match the chat input bar, which sits below every bubble, so the runner reads the input bar instead of the reply (an 18-character result such as `Connect IM` + `GLM-5.2`). Excluding `[class*="messageInputContainer"]` fixes that. Prefer a precise response selector and keep exclude as the safety net.
+
+**Test selectors** prints `[after exclude: N of M]` on each response selector and warns when N is 0 while M is not, which means an over-broad exclude is discarding every reply.
+
+## Community submission
+
+Each custom provider row has a **Submit** button. It opens a pre-filled GitHub issue on the repository (`REPO_URL` at the top of `providers.js`), with the provider's `providers/<name>.js`, the domains, and the name or handle from the "your name or GitHub handle" field. No API calls and no OAuth. The issue is public, so review it before submitting.
+
+If the encoded body would exceed about 6000 characters (GitHub rejects very long links), the button falls back in two steps: first the definition as compact JSON only, then a short body with the full file copied to your clipboard to paste between the fences.
+
+Maintainer: copy the file into `providers/<name>.js` and the definition into `seeds/<name>.json`. Note that the **Seed** button currently only knows `seeds/glm.json`; seeding other providers needs a seed index and is on the deferred list, so a merged `seeds/<name>.json` is not yet offered to other users by the UI.
+
+## Gotchas
+
+- After **Edit**, the form stays in edit mode and Save overwrites that provider. Click **New / clear** before adding a different one.
+- `stop` carries the completion logic: while it matches, the runner ignores text stability. Without a `stop` selector it can finish on thinking text.
+- Keep exactly one tab per provider hostname open; two give `multiple_work_tabs`.

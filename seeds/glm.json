@@ -7,8 +7,9 @@
     "input": ["#chat-input"],
     "send": ["button[aria-label=\"Send Message\"]:not([disabled])", "[aria-label=\"Send Message\"] button:not([disabled])"],
     "stop": ["[aria-label=\"Stop\"]", "[aria-label=\"Stop generating\"]"],
-    "response": ["[data-message-author-role=\"assistant\"]", "[class*=\"message\"]"]
+    "response": ["div.group"]
   },
+  "exclude": ["[class*=\"messageInputContainer\"]"],
   "timeouts": { "sendMs": 15000, "responseMs": 180000 },
   "pacingMs": 3000,
   "extraction": "codeBlock",

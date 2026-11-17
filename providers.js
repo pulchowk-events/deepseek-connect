@@ -4,6 +4,8 @@
 
 const DSC = globalThis.DSC;
 const $ = (id) => document.getElementById(id);
+const REPO_URL = 'https://github.com/pulchowk-events/deepseek-connect';
+const SUBMITTER_KEY = 'dsc_submitter';
 const REG_KEY = DSC.STORAGE.REGISTERED;
 const BUILTIN = ['deepseek', 'qwen'];
 let editing = null;
@@ -53,6 +55,7 @@ function readForm() {
     completionMode: $('f-mode').value,
   };
   if (lines('f-dismiss').length) def.dismiss = lines('f-dismiss');
+  if (lines('f-exclude').length) def.exclude = lines('f-exclude');
   const to = {};
   if (num('f-sendMs') !== undefined) to.sendMs = num('f-sendMs');
   if (num('f-responseMs') !== undefined) to.responseMs = num('f-responseMs');
@@ -71,6 +74,7 @@ function fillForm(d) {
   $('f-input').value = (s.input || []).join('\n'); $('f-send').value = (s.send || []).join('\n');
   $('f-stop').value = (s.stop || []).join('\n'); $('f-response').value = (s.response || []).join('\n');
   $('f-code').value = (s.code || []).join('\n'); $('f-dismiss').value = (d.dismiss || []).join('\n');
+  $('f-exclude').value = (d.exclude || []).join('\n');
   $('f-sendMs').value = t.sendMs === undefined ? '' : t.sendMs;
   $('f-responseMs').value = t.responseMs === undefined ? '' : t.responseMs;
   $('f-pacing').value = d.pacingMs === undefined ? '' : d.pacingMs;
@@ -117,6 +121,7 @@ function render() {
       r.append(cb);
       r.append(btn('Grant', () => grant(p.definition)));
       r.append(btn('Edit', () => { editing = p.name; fillForm(p.definition); window.scrollTo(0, document.body.scrollHeight); }));
+      r.append(btn('Submit', () => submitProvider(p)));
     }
     r.append(btn('Delete', () => del(p)));
     c.append(r);
@@ -204,6 +209,26 @@ async function saveDefinition(def, isEdit) {
   return true;
 }
 
+async function submitProvider(p) {
+  const submitter = $('f-submitter').value.trim();
+  if (submitter) await chrome.storage.local.set({ [SUBMITTER_KEY]: submitter });
+  const v = DSC.validateDefinition(p.definition);
+  if (!v.ok) { setMsg('Cannot submit: ' + v.errors.join('\n'), true); return; }
+  const out = globalThis.DSC_SUBMIT.buildIssue({
+    repoUrl: REPO_URL, name: v.value.name, label: v.value.label, domains: v.value.domains,
+    source: renderSource(v.value), definition: v.value, submitter,
+  });
+  if (out.clipboard) {
+    try { await navigator.clipboard.writeText(out.clipboard); }
+    catch (_) { setMsg('Too long for a link and the clipboard copy failed. Copy providers/' + v.value.name + '.js by hand into a new issue at ' + REPO_URL + '/issues/new', true); return; }
+  }
+  window.open(out.url, '_blank', 'noopener');
+  const how = out.tier === 1 ? 'with the full providers/' + v.value.name + '.js'
+    : out.tier === 2 ? 'with the definition as compact JSON (the file was too long for a link)'
+    : 'EMPTY: the full file is on your clipboard, paste it between the fences in the issue body';
+  setMsg('Opened a pre-filled GitHub issue ' + how + '. It is public: review it before submitting.');
+}
+
 async function del(p) {
   if (!confirm('Delete provider "' + p.name + '" (removes providers/' + p.name + '.js)?')) return;
   try {
@@ -222,17 +247,26 @@ async function testSelectors() {
   const origins = v.value.domains.map((d) => 'https://' + d + '/*');
   const tabs = await chrome.tabs.query({ url: origins });
   if (tabs.length === 0) { setMsg('No open tab on ' + v.value.domains.join(', '), true); return; }
-  const map = Object.assign({}, v.value.selectors, { dismiss: v.value.dismiss || [] });
+  const map = Object.assign({}, v.value.selectors, { dismiss: v.value.dismiss || [], exclude: v.value.exclude || [] });
   let out = '';
   for (const t of tabs) {
     try {
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: t.id },
-        args: [map],
-        func: (m) => {
+        args: [map, v.value.exclude || []],
+        func: (m, ex) => {
           const o = {};
           for (const [k, sels] of Object.entries(m)) {
             o[k] = sels.map((s) => { try { return [s, document.querySelectorAll(s).length]; } catch (_) { return [s, 'invalid']; } });
+            if (k === 'response' && ex.length) {
+              o[k] = sels.map((s) => {
+                try {
+                  const all = Array.from(document.querySelectorAll(s));
+                  const kept = all.filter((el) => !ex.some((x) => { try { return !!el.closest(x); } catch (_) { return false; } }));
+                  return [s + '   [after exclude: ' + kept.length + ' of ' + all.length + ']' + (kept.length === 0 && all.length > 0 ? ' WARNING: exclude discards every match' : ''), all.length];
+                } catch (_) { return [s, 'invalid']; }
+              });
+            }
           }
           return o;
         },
@@ -248,7 +282,7 @@ async function testSelectors() {
 // ---- selector picker --------------------------------------------------------
 // Pick button -> inject picker.js into the provider tab -> picker.js reports back
 // with a dsc_picker_result message. Main frame only (see the TODO in picker.js).
-const PICK_FIELDS = ['input', 'send', 'stop', 'response', 'code'];
+const PICK_FIELDS = ['input', 'send', 'stop', 'response', 'code', 'exclude'];
 let currentPick = null; // { id, tabId }
 let pendingField = null;
 
@@ -267,8 +301,8 @@ async function runPick(field, tabId) {
     await chrome.tabs.update(tabId, { active: true });
     await chrome.scripting.executeScript({
       target: { tabId },
-      args: [id, field],
-      func: (pid, f) => { globalThis.__dsc_pick = { id: pid, field: f }; },
+      args: [id, field, lines('f-input'), lines('f-send')],
+      func: (pid, f, inp, snd) => { globalThis.__dsc_pick = { id: pid, field: f, input: inp, send: snd }; },
     });
     await chrome.scripting.executeScript({ target: { tabId }, files: ['picker.js'] });
   } catch (e) {
@@ -324,9 +358,13 @@ chrome.runtime.onMessage.addListener((msg) => {
   const list = Array.isArray(msg.candidates) ? msg.candidates : null;
   if (!list) { setMsg('Pick cancelled.'); return; }
   if (list.length === 0) { setMsg('No stable selector found for that element. Try Up/Down to pick a different level.', true); return; }
-  $('f-' + msg.field).value = list.map((c) => c.selector).join('\n');
-  setMsg('Picked ' + list.length + ' candidate(s) for ' + msg.field + ' (match count in the tab):\n' +
-    list.map((c) => c.count + 'x  ' + c.selector).join('\n') + '\nReview, then Save.');
+  const chosen = list.find((c) => c.selector === msg.chosen) || null;
+  // Only the operator's explicit choice may be a will-break selector; other will-break candidates are never written.
+  const written = (chosen ? [chosen] : []).concat(list.filter((c) => c !== chosen && c.rating !== 'will-break'));
+  if (written.length === 0) { setMsg('Nothing written: no confirmed selector.', true); return; }
+  $('f-' + msg.field).value = written.map((c) => c.selector).join('\n');
+  setMsg('Wrote ' + written.length + ' selector(s) for ' + msg.field + ' (chosen first; will-break candidates you did not confirm are never written):\n' +
+    written.map((c) => c.count + 'x  [' + c.rating + ']  ' + c.selector + '  - ' + c.reason).join('\n') + '\nReview, then Save.');
 });
 
 $('f-extraction').addEventListener('change', () => { $('delim-box').hidden = $('f-extraction').value !== 'delimiter'; });
@@ -343,5 +381,6 @@ $('seed').addEventListener('click', async () => {
 });
 chrome.storage.onChanged.addListener((c, a) => { if (a === 'local' && c[REG_KEY]) refresh(); });
 
+chrome.storage.local.get(SUBMITTER_KEY).then((s) => { if (s[SUBMITTER_KEY]) $('f-submitter').value = s[SUBMITTER_KEY]; });
 fillForm();
 refresh();
