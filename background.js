@@ -25,6 +25,28 @@ const state = {
 let running = false;
 let loopActive = false;
 
+// ---- config providers: dynamic host hydration --------------------------------
+// The SW restarts often; dsc_registered is the persisted copy of what the last
+// reconcile found on disk. Awaited before the first register()/resolveWorkTab().
+const REG_KEY = DSC.STORAGE.REGISTERED;
+const BUILTIN_PROVIDERS = ['deepseek', 'qwen'];
+let hydrated = null;
+async function hydrateDynamic() {
+  const s = await chrome.storage.local.get(REG_KEY);
+  DSC.setDynamicHosts(Array.isArray(s[REG_KEY]) ? s[REG_KEY] : []);
+}
+function ensureHydrated() {
+  if (!hydrated) hydrated = hydrateDynamic().catch(() => { hydrated = null; });
+  return hydrated;
+}
+
+function injectFilesFor(provider) {
+  if (provider && !BUILTIN_PROVIDERS.includes(provider) && DSC.isRoutable(provider)) {
+    return ['shared.js', 'providers/' + provider + '.js', 'content.js'];
+  }
+  return ['shared.js', 'selectors.js', 'providers/deepseek.js', 'providers/qwen.js', 'content.js'];
+}
+
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function loadConfig() {
@@ -80,7 +102,8 @@ async function apiFetch(cfg, path, init) {
 // Resolve the single tab for `provider`. Returns { tab } or
 // { error, reason, details } -- never a fallback to another provider.
 async function resolveWorkTab(targetTabId, provider) {
-  if (!provider || !DSC.ROUTABLE_PROVIDERS.includes(provider)) {
+  await ensureHydrated();
+  if (!provider || !DSC.isRoutable(provider)) {
     return {
       error: DSC.ERR.BAD_REQUEST,
       reason: 'provider_required',
@@ -143,7 +166,7 @@ async function sendToTab(tabId, msg) {
     // lost after SW restart). Re-inject and retry once.
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ['shared.js', 'selectors.js', 'providers/deepseek.js', 'providers/qwen.js', 'content.js'],
+      files: injectFilesFor(msg && msg.provider),
     });
     return await sendOnce(tabId, msg);
   }
@@ -187,6 +210,7 @@ function broadcast() {
 }
 
 async function register(cfg) {
+  await ensureHydrated();
   const all = await chrome.tabs.query({});
   const tabs = all.filter((t) => DSC.providerForUrl(t.url) !== null);
   const tabList = tabs.map((t) => ({
@@ -511,6 +535,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === 'reconcileProviders') {
+    reconcileProviders().then((r) => sendResponse(r || { ok: true }), (e) => sendResponse({ ok: false, reason: e.message }));
+    return true;
+  }
   if (msg && msg.type === 'getState') {
     sendResponse({ state });
     return false;
@@ -520,4 +548,75 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return false;
 });
 
+// ---- config providers: reconcile providers/ on disk with content scripts -----
+// GET /providers is the source of truth. dsc_registered is a cache plus the
+// per-machine `enabled` flag. A storage change only re-hydrates (no reconcile),
+// so writing the rows here cannot loop.
+const DYN_PREFIX = 'dsc-provider-';
+let reconciling = null;
+
+function reconcileProviders() {
+  if (reconciling) return reconciling;
+  reconciling = (async () => {
+    const cfg = await loadConfig();
+    if (!cfg) return { ok: false, reason: 'no_config' };
+    const s = await chrome.storage.local.get(REG_KEY);
+    const prev = Array.isArray(s[REG_KEY]) ? s[REG_KEY] : [];
+    let listing;
+    try {
+      listing = await apiFetch(cfg, '/providers', { method: 'GET', timeoutMs: 8000 });
+    } catch (e) {
+      DSC.setDynamicHosts(prev); // server down: keep the cache, prune nothing
+      return { ok: false, reason: 'server_down' };
+    }
+    const enabledBefore = new Map(prev.map((r) => [r.name, r.enabled !== false]));
+    const rows = [];
+    for (const p of (listing.providers || []).filter((x) => x.kind === 'config')) {
+      const id = DYN_PREFIX + p.name;
+      if (!p.definition || !Array.isArray(p.definition.domains)) {
+        rows.push({ name: p.name, id, domains: [], enabled: false, status: 'no definition' });
+        continue;
+      }
+      const domains = p.definition.domains;
+      const enabled = enabledBefore.has(p.name) ? enabledBefore.get(p.name) : true;
+      let granted = false;
+      try { granted = await chrome.permissions.contains({ origins: domains.map((d) => 'https://' + d + '/*') }); } catch (_) { granted = false; }
+      rows.push({ name: p.name, id, domains, enabled, status: !enabled ? 'disabled' : granted ? 'registered' : 'permission needed' });
+    }
+
+    const existing = (await chrome.scripting.getRegisteredContentScripts()).filter((x) => x.id.startsWith(DYN_PREFIX));
+    const want = new Map(rows.filter((r) => r.status === 'registered').map((r) => [r.id, r]));
+    const stale = existing.filter((x) => !want.has(x.id)).map((x) => x.id);
+    if (stale.length) await chrome.scripting.unregisterContentScripts({ ids: stale }).catch(() => {});
+    for (const r of want.values()) {
+      const script = {
+        id: r.id,
+        matches: r.domains.map((d) => 'https://' + d + '/*'),
+        js: ['shared.js', 'providers/' + r.name + '.js', 'content.js'],
+        runAt: 'document_idle',
+        persistAcrossSessions: true,
+      };
+      try {
+        if (existing.some((x) => x.id === r.id)) await chrome.scripting.updateContentScripts([script]);
+        else await chrome.scripting.registerContentScripts([script]);
+      } catch (e) {
+        r.status = 'register failed: ' + e.message;
+      }
+    }
+    await chrome.storage.local.set({ [REG_KEY]: rows });
+    DSC.setDynamicHosts(rows);
+    refreshTabsSoon();
+    return { ok: true, providers: rows.length };
+  })().finally(() => { reconciling = null; });
+  return reconciling;
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes[REG_KEY]) DSC.setDynamicHosts(changes[REG_KEY].newValue || []);
+});
+chrome.runtime.onInstalled.addListener(() => { reconcileProviders().catch(() => {}); });
+chrome.runtime.onStartup.addListener(() => { reconcileProviders().catch(() => {}); });
+ensureHydrated().then(() => reconcileProviders()).catch(() => {});
+
 startLoop();
+
