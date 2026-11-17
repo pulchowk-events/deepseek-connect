@@ -267,8 +267,8 @@ async function runPick(field, tabId) {
     await chrome.tabs.update(tabId, { active: true });
     await chrome.scripting.executeScript({
       target: { tabId },
-      args: [id, field],
-      func: (pid, f) => { globalThis.__dsc_pick = { id: pid, field: f }; },
+      args: [id, field, lines('f-input'), lines('f-send')],
+      func: (pid, f, inp, snd) => { globalThis.__dsc_pick = { id: pid, field: f, input: inp, send: snd }; },
     });
     await chrome.scripting.executeScript({ target: { tabId }, files: ['picker.js'] });
   } catch (e) {
@@ -324,9 +324,13 @@ chrome.runtime.onMessage.addListener((msg) => {
   const list = Array.isArray(msg.candidates) ? msg.candidates : null;
   if (!list) { setMsg('Pick cancelled.'); return; }
   if (list.length === 0) { setMsg('No stable selector found for that element. Try Up/Down to pick a different level.', true); return; }
-  $('f-' + msg.field).value = list.map((c) => c.selector).join('\n');
-  setMsg('Picked ' + list.length + ' candidate(s) for ' + msg.field + ' (match count in the tab):\n' +
-    list.map((c) => c.count + 'x  ' + c.selector).join('\n') + '\nReview, then Save.');
+  const chosen = list.find((c) => c.selector === msg.chosen) || null;
+  // Only the operator's explicit choice may be a will-break selector; other will-break candidates are never written.
+  const written = (chosen ? [chosen] : []).concat(list.filter((c) => c !== chosen && c.rating !== 'will-break'));
+  if (written.length === 0) { setMsg('Nothing written: no confirmed selector.', true); return; }
+  $('f-' + msg.field).value = written.map((c) => c.selector).join('\n');
+  setMsg('Wrote ' + written.length + ' selector(s) for ' + msg.field + ' (chosen first; will-break candidates you did not confirm are never written):\n' +
+    written.map((c) => c.count + 'x  [' + c.rating + ']  ' + c.selector + '  - ' + c.reason).join('\n') + '\nReview, then Save.');
 });
 
 $('f-extraction').addEventListener('change', () => { $('delim-box').hidden = $('f-extraction').value !== 'delimiter'; });
