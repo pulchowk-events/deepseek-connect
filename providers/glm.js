@@ -31,7 +31,7 @@ globalThis.DSC.makeConfigProvider(/*DEF*/{
   },
   "timeouts": {
     "sendMs": 15000,
-    "responseMs": 360000
+    "responseMs": 600000
   },
   "pacingMs": 3000,
   "extraction": "codeBlock",
