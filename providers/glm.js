@@ -22,7 +22,7 @@ globalThis.DSC.makeConfigProvider(/*DEF*/{
       "button[aria-label=\"Stop\"]"
     ],
     "response": [
-      "div.group"
+      "#response-content-container"
     ],
     "code": [
       "pre code",
@@ -31,7 +31,7 @@ globalThis.DSC.makeConfigProvider(/*DEF*/{
   },
   "timeouts": {
     "sendMs": 15000,
-    "responseMs": 180000
+    "responseMs": 360000
   },
   "pacingMs": 3000,
   "extraction": "codeBlock",

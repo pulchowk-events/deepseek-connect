@@ -2,15 +2,32 @@
   "schema": 1,
   "name": "glm",
   "label": "GLM (Z.ai)",
-  "domains": ["chat.z.ai"],
+  "domains": [
+    "chat.z.ai"
+  ],
   "selectors": {
-    "input": ["#chat-input"],
-    "send": ["button[aria-label=\"Send Message\"]:not([disabled])", "[aria-label=\"Send Message\"] button:not([disabled])"],
-    "stop": ["[aria-label=\"Stop\"]", "[aria-label=\"Stop generating\"]"],
-    "response": ["div.group"]
+    "input": [
+      "#chat-input"
+    ],
+    "send": [
+      "button[aria-label=\"Send Message\"]:not([disabled])",
+      "[aria-label=\"Send Message\"] button:not([disabled])"
+    ],
+    "stop": [
+      "[aria-label=\"Stop\"]",
+      "[aria-label=\"Stop generating\"]"
+    ],
+    "response": [
+      "div.group"
+    ]
   },
-  "exclude": ["[class*=\"messageInputContainer\"]"],
-  "timeouts": { "sendMs": 15000, "responseMs": 180000 },
+  "exclude": [
+    "[class*=\"messageInputContainer\"]"
+  ],
+  "timeouts": {
+    "sendMs": 15000,
+    "responseMs": 360000
+  },
   "pacingMs": 3000,
   "extraction": "codeBlock",
   "completionMode": "whichever",
