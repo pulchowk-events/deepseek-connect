@@ -28,6 +28,7 @@ const CODES = {
   USER_NAVIGATED: 'user_navigated',
   INVALID_RESPONSE_FORMAT: 'invalid_response_format',
   AMBIGUOUS_PROVIDER_TAB: 'ambiguous_provider_tab',
+  BOT_BLOCKED: 'bot_blocked',
 
   // ---- Server / transport ----
   EXTENSION_DISCONNECTED: 'extension_disconnected',
@@ -91,6 +92,10 @@ const META = {
   [CODES.AMBIGUOUS_PROVIDER_TAB]: {
     retryable: false, userFixable: true, http: 409,
     human: 'Expected exactly one open tab for the requested provider (exact hostname match); found none or several. Close extras or open one.',
+  },
+  [CODES.BOT_BLOCKED]: {
+    retryable: true, userFixable: true, http: 403,
+    human: 'Provider showed a bot challenge (e.g. Cloudflare Turnstile) instead of the chat. Solve it in the work tab, or retry after retryAfter ms. Raised by chatgpt only.',
   },
 
   [CODES.EXTENSION_DISCONNECTED]: {

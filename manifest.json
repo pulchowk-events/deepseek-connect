@@ -12,6 +12,7 @@
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",
+    "https://chatgpt.com/*",
     "file:///*",
     "https://chat.deepseek.com/*",
     "https://chat.qwen.ai/*",
@@ -29,6 +30,7 @@
         "https://chat.deepseek.com/*",
         "https://chat.qwen.ai/*",
         "https://tongyi.aliyun.com/*",
+        "https://chatgpt.com/*",
         "file:///*mock-deepseek.html"
       ],
       "js": [
@@ -36,6 +38,7 @@
         "selectors.js",
         "providers/deepseek.js",
         "providers/qwen.js",
+        "providers/chatgpt.js",
         "content.js"
       ],
       "run_at": "document_idle"

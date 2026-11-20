@@ -138,7 +138,7 @@ test('decision buckets match the documented counts', () => {
   }
   assert.strictEqual(buckets.A, 5, 'bucket A (retry silently)');
   assert.strictEqual(buckets.B, 1, 'bucket B (retry delayed)');
-  assert.strictEqual(buckets.C, 2, 'bucket C (retry then beep)');
+  assert.strictEqual(buckets.C, 3, 'bucket C (retry then beep)');
   assert.strictEqual(buckets.D, 9, 'bucket D (beep)');
   assert.strictEqual(buckets.E, 6, 'bucket E (skip)');
 });

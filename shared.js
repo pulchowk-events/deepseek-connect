@@ -12,7 +12,7 @@
   const DSC = {
     VERSION: '0.2.0',
 
-    BUILD_HASH: 'cfg-providers-20261117f',
+    BUILD_HASH: 'cfg-providers-20261120d',
 
     STORAGE: {
       TOKEN: 'dsc_token',
@@ -24,13 +24,14 @@
 
     // Built-in providers with a code module. Config providers are added to this
     // list at runtime by registerDynamicProvider().
-    ROUTABLE_PROVIDERS: ['deepseek', 'qwen'],
+    ROUTABLE_PROVIDERS: ['deepseek', 'qwen', 'chatgpt'],
 
     // Built-in hosts (exact hostname). Never mutated at runtime.
     PROVIDER_HOSTS: {
       deepseek: 'chat.deepseek.com',
       qwen: 'chat.qwen.ai',
       tongyi: 'tongyi.aliyun.com',
+      chatgpt: 'chatgpt.com',
     },
 
     // Origin (with trailing slash) used for navigation. Config providers are
@@ -39,6 +40,7 @@
       deepseek: 'https://chat.deepseek.com/',
       qwen: 'https://chat.qwen.ai/',
       tongyi: 'https://tongyi.aliyun.com/',
+      chatgpt: 'https://chatgpt.com/',
     },
 
     // name -> [hostnames] for config providers (providers/<name>.js).
@@ -81,8 +83,8 @@
   // Idempotent injection: a second load of the same build keeps the first DSC.
   if (globalThis.DSC && globalThis.DSC.BUILD_HASH === DSC.BUILD_HASH && globalThis.DSC.makeConfigProvider) return;
 
-  const BUILTIN_ROUTABLE = ['deepseek', 'qwen'];
-  const BUILTIN_NAMES = ['deepseek', 'qwen', 'tongyi'];
+  const BUILTIN_ROUTABLE = ['deepseek', 'qwen', 'chatgpt'];
+  const BUILTIN_NAMES = ['deepseek', 'qwen', 'tongyi', 'chatgpt'];
   const NAME_RE = /^[a-z][a-z0-9_-]{0,30}$/;
   const HOST_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
   DSC.NAME_RE = NAME_RE;

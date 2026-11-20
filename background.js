@@ -29,7 +29,7 @@ let loopActive = false;
 // The SW restarts often; dsc_registered is the persisted copy of what the last
 // reconcile found on disk. Awaited before the first register()/resolveWorkTab().
 const REG_KEY = DSC.STORAGE.REGISTERED;
-const BUILTIN_PROVIDERS = ['deepseek', 'qwen'];
+const BUILTIN_PROVIDERS = ['deepseek', 'qwen', 'chatgpt'];
 let hydrated = null;
 async function hydrateDynamic() {
   const s = await chrome.storage.local.get(REG_KEY);
@@ -44,7 +44,7 @@ function injectFilesFor(provider) {
   if (provider && !BUILTIN_PROVIDERS.includes(provider) && DSC.isRoutable(provider)) {
     return ['shared.js', 'providers/' + provider + '.js', 'content.js'];
   }
-  return ['shared.js', 'selectors.js', 'providers/deepseek.js', 'providers/qwen.js', 'content.js'];
+  return ['shared.js', 'selectors.js', 'providers/deepseek.js', 'providers/qwen.js', 'providers/chatgpt.js', 'content.js'];
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }

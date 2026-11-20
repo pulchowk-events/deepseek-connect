@@ -88,7 +88,7 @@ test('setDynamicHosts replaces the set and skips disabled rows', () => {
   DSC.setDynamicHosts([{ name: 'cc', domains: ['c.example.com'] }]);
   assert.equal(DSC.isRoutable('aa'), false);
   assert.equal(DSC.isRoutable('cc'), true);
-  assert.deepEqual(DSC.ROUTABLE_PROVIDERS.slice(0, 2), ['deepseek', 'qwen']);
+  assert.deepEqual(DSC.ROUTABLE_PROVIDERS.slice(0, 3), ['deepseek', 'qwen', 'chatgpt']);
   DSC.setDynamicHosts([]);
-  assert.deepEqual(DSC.ROUTABLE_PROVIDERS, ['deepseek', 'qwen']);
+  assert.deepEqual(DSC.ROUTABLE_PROVIDERS, ['deepseek', 'qwen', 'chatgpt']);
 });

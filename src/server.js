@@ -25,7 +25,7 @@ const DEFAULT_DELIMITERS = { start: 'START_', end: 'END_' };
 
 // Providers with a registered extension module. Mirrors shared.js
 // ROUTABLE_PROVIDERS. tongyi has a domain but no module, so it is excluded.
-const KNOWN_PROVIDERS = Object.freeze(['deepseek', 'qwen']);
+const KNOWN_PROVIDERS = Object.freeze(['deepseek', 'qwen', 'chatgpt']);
 
 function makeErr(code, reason, details) {
   const e = new Error(reason);

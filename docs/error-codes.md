@@ -1,6 +1,6 @@
 # Error codes
 
-The `DSCError` taxonomy. Twenty-three codes, every failure mode the extension or server can report, and — the part that matters for integrators — the decision rule for what to do about each one. Read this before writing a `try/catch` around any `deepseek-connect` call.
+The `DSCError` taxonomy. Twenty-four codes, every failure mode the extension or server can report, and — the part that matters for integrators — the decision rule for what to do about each one. Read this before writing a `try/catch` around any `deepseek-connect` call.
 
 Multi-provider changes the taxonomy in two ways. First, one code is new: `invalid_response_format`, raised only by Qwen. Second, several codes are now **provider-specific** — `deepthink_enable_failed` and `search_enable_failed` only apply to DeepSeek; `invalid_response_format` only applies to Qwen. A wizard that switches on `err.code` needs to know which codes can appear from which providers.
 
@@ -46,7 +46,7 @@ Every `DSCError` carries three booleans (plus an optional `retryAfter`) that ans
 
 > Milliseconds to wait before the retry, if `retryable`.
 
-Only `rate_limited` sets a non-zero value (30000ms). Every other retryable code defaults to 0 — retry immediately. The field is present on every `DSCError` as `0` when irrelevant, so a caller can unconditionally `await sleep(err.retryAfter)` and it does the right thing.
+Only `rate_limited` and `bot_blocked` set a non-zero value (30000ms). Every other retryable code defaults to 0 — retry immediately. The field is present on every `DSCError` as `0` when irrelevant, so a caller can unconditionally `await sleep(err.retryAfter)` and it does the right thing.
 
 ### HTTP status
 
@@ -95,7 +95,7 @@ The `attempts < 3` cap is a wizard-side policy, not a `DSCError` guarantee. See 
 
 ## Five decision buckets
 
-Twenty-three codes, grouped by their response. Every code falls into exactly one bucket.
+Twenty-four codes, grouped by their response. Every code falls into exactly one bucket.
 
 ### Bucket A — Retry, no beep (5 codes)
 
@@ -123,13 +123,14 @@ Twenty-three codes, grouped by their response. Every code falls into exactly one
 
 **Pivot option.** A wizard that supports multi-provider can pivot here: instead of skipping the source, retry it with `provider: 'qwen'` (if the original was DeepSeek, or vice versa). The `rate_limited` error carries the same shape regardless of which provider raised it; the wizard's pivot policy handles the provider switch. See [integration-guide.md#provider-pivot](integration-guide.md#provider-pivot).
 
-### Bucket C — Retry, then beep (2 codes)
+### Bucket C — Retry, then beep (3 codes)
 
 `retryable: true, userFixable: true`. Dual-flag — retry first, but if retries exhaust, escalate to beep. The retry handles transient cases (brief extension restart, slow stream); the beep handles the case where the transient condition has become permanent.
 
 | Code | What causes it | When to beep |
 |---|---|---|
 | `response_timeout` | No answer within the timeout window — the provider's stream stalled, the model is stuck in a long reasoning loop, or the tab is backgrounded and Chrome throttled it | After 2 retries with the same code; the third beep is the user's signal to check the tab |
+| `bot_blocked` | **chatgpt only.** A bot challenge (Cloudflare Turnstile) is showing instead of the chat page; the provider refuses to type or send while it is up | After 2 retries with the same code; the third beep is the signal to open the work tab and clear the challenge |
 | `extension_disconnected` | Extension hasn't polled `/next` in over 60s — service worker crashed, or `.env` token was changed without reloading the extension | After 2 retries with the same code; the third beep is the user's signal to reload the extension |
 
 **The beep message must be specific.** `extension_disconnected` says "reload the extension in `brave://extensions`"; `response_timeout` says "check the work tab — the provider might be stuck streaming". The reason field carries this through; beep renderers should not collapse it to the code name.
@@ -201,6 +202,8 @@ Which codes can be raised by which providers. A wizard that switches on `err.cod
 | `cancelled` | — | — | ✓ |
 | `user_skipped` | ✓ | ✓ | — |
 
+**chatgpt.** `providers/chatgpt.js` postdates the table above, which has deepseek and qwen columns only. It raises `bot_blocked` (chatgpt only), `logged_out`, `rate_limited`, `send_failed`, `input_not_found`, `response_timeout` and `user_navigated`. It raises `invalid_response_format` only with reason `extract_failed` (empty reply). It never raises the DeepSeek toggle codes.
+
 **Two reasons that appear on `input_not_found` but aren't codes.** These deserve special attention because they masquerade as one code but mean different things.
 
 **`no_work_tab`** — raised by `background.js#handleNext` when `getWorkTab(provider)` returns `null`. Meaning: no tab with the requested provider is open. For `provider: 'qwen'`, this means "the user hasn't opened a Qwen tab." That's user-fixable (`input_not_found` is correctly bucket D). For `provider: 'tongyi'`, this could also mean the provider is registered in `PROVIDER_DOMAINS` but no one has opened a tongyi tab — same user-fixable. **The `reason` field carries `no_work_tab`; the code is `input_not_found`.** A wizard that wants to distinguish "no tab open for this provider" from "tab open but input not found" can check `err.reason === 'no_work_tab'`.
@@ -223,6 +226,7 @@ Sorted by bucket, then alphabetically within bucket. Use this for reference look
 | **A** | `invalid_response_format` | ✓ | 0 | ✗ | 502 | **qwen** | Delimiters missing in model reply |
 | **A** | `send_failed` | ✓ | 0 | ✗ | 502 | both | Send click didn't register |
 | **B** | `rate_limited` | ✓ | 30000 | ✗ | 429 | both | Provider rate limit hit |
+| **C** | `bot_blocked` | ✓ | 30000 | ✓ | 403 | **chatgpt** | Bot challenge showing instead of the chat |
 | **C** | `extension_disconnected` | ✓ | 0 | ✓ | 409 | server | Extension not connected |
 | **C** | `response_timeout` | ✓ | 0 | ✓ | 504 | both | No answer within timeout |
 | **D** | `ambiguous_provider_tab` | ✗ | 0 | ✓ | 409 | both | Zero or several tabs match the provider |
@@ -241,7 +245,7 @@ Sorted by bucket, then alphabetically within bucket. Use this for reference look
 | **E** | `unknown_request` | ✗ | 0 | ✗ | 404 | server | Unknown requestId |
 | **E** | `user_skipped` | ✗ | 0 | ✓ | 499 | both | Skipped by user via popup |
 
-**Sanity check:** 5 (A) + 1 (B) + 2 (C) + 9 (D) + 6 (E) = 23. Matches `Object.keys(CODES).length` in `src/errors.js` and the bucket-count assertion in `tests/errors.test.js`.
+**Sanity check:** 5 (A) + 1 (B) + 3 (C) + 9 (D) + 6 (E) = 24. Matches `Object.keys(CODES).length` in `src/errors.js` and the bucket-count assertion in `tests/errors.test.js`.
 
 ---
 
@@ -330,6 +334,20 @@ The one-liner in the full table is what fits on a log line. This section is what
 **Details:** `retryAfter` is the primary payload. The wizard's retry loop should `await sleep(err.retryAfter)` before resending.
 
 ### Bucket C
+
+#### `bot_blocked`
+
+**Raises in:** `providers/chatgpt.js`, in `ensureChat` and in `sendPrompt` (re-checked on every poll while waiting for the reply), when no chat input is visible and a bot challenge is detected: a `challenges.cloudflare.com` iframe, `#challenge-form`, `div.cf-turnstile`, a `Just a moment` page title, or `verify you are human` text.
+
+**Means:** the provider served a bot-check interstitial instead of the chat page. The provider stops without typing or sending anything. There is no bypass: the extension never tries to solve the challenge.
+
+**Retry:** yes, up to 2 attempts, after `retryAfter` (30000ms, set by the provider). The challenge sometimes clears on its own, or the operator clears it in the meantime.
+
+**Beep:** yes, after the second failed retry. Message: `Bot challenge showing in the work tab; solve it there and confirm you see the chat input`.
+
+**Details:** `reason` is `turnstile_challenge`; `trace` carries the phases up to the block. As of this commit the `/chat` error body in `src/server.js` does not forward `retryAfter`, so a caller sees `0` and should apply its own delay.
+
+**Provider-specific.** Only `chatgpt` raises it.
 
 #### `extension_disconnected`
 
