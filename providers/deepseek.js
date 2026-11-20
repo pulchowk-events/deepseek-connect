@@ -566,7 +566,7 @@
     if (!raw) return fail(DSC.ERR.RESPONSE_TIMEOUT, 'empty_response');
 
     if (/too many requests|rate limit/i.test(raw)) {
-      return fail(DSC.ERR.RATE_LIMITED, 'rate_limited', { retryAfter: 30 });
+      return fail(DSC.ERR.RATE_LIMITED, 'rate_limited', { retryAfter: 30000 });
     }
 
     // Phase 7: extract
