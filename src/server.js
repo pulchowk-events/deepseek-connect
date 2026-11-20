@@ -17,7 +17,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-const { httpStatusFor } = require('./errors.js');
+const { META, httpStatusFor } = require('./errors.js');
 
 const DEFAULT_PORT = 7331;
 const LONG_POLL_MS = 30000;
@@ -64,10 +64,15 @@ function readBuildHash() {
 }
 
 function errorBody(e, fallbackCode) {
+  const code = e.code || fallbackCode || e.message;
+  const meta = META[code];
   return {
     ok: false,
-    error: e.code || fallbackCode || e.message,
+    error: code,
     reason: e.reason || e.message,
+    retryable: e.retryable ?? (meta ? meta.retryable : false),
+    retryAfter: e.retryAfter || 0,
+    userFixable: e.userFixable ?? (meta ? meta.userFixable : false),
     details: e.details,
     trace: e.trace,
   };
@@ -458,9 +463,10 @@ function createServer(opts) {
         const prompt = messages.map((m) => m.content || '').join('\n\n');
         const chatName = body.chat || ('api-' + crypto.randomUUID().slice(0, 8));
         const targetTabId = body.targetTabId;
+        const targetUrl = body.url;
         const startedAt = Date.now();
         try {
-          const result = await enqueue({ prompt, chatName, targetTabId, provider: body.provider });
+          const result = await enqueue({ prompt, chatName, targetTabId, targetUrl, provider: body.provider });
           return writeJson(res, 200, {
             content: result.content,
             chat: chatName,

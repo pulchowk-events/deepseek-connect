@@ -5,6 +5,11 @@ const assert = require('node:assert/strict');
 
 require('../shared.js');
 const DSC = globalThis.DSC;
+const { CODES } = require('../src/errors.js');
+
+test('shared.js exposes the registered user_navigated error code', () => {
+  assert.equal(DSC.ERR.USER_NAVIGATED, CODES.USER_NAVIGATED);
+});
 
 const base = () => ({
   schema: 1, name: 'myprov', label: 'My Prov', domains: ['Chat.Example.com'],

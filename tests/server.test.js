@@ -113,6 +113,37 @@ test('/reply error rejects the enqueue promise', async () => {
   } finally { await server.close(); }
 });
 
+test('/chat preserves retry metadata from provider errors', async () => {
+  const { server, baseUrl } = await startServer();
+  try {
+    const responsePromise = postJson(baseUrl, '/chat', {
+      messages: [{ role: 'user', content: 'hello' }],
+      chat: 'rate-limited-chat',
+      provider: 'deepseek',
+      url: 'https://chat.deepseek.com/a/chat/s/saved-chat',
+    });
+    const next = await fetch(baseUrl + '/next', { headers: authHeaders() });
+    const work = await next.json();
+    assert.equal(work.targetUrl, 'https://chat.deepseek.com/a/chat/s/saved-chat');
+
+    await postJson(baseUrl, '/reply', {
+      requestId: work.requestId,
+      status: 'error',
+      error: 'rate_limited',
+      reason: 'rate_limited',
+      retryAfter: 30000,
+    });
+
+    const response = await responsePromise;
+    assert.equal(response.status, 429);
+    const body = await response.json();
+    assert.equal(body.error, 'rate_limited');
+    assert.equal(body.retryable, true);
+    assert.equal(body.retryAfter, 30000);
+    assert.equal(body.userFixable, false);
+  } finally { await server.close(); }
+});
+
 test('/reply with unknown requestId returns 404', async () => {
   const { server, baseUrl } = await startServer();
   try {

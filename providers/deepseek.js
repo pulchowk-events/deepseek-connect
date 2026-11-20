@@ -522,7 +522,7 @@
       }
       if (!sawNew) continue;
       if (streamUrl && location.href !== streamUrl) {
-        return fail(DSC.ERR.DOM_DRIFT, 'user_navigated', {
+        return fail(DSC.ERR.USER_NAVIGATED, 'user_navigated', {
           expected: streamUrl, actual: location.href,
         });
       }
@@ -566,7 +566,7 @@
     if (!raw) return fail(DSC.ERR.RESPONSE_TIMEOUT, 'empty_response');
 
     if (/too many requests|rate limit/i.test(raw)) {
-      return fail(DSC.ERR.RATE_LIMITED, 'rate_limited', { retryAfter: 30 });
+      return fail(DSC.ERR.RATE_LIMITED, 'rate_limited', { retryAfter: 30000 });
     }
 
     // Phase 7: extract

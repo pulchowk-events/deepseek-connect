@@ -12,7 +12,7 @@
   const DSC = {
     VERSION: '0.2.0',
 
-    BUILD_HASH: 'cfg-providers-20261120e',
+    BUILD_HASH: 'cfg-providers-retry-after-20261120f',
 
     STORAGE: {
       TOKEN: 'dsc_token',
@@ -69,6 +69,7 @@
       LOGGED_OUT: 'logged_out',
       RESPONSE_TIMEOUT: 'response_timeout',
       SEND_FAILED: 'send_failed',
+      USER_NAVIGATED: 'user_navigated',
       INVALID_RESPONSE_FORMAT: 'invalid_response_format',
       AMBIGUOUS_PROVIDER_TAB: 'ambiguous_provider_tab',
       VERSION_MISMATCH: 'version_mismatch',
