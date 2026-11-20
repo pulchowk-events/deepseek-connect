@@ -522,7 +522,7 @@
       }
       if (!sawNew) continue;
       if (streamUrl && location.href !== streamUrl) {
-        return fail(DSC.ERR.DOM_DRIFT, 'user_navigated', {
+        return fail(DSC.ERR.USER_NAVIGATED, 'user_navigated', {
           expected: streamUrl, actual: location.href,
         });
       }
