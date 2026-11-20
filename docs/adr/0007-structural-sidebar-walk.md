@@ -60,7 +60,7 @@ The "New chat" button's text is the only required anchor. If the button's text c
 
 ## References
 
-- [architecture.md#7-structural-sidebar-walk-over-class-names](../../architecture.md#7-structural-sidebar-walk-over-class-names)
-- [selector-maintenance.md#the-structural-sidebar-walk](../../selector-maintenance.md#the-structural-sidebar-walk)
-- [protocol.md#post-open](../../protocol.md#post-open) — `debug` field
+- [architecture.md#7-structural-sidebar-walk-as-fallback](../architecture.md#7-structural-sidebar-walk-as-fallback)
+- [selector-maintenance.md#the-structural-sidebar-walk](../selector-maintenance.md#the-structural-sidebar-walk)
+- [protocol.md#post-open](../protocol.md#post-open) — `debug` field
 - `content.js` `findSidebarContainer`, `listChatLeafItems`, `clickableAncestor`, `findChatInSidebar`

@@ -59,7 +59,7 @@ The extension is a client of the local server; the server is a client of the ext
 
 ## References
 
-- [architecture.md#2-real-chrome-over-puppeteer](../../architecture.md#2-real-chrome-over-puppeteer)
+- [architecture.md#2-real-chrome-over-puppeteer](../architecture.md#2-real-chrome-over-puppeteer)
 - `manifest.json` — MV3, content script match on `chat.deepseek.com`
 - `background.js` — `chrome.tabs` interaction, sticky tab
 - `README.md#why-it-exists` — the problem statement this addresses

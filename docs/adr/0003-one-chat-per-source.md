@@ -4,7 +4,7 @@
 - **Date:** 2026-11-16
 - **Deciders:** maintainer
 - **Supersedes:** —
-- **Amended by:** [0008 — multi-provider plugin architecture](0008-multi-provider-plugin-architecture.md)
+- **Amended by:** [0008 — multi-provider plugin architecture](0008-multi-provider-plugin.architecture.md)
 - **Superseded by:** —
 
 ## Context
@@ -60,9 +60,9 @@ DeepSeek auto-names every chat from its first message. The batch prompt embeds t
 
 ## References
 
-- [architecture.md#3-one-chat-per-source](../../architecture.md#3-one-chat-per-source)
-- [protocol.md#post-open](../../protocol.md#post-open)
-- [selector-maintenance.md#the-structural-sidebar-walk](../../selector-maintenance.md#the-structural-sidebar-walk)
+- [architecture.md#3-one-chat-per-source-url-primary-identity](../architecture.md#3-one-chat-per-source-url-primary-identity)
+- [protocol.md#post-open](../protocol.md#post-open)
+- [selector-maintenance.md#the-structural-sidebar-walk](../selector-maintenance.md#the-structural-sidebar-walk)
 - `content.js` `ensureChat`, `findChatInSidebar`
 - `background.js` `handleNext` (the `needNewChat` branch)
 

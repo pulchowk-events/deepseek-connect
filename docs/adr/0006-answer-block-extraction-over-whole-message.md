@@ -32,7 +32,7 @@ The stream loop's `answerStarted` flag gates on `.ds-assistant-message-main-cont
 
 ### Negative
 
-- **Selector dependency.** The extraction depends on `.ds-assistant-message-main-content` and `[class*="think"]` — both are semantic-ish class names that DeepSeek could rename. If they do, extraction falls back to whole-message and the reasoning-as-answer bug returns. This is tracked in [selector-maintenance.md](../../selector-maintenance.md).
+- **Selector dependency.** The extraction depends on `.ds-assistant-message-main-content` and `[class*="think"]` — both are semantic-ish class names that DeepSeek could rename. If they do, extraction falls back to whole-message and the reasoning-as-answer bug returns. This is tracked in [selector-maintenance.md](../selector-maintenance.md).
 - **Mock page divergence.** The mock page (`tests/mock-deepseek.html`) doesn't have a `.ds-assistant-message-main-content` element — its assistant message is just a `.assistant` div with a code block. The fallback path handles this, but it means the mock page never exercises the primary extraction path. Testing the primary path requires real DeepSeek.
 - **Answer-not-yet-present race.** Between `firstMsg` and `answerStarted`, `.ds-assistant-message-main-content` doesn't exist yet. The `lastAssistantText` function returns null during this window. The stream loop handles this with the `if (!hasAnswer) continue` check, but it means the extraction can't run on a message that hasn't started answering yet — which is correct, but means the caller can't inspect partial reasoning.
 
@@ -54,7 +54,7 @@ The stream loop's `answerStarted` flag gates on `.ds-assistant-message-main-cont
 
 ## References
 
-- [architecture.md#6-answer-block-extraction-over-whole-message](../../architecture.md#6-answer-block-extraction-over-whole-message)
-- [architecture.md#the-two-streaming-guards](../../architecture.md#the-two-streaming-guards)
-- [selector-maintenance.md#per-selector-reference](../../selector-maintenance.md#per-selector-reference)
+- [architecture.md#6-answer-block-extraction-over-whole-message](../architecture.md#6-answer-block-extraction-over-whole-message)
+- [architecture.md#the-two-streaming-guards](../architecture.md#the-two-streaming-guards)
+- [selector-maintenance.md#deepseek-per-selector-reference](../selector-maintenance.md#deepseek-per-selector-reference)
 - `content.js` `lastAssistantText`, the `answerStarted` gating in the stream loop

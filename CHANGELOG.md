@@ -10,11 +10,16 @@ server. Upgrade both sides together.
 
 ## [Unreleased]
 
+### Changed
+
+- Provider selection is required for `/chat`, `/open`, and `/reset`; routing requires exactly one exact-host tab and has no sticky-tab fallback.
+- `/chat` accepts a saved `url` for direct retry navigation. Error responses include `retryable`, `retryAfter` (milliseconds), and `userFixable` metadata.
+- DeepSeek rate-limit delays use milliseconds, and navigation during streaming reports the registered `user_navigated` code.
+
 ### Planned
 
 - Aggregator `--extension` flag integration in `pulchowk-events-bot` (transport + paste-extension exist; provider forwarding to the transport is next)
 - Wizard error beeps and `needs-review` skip on the aggregator side
-- Per-provider work tab ID storage (currently the pinned tab is single; provider-scoped queries bypass it)
 - Auto-pivot on rate limit as a wizard-level policy (the pivot pattern is documented; the aggregator's transport doesn't implement it yet)
 - Provider unit tests (`tests/providers/*.test.js`)
 - Playwright end-to-end test (`tests/e2e.test.js`)
@@ -58,12 +63,12 @@ Multi-provider plugin architecture. `deepseek-connect` now drives DeepSeek, Qwen
 **Error taxonomy**
 
 - New code: `invalid_response_format` (Qwen). The model didn't wrap its reply in the required `START_QWEN_REPLY` / `END_QWEN_REPLY` delimiters. `retryable: true, userFixable: false, http: 502`. Bucket A (retry silently).
-- Provider attribution table in [docs/error-codes.md](docs/error-codes.md#provider-attribution) — which codes can be raised by which provider.
+- Provider-specific error behavior in [docs/error-codes.md](docs/error-codes.md#registered-codes).
 - `deepthink_enable_failed` and `search_enable_failed` are now documented as DeepSeek-only.
 
 **Architecture decision record**
 
-- [ADR 0008 — multi-provider plugin architecture](docs/adr/0008-multi-provider-plugin-architecture.md). Documents the registry vs. feature flags vs. class inheritance vs. per-provider content scripts trade-off, and the three-registration checklist.
+- [ADR 0008 — multi-provider plugin architecture](docs/adr/0008-multi-provider-plugin.architecture.md). Documents the registry vs. feature flags vs. class inheritance vs. per-provider content scripts trade-off.
 - ADRs 0003, 0004, 0007 amended with cross-references.
 
 **Documentation** — `docs/`

@@ -30,8 +30,8 @@ Have a working install, need to integrate, extend, or operate. Task-oriented gui
 
 | Doc | Answers |
 |---|---|
-| [providers.md](providers.md) | Add a third provider (Claude, Gemini, whatever). The plugin contract, the registration checklist, the Qwen case study, testing a new provider |
-| [integration-guide.md](integration-guide.md) | Wire deepseek-connect into a batch wizard or another Node consumer — lifecycle blueprint, batch loop, per-code error policy, provider threading, `--manual` fallback |
+| [providers.md](providers.md) | Configure selector-based providers in the Providers page; maintainer-only notes cover built-in driver development |
+| [integration-guide.md](integration-guide.md) | Reference design for integrating another Node consumer; examples are illustrative and the aggregator is a separate repository |
 | [operations.md](operations.md) | Reload the extension after a code change, read the trace log, recover from `logged_out` / `rate_limited` / Qwen's age modal |
 | [selector-maintenance.md](selector-maintenance.md) | A provider DOM change broke extraction — per-provider selector fallbacks, the structural-walk strategy, the recovery playbook |
 
@@ -41,8 +41,8 @@ Need precise, exhaustive information. Not for learning, not for doing — for re
 
 | Doc | Answers |
 |---|---|
-| [protocol.md](protocol.md) | Every HTTP route — request shape, response shape, error shape, auth, long-poll lifecycle, queue state machine, protocol version, provider threading, one-work-tab-per-provider constraint |
-| [error-codes.md](error-codes.md) | All 21 `DSCError` codes — `retryable`, `userFixable`, `retryAfter`, HTTP status, wizard decision per code |
+| [protocol.md](protocol.md) | HTTP route shapes, auth, queue lifecycle, provider requirements, and exact-host tab routing |
+| [error-codes.md](error-codes.md) | Registered error codes and retry metadata; verify current mappings against `src/errors.js` |
 
 ### Understanding — "why is it shaped this way?"
 
@@ -50,7 +50,7 @@ Not trying to do anything yet, want the mental model before deciding what to bui
 
 | Doc | Answers |
 |---|---|
-| [architecture.md](architecture.md) | Plugin registry as a load-bearing decision, long-poll vs WebSockets, real Chrome vs Puppeteer, one chat per source, URL-based chat identity, sticky tab, build-hash selector strategy — every load-bearing decision and the reasoning behind it |
+| [architecture.md](architecture.md) | Plugin registry, long-poll flow, URL-based chat identity, and strict provider-tab routing; superseded designs are labeled |
 
 ---
 
@@ -78,11 +78,11 @@ Material decisions that constrain multiple modules or the wire protocol. Each AD
 | [0001 — long-poll over WebSocket](adr/0001-use-long-poll-over-websocket.md) | HTTP long-poll between server and extension, not WebSockets |
 | [0002 — real Chrome over Puppeteer](adr/0002-real-chrome-over-puppeteer.md) | Drive the user's logged-in tab, not a fresh headless session |
 | [0003 — one chat per source](adr/0003-one-chat-per-source.md) | Each source gets its own persistent chat, reused across retries *(amended by 0008: URL-based identity is now primary)* |
-| [0004 — sticky work tab](adr/0004-sticky-work-tab-over-target-tab-id.md) | Extension pins one tab in `chrome.storage`; callers don't supply tab IDs *(amended by 0008: provider-scoped queries bypass the pin)* |
+| [0004 — sticky work tab](adr/0004-sticky-work-tab-over-target-tab-id.md) | Historical decision; the current extension does not pin a work tab and instead requires one exact provider-tab match |
 | [0005 — URL navigation for new chat](adr/0005-url-navigation-over-new-chat-button.md) | Fresh chat via `chrome.tabs.update({ url: '/' })`, not the "New chat" button |
 | [0006 — answer-block extraction](adr/0006-answer-block-extraction-over-whole-message.md) | Extract the answer wrapper only; skip the reasoning / thinking stream |
 | [0007 — structural sidebar walk](adr/0007-structural-sidebar-walk.md) | Find chat titles by walking from "New chat" text, not by class name *(amended by 0008: sidebar walk is a fallback, not the primary mechanism)* |
-| [0008 — multi-provider plugin architecture](adr/0008-multi-provider-plugin-architecture.md) | Registry-based plugin system; `content.js` as router; provider contract; three-registration checklist |
+| [0008 — multi-provider plugin architecture](adr/0008-multi-provider-plugin.architecture.md) | Registry-based plugin system; `content.js` as router; original built-in provider contract |
 
 ---
 
@@ -93,22 +93,22 @@ You're building against this repo from a different process — a batch wizard, a
 1. **[getting-started.md](getting-started.md)** — reach a working round-trip before designing anything
 2. **[architecture.md](architecture.md)** — understand why the API is shaped the way it is, including the provider dimension, so you don't design against it
 3. **[protocol.md](protocol.md)** — the full contract when you need a route's exact shape, especially the `provider` field on `/chat` and `/open`
-4. **[error-codes.md](error-codes.md)** — the decision rule for every failure, before you write a `try/catch`. Note that `invalid_response_format` (Qwen) and `rate_limited` (both providers) behave differently.
+4. **[error-codes.md](error-codes.md)** — the decision rule for every failure, before you write a `try/catch`. `invalid_response_format` can come from Qwen and ChatGPT; `rate_limited` is provider-independent.
 5. **[integration-guide.md](integration-guide.md)** — the concrete blueprint: lifecycle, batch loop, provider threading, error policy
 
 Steps 1-2 are non-negotiable — skipping them leads to integrations that fight the design. Steps 3-5 are consulted during the build, not read once front-to-back.
 
 ## Reading order for provider authors
 
-You're adding a third provider (Claude, Gemini, whatever comes next). Read in this order:
+You're configuring a selector-based provider or implementing a new built-in driver. Start with the Providers page workflow; use the maintainer-only driver details only when a config provider cannot express the behavior you need.
 
 1. **[providers.md](providers.md)** — the contract, the five-step walkthrough, the registration checklist, the Qwen case study
-2. **[architecture.md#the-plugin-registry](architecture.md#the-plugin-registry)** — why `content.js` is a router and nothing else
-3. **[adr/0008-multi-provider-plugin-architecture.md](adr/0008-multi-provider-plugin-architecture.md)** — the decision record, including alternatives that were rejected (feature flags, subclassing, hardcoded branching)
+2. **[architecture.md#8-plugin-registry-over-feature-flags](architecture.md#8-plugin-registry-over-feature-flags)** — why `content.js` is a router and nothing else
+3. **[adr/0008-multi-provider-plugin.architecture.md](adr/0008-multi-provider-plugin.architecture.md)** — the decision record, including alternatives that were rejected (feature flags, subclassing, hardcoded branching)
 4. **[selector-maintenance.md](selector-maintenance.md)** — when your provider's DOM changes, this is the recovery playbook (per-provider sections)
 5. **[operations.md#reload-discipline](operations.md#reload-discipline)** — the six-step reload sequence that prevents "the code on disk is correct but the extension isn't seeing it"
 
-The Qwen provider is the reference implementation. `providers/qwen.js` is self-contained and demonstrates the three patterns a real provider usually needs: modal dismissal, anti-bot pacing, strict delimiter enforcement. When in doubt, read that file.
+For a code-based driver, `providers/chatgpt.js` and `providers/qwen.js` are useful references. Config providers such as GLM are defined through the Providers page and do not implement the four-method JavaScript plugin contract themselves.
 
 ## Reading order for maintainers
 

@@ -52,7 +52,7 @@ The content script never clicks the "New chat" button. It returns `{ ok: false, 
 
 ## References
 
-- [architecture.md#5-url-navigation-over-new-chat-button](../../architecture.md#5-url-navigation-over-new-chat-button)
-- [protocol.md#ensurechat](../../protocol.md#ensurechat)
+- [architecture.md#5-url-navigation-over-new-chat-button](../architecture.md#5-url-navigation-over-new-chat-button)
+- [protocol.md#ensurechat](../protocol.md#ensurechat)
 - `background.js` `handleNext` (the `needNewChat` branch)
 - `content.js` `ensureChat` — returns `needNewChat: true`
