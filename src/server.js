@@ -463,9 +463,10 @@ function createServer(opts) {
         const prompt = messages.map((m) => m.content || '').join('\n\n');
         const chatName = body.chat || ('api-' + crypto.randomUUID().slice(0, 8));
         const targetTabId = body.targetTabId;
+        const targetUrl = body.url;
         const startedAt = Date.now();
         try {
-          const result = await enqueue({ prompt, chatName, targetTabId, provider: body.provider });
+          const result = await enqueue({ prompt, chatName, targetTabId, targetUrl, provider: body.provider });
           return writeJson(res, 200, {
             content: result.content,
             chat: chatName,

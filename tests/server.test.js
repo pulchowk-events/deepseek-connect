@@ -120,9 +120,11 @@ test('/chat preserves retry metadata from provider errors', async () => {
       messages: [{ role: 'user', content: 'hello' }],
       chat: 'rate-limited-chat',
       provider: 'deepseek',
+      url: 'https://chat.deepseek.com/a/chat/s/saved-chat',
     });
     const next = await fetch(baseUrl + '/next', { headers: authHeaders() });
     const work = await next.json();
+    assert.equal(work.targetUrl, 'https://chat.deepseek.com/a/chat/s/saved-chat');
 
     await postJson(baseUrl, '/reply', {
       requestId: work.requestId,

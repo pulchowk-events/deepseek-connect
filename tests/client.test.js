@@ -57,6 +57,7 @@ test('chat() sends POST /chat with the right body and returns the parsed result'
     const result = await dc.chat({
       messages: [{ role: 'user', content: 'hello' }],
       chat: 'my-chat',
+      url: 'https://chat.deepseek.com/a/chat/s/saved-chat',
     });
     assert.strictEqual(result.content, 'hi');
     assert.strictEqual(result.chat, 'my-chat');
@@ -70,6 +71,7 @@ test('chat() sends POST /chat with the right body and returns the parsed result'
     const sent = JSON.parse(req.body);
     assert.deepStrictEqual(sent.messages, [{ role: 'user', content: 'hello' }]);
     assert.strictEqual(sent.chat, 'my-chat');
+    assert.strictEqual(sent.url, 'https://chat.deepseek.com/a/chat/s/saved-chat');
   } finally {
     await srv.close();
   }

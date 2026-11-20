@@ -106,6 +106,7 @@ function createClient(opts) {
     const body = { messages: params.messages };
     if (params.chat) body.chat = params.chat;
     if (params.targetTabId) body.targetTabId = params.targetTabId;
+    if (params.url) body.url = params.url;
     if (params.provider) body.provider = params.provider;
     const timeoutMs = params.timeoutMs || DEFAULT_CHAT_TIMEOUT_MS;
     return await request('POST', '/chat', body, timeoutMs);
