@@ -12,7 +12,7 @@
   const DSC = {
     VERSION: '0.2.0',
 
-    BUILD_HASH: 'cfg-providers-20261120d',
+    BUILD_HASH: 'cfg-providers-20261120e',
 
     STORAGE: {
       TOKEN: 'dsc_token',

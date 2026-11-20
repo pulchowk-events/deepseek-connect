@@ -23,6 +23,45 @@
   };
   const REASON_SEL = 'details, [data-testid*="thought" i], [data-testid*="reasoning" i], [class*="thinking" i], [class*="reasoning" i]';
   const RATE_RE = /too many requests|rate limit|you.ve (?:reached|hit)[^.]{0,80}(?:limit|cap)|you have (?:reached|hit)[^.]{0,80}(?:limit|cap)|usage (?:limit|cap)|limit (?:will )?resets?/i;
+  const CHATGPT_MAX_PROMPT_CHARS = 55000;
+  const TOO_LONG_RE = /messages?\s+you\s+submitted\s+(?:was|were)\s+too\s+long/i;
+  let lastTooLongCheck = 0;
+
+  function detectTooLong() {
+    const leafMatch = function (el) {
+      if (!el || (el.children && el.children.length)) return null;
+      const t = (el.textContent || '').trim();
+      if (t && t.length < 300 && TOO_LONG_RE.test(t)) return t;
+      return null;
+    };
+    const scoped = '[role="dialog"], [role="alert"], [data-testid*="toast" i], [data-testid*="error" i]';
+    let roots = [];
+    try { roots = Array.from(document.querySelectorAll(scoped)); } catch (_) { roots = []; }
+    for (const root of roots) {
+      const self = leafMatch(root);
+      if (self) return self;
+      let kids = [];
+      try { kids = Array.from(root.querySelectorAll('*')); } catch (_) { kids = []; }
+      for (const k of kids) { const m = leafMatch(k); if (m) return m; }
+    }
+    if (!document.body) return null;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+      acceptNode: function (n) {
+        const tag = n.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    let visited = 0;
+    let n = walker.nextNode();
+    while (n && visited < 20000) {
+      visited++;
+      const m = leafMatch(n);
+      if (m) return m;
+      n = walker.nextNode();
+    }
+    return null;
+  }
   const CF_TEXT_RE = /verify you are human|checking your browser|performing security verification|just a moment/i;
 
   function visible(el) {
@@ -248,6 +287,10 @@
     };
     const dStart = (delimiters && delimiters.start) || 'START_';
     const dEnd = (delimiters && delimiters.end) || 'END_';
+    if (prompt && prompt.length > CHATGPT_MAX_PROMPT_CHARS) {
+      return fail(E.BAD_REQUEST, 'prompt_too_large', { promptLen: prompt.length, limit: CHATGPT_MAX_PROMPT_CHARS });
+    }
+    lastTooLongCheck = 0;
 
     const input = await waitFor(function () { return findInput() || (detectBlocked() ? true : null); }, 15000);
     T('gpt_input', { found: !!input && input !== true });
@@ -319,6 +362,11 @@
 
       const cand = newAssistant();
       if (!cand) {
+        if (Date.now() - lastTooLongCheck > 3000) {
+          lastTooLongCheck = Date.now();
+          const matchedText = detectTooLong();
+          if (matchedText) return fail(E.BAD_REQUEST, 'prompt_too_long_rejected', { matchedText: matchedText.slice(0, 200) });
+        }
         if (detectRateLimit()) return fail(E.RATE_LIMITED, 'rate_limited', { retryAfter: 30000 });
         if (!sawMsg && !seenStop && Date.now() - sentAt > 60000) return fail(E.RESPONSE_TIMEOUT, 'no_new_message');
         continue;
@@ -377,7 +425,7 @@
   }
 
   globalThis.DSC_PROVIDERS = globalThis.DSC_PROVIDERS || {};
-  globalThis.DSC_PROVIDERS['chatgpt'] = { name: 'chatgpt', ensureChat: ensureChat, sendPrompt: sendPrompt,
+  globalThis.DSC_PROVIDERS['chatgpt'] = { name: 'chatgpt', ensureChat: ensureChat, sendPrompt: sendPrompt, limits: { maxPromptChars: CHATGPT_MAX_PROMPT_CHARS }, tooLongRe: TOO_LONG_RE,
     checkState: checkState, resetChat: resetChat, selectors: SEL };
   console.debug('[dsc:registry] chatgpt provider registered');
 })();
