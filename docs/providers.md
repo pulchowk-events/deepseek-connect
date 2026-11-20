@@ -23,6 +23,9 @@
 > **three registrations** sections below describe the legacy code-module flow only. Corrections to the
 > text below: `providerForUrl` matches exact hostnames (not `startsWith`); there is no default provider
 > (the server refuses a missing one); the server whitelist is `providers/*.js` plus the built-ins.
+>
+> **Use the Providers page for ordinary additions.** The code-module contract and manual registration
+> walkthrough are maintainer notes for built-in drivers; they are not the current config-provider flow.
 
 
 How to add a new provider, understand the plugin contract, and debug a provider that isn't routing correctly. This is the doc that makes `deepseek-connect` extensible — without it, "add a provider" means reverse-engineering `qwen.js` and hoping.
@@ -191,7 +194,7 @@ Two places. First, `host_permissions` and `content_scripts.matches`:
 
 Order matters in `content_scripts.js`. `shared.js` must come first (it defines `globalThis.DSC`). `content.js` must come last (it routes to providers that must already be registered). Provider files can come in any order between those two.
 
-If the provider's tab loads anything from a subdomain (e.g., `assets.claude.ai`), add that host too — otherwise the extension can't inspect the tab's URL and the work-tab selection fails with `no_work_tab`.
+If the provider's tab loads anything from a subdomain (e.g., `assets.claude.ai`), add the necessary host permissions. Routing matches the provider's configured hostname exactly; it does not depend on a sticky work tab.
 
 ### 3. Update `background.js`'s `sendToTab` re-injection list
 
@@ -211,7 +214,7 @@ await chrome.scripting.executeScript({
 });
 ```
 
-Forgetting this means a mid-run crash re-injects only the old providers, and the retried `sendPrompt` returns `no_provider_loaded`. The failure is confusing because the first request worked — only the retry fails.
+Forgetting this means a mid-run crash re-injects only the old providers. A missing provider module is an internal registration failure, not a registered public `DSCError` code.
 
 ### 4. Create `providers/claude.js`
 
@@ -364,9 +367,9 @@ A new provider needs exactly **three** registrations. Missing any of them produc
 
 | Registration | File | Missing means |
 |---|---|---|
-| `DSC.PROVIDER_DOMAINS['<name>'] = '<url-prefix>/'` | `shared.js` | `/chat { provider: '<name>' }` returns `no_work_tab` even when the tab is open. `providerForUrl` returns null, background can't find the tab. |
-| `providers/<name>.js` in `content_scripts.js` and `host_permissions`/`matches` | `manifest.json` | The provider file never loads. `content.js` returns `no_provider_loaded`. F12 console on the tab shows `[dsc:router:diag]` with `registeredProviders` missing your provider. |
-| `providers/<name>.js` in the `sendToTab` re-injection `files` array | `background.js` | The first request works. A mid-run crash (service worker killed, tab reloaded) re-injects the old providers only, and the retry returns `no_provider_loaded`. This is the hardest one to debug because it looks like an intermittent failure. |
+| Provider host definition and permissions | Shared/config setup and extension manifest | The tab is not recognized or the extension cannot access it. Current work requests fail with `ambiguous_provider_tab` if there is not exactly one provider match. |
+| `providers/<name>.js` in built-in `content_scripts.js` | `manifest.json` | The built-in module is not loaded. Inspect the tab's extension console and registration diagnostics; public errors may be normalized to `internal_error`. |
+| `providers/<name>.js` in the `sendToTab` re-injection `files` array | `background.js` | A re-injected tab may lack the built-in provider module. Test initial load and reinjection after any registration change. |
 
 Three places, one file each. If any provider-specific logic ever lives outside `providers/<name>.js`, that's a bug — the router is deliberately blind, and everything provider-specific belongs inside the module.
 
@@ -471,14 +474,14 @@ curl -s -X POST http://127.0.0.1:7331/chat \
 
 Expected on success: `{ content: "ping", chat: "claude-test", url: "https://claude.ai/chat/...", elapsedMs: N }`.
 
-Expected on failure with a clear error: `{ error: "no_provider_loaded" }` (registration missing), `{ error: "no_work_tab" }` (PROVIDER_DOMAINS missing), `{ error: "input_not_found" }` (provider's `findInput` doesn't match), `{ error: "response_timeout" }` (provider's completion detector doesn't fire).
+Expected current failures include `ambiguous_provider_tab` (missing/duplicate provider tab), `input_not_found` (input unavailable), and `response_timeout` (completion detector did not finish). Provider registration problems may surface as `internal_error`.
 
 The error code itself is the diagnosis. Match it against the three registrations:
 
 | Error | Registration missing |
 |---|---|
-| `no_provider_loaded` | `manifest.json` `content_scripts.js` |
-| `no_work_tab` | `shared.js` `PROVIDER_DOMAINS` |
+| `internal_error` with registration diagnostics | Built-in script load or config-provider registration |
+| `ambiguous_provider_tab` | Exact provider hostname and number of open matching tabs |
 | Works once, fails on retry | `background.js` `sendToTab` re-injection list |
 | `input_not_found` after successful `ensureChat` | Provider's `findInput` selector is wrong |
 | `response_timeout` | Provider's completion detector never fires |
@@ -553,7 +556,7 @@ Reference table for the two shipped providers. Useful when debugging or when wri
 | Send button is not aria-labeled consistently | Selector tries buttons inside `.chat-message-input-fixed` / `.message-input-wrapper`, falls back to `button.send-button`, then `button[type="submit"]`. |
 | `resetChat` is a no-op | Qwen has no delete-chat UI the provider can drive reliably. Returns `{ ok: true, reason: 'qwen_reset_not_implemented' }`. |
 
-When a provider's DOM changes and the recovery playbook in [selector-maintenance.md](selector-maintenance.md) doesn't cover it, the fix is usually a new tier in the provider's own selector logic, not a change to `selectors.js` (which is DeepSeek-specific). See [selector-maintenance.md#adding-a-new-tier](selector-maintenance.md#adding-a-new-tier) for the general procedure.
+When a provider's DOM changes and the recovery playbook in [selector-maintenance.md](selector-maintenance.md) doesn't cover it, the fix is usually a new tier in the provider's own selector logic, not a change to `selectors.js` (which is DeepSeek-specific). See [selector-maintenance.md#when-adding-a-tier-isnt-enough](selector-maintenance.md#when-adding-a-tier-isnt-enough) for the general procedure.
 
 ---
 

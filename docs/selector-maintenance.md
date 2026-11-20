@@ -28,11 +28,12 @@ The recovery playbook when a provider ships a UI change and the extension starts
 
 Before touching any selector, confirm the failure is drift and not one of the six other causes that produce the same symptom. This is the most common time-waster in the operations runbook.
 
+> Current note: routing failures now use `ambiguous_provider_tab` when there is not exactly one tab matching the requested provider's exact hostname. `no_work_tab` and `no_provider_loaded` are not registered public error codes; treat old references to them below as historical diagnostics only.
+
 | Failure code | Drift? | How to tell |
 |---|---|---|
 | `logged_out` | No | Provider tab shows login screen. Log in. |
-| `input_not_found` with `reason: 'no_work_tab'` | No | No provider tab is open. Open one. |
-| `input_not_found` with `reason: 'no_provider_loaded'` | No | Registration bug. See [providers.md#the-registration-checklist](providers.md#the-registration-checklist). |
+| `ambiguous_provider_tab` | No | No tab or multiple tabs match the provider hostname. Leave exactly one matching tab open. |
 | `input_not_found` with empty `probe` | No | Content script didn't inject. Hard-reload the tab (Ctrl+Shift+R). |
 | `input_not_found` with `probe.requiredMissing: ["input"]` | **Yes** | Input selector returned null. Drift. |
 | `input_not_found` on Qwen (no `probe` field) | **Yes** (probably) | Qwen's provider doesn't emit a `probe`; the reason string is just `'input_not_found'`. F12 the tab and check whether `document.querySelector('textarea')` returns anything. |
@@ -41,7 +42,6 @@ Before touching any selector, confirm the failure is drift and not one of the si
 | `dom_drift` with empty `requiredMissing` | No | Probe itself threw. Check content script console for the exception. |
 | `chat_not_found` | Maybe | Sidebar walk failed — but only if `debug.leafCount` is 0. If `leafCount > 0` but the chat isn't in `leafPreview`, the chat title doesn't contain the source name (matching bug, not drift; use URL-based retry instead). |
 | `invalid_response_format` (Qwen) | No | Not a selector failure — the model didn't wrap its reply in the required delimiters. See [operations.md#symptom-invalid_response_format-qwen](operations.md#symptom-invalid_response_format-qwen). |
-| `extension_disconnected` | No | Not connected. See [operations.md#symptom-extension_disconnected](operations.md#symptom-extension_disconnected). |
 
 The `probe` field on the error is the primary signal for DeepSeek. It's the content script's selector-probe snapshot at failure time:
 

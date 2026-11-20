@@ -69,9 +69,9 @@ Four rules that constrain everything else:
 
 2. **The server is one end of every HTTP conversation.** External callers and the extension both connect to it. There is no direct caller-to-extension path, no reverse channel, no push. The extension is a polling client with a long-poll hold.
 
-3. **The provider field is opaque to the server.** The server reads `provider` from the request body, stores it on the queue entry, and includes it in the `/next` payload. It does not validate the value, does not default it beyond `'deepseek'`, does not branch on it. The only place `provider` has meaning is inside `content.js`'s router and inside the provider module that the router dispatches to.
+3. **The provider field is validated and threaded.** The server rejects missing or unknown provider names, stores accepted names on the queue entry, and includes them in `/next`. The extension uses the name for exact-host tab routing and provider-module dispatch.
 
-4. **The extension is single-tab-per-provider.** When a request specifies `provider`, the extension queries that provider's domain for candidate tabs and dispatches to the first non-active match. When no provider is specified, the extension uses its single pinned work tab (v0.1.x behavior). Two concurrent requests against the same provider serialize through the queue; two against different providers use different tabs but still serialize (one job in-flight at a time). See [Constraints](#constraints).
+4. **The extension requires exactly one tab per requested provider.** A missing or ambiguous match fails with `ambiguous_provider_tab`; there is no pinned-tab or cross-provider fallback. Requests for all providers serialize through the same queue.
 
 All request and response bodies are JSON. All requests carry `Content-Type: application/json` when they have a body. All responses carry `Content-Type: application/json` unconditionally.
 
@@ -114,22 +114,27 @@ There is no token rotation, no expiry, no refresh flow, no signature. The token 
 
 ## Route index
 
-Nine routes, split into two groups:
+Routes are split into caller, extension, and provider-management groups:
 
 **Caller routes** — invoked by external callers. Return success payloads or error responses. Wait for the extension round-trip before responding.
 
 | Method | Path | Auth | Blocking | Provider field | Returns |
 |---|---|---|---|---|---|
-| `POST` | `/chat` | ✓ | yes — waits for extension reply | request: `provider` (optional, default `'deepseek'`) | `{ content, chat, url, elapsedMs }` |
-| `POST` | `/open` | ✓ | yes — waits for extension reply | request: `provider` (optional, default `'deepseek'`) | `{ ok, existing, mode, url, debug, chat }` |
-| `POST` | `/reset` | ✓ | yes — waits for extension reply | request: `provider` (optional, default `'deepseek'`) | `{ ok, chat, result }` |
+| `POST` | `/chat` | ✓ | yes — waits for extension reply | request: required `provider` | `{ content, chat, url, elapsedMs }` |
+| `POST` | `/open` | ✓ | yes — waits for extension reply | request: required `provider` | `{ ok, existing, mode, url, debug, chat }` |
+| `POST` | `/reset` | ✓ | yes — waits for extension reply | request: required `provider` | `{ ok, chat, result }` |
 | `GET` | `/tabs` | ✓ | no — reads cached tab list | response: `provider` per tab | `{ ok, tabs }` |
+| `GET` | `/version` | ✓ | no | none | `{ ok, version, buildHash }` |
+| `GET` | `/providers` | ✓ | no | none | Built-in and configured provider definitions |
+| `POST` | `/providers` | ✓ | no | body: `name`, `definition` | Writes a new config provider |
+| `PUT` | `/providers/:name` | ✓ | no | body: `definition` | Updates a generated config provider |
+| `DELETE` | `/providers/:name` | ✓ | no | none | Deletes a generated config provider |
 
 **Extension routes** — invoked by the extension service worker. Most are fire-and-forget or long-poll; none wait on the caller.
 
 | Method | Path | Auth | Blocking | Provider field | Returns |
 |---|---|---|---|---|---|
-| `POST` | `/hello` | ✓ | no | not present in v0.2.0 (see [Extending the protocol](#extending-the-protocol)) | `{ ok, sessionId }` |
+| `POST` | `/hello` | ✓ | no | `provider` is not a request field | `{ ok, sessionId }` |
 | `GET` | `/next` | ✓ | yes — 30s long-poll hold | response: `provider` (echoed from queue entry) | `{ action: 'next', provider, ... }` or `{ action: 'idle' }` |
 | `POST` | `/reply` | ✓ | no | not present (reply body has `requestId`; provider implicit) | `{ ok }` |
 | `POST` | `/progress` | ✓ | no | not present (phase messages don't carry provider; the phase name itself is provider-specific, see [POST /progress](#post-progress)) | `{ ok }` |
@@ -148,7 +153,7 @@ HTTP/1.1 404 Not Found
 
 ### POST /chat
 
-The main entry point. Send messages plus an optional provider; receive the assistant's reply plus the stable chat URL.
+The main entry point. Send messages with a required provider; receive the assistant's reply plus the stable chat URL.
 
 **Request:**
 
@@ -159,7 +164,8 @@ The main entry point. Send messages plus an optional provider; receive the assis
   ],
   "chat": "my-chat-name",
   "provider": "qwen",
-  "targetTabId": 1234567890
+  "targetTabId": 1234567890,
+  "url": "https://chat.qwen.ai/c/..."
 }
 ```
 
@@ -167,8 +173,9 @@ The main entry point. Send messages plus an optional provider; receive the assis
 |---|---|---|---|
 | `messages` | array | ✓ | One or more `{ role, content }` objects. Only `content` is used; `role` is preserved for future multi-turn use but not currently sent to providers as anything other than a blank-line-joined blob. |
 | `chat` | string | ✗ | The chat name to open before sending. If omitted, the server generates `api-<uuid8>`. |
-| `provider` | string | ✗ | Which provider to route to. Defaults to `'deepseek'` when omitted. Valid values are the keys in `DSC.PROVIDER_DOMAINS` (`deepseek`, `qwen`, `tongyi`). An unknown provider produces `no_provider_loaded` from the content router. |
-| `targetTabId` | number | ✗ | Explicit tab ID to target. Validated against the requested `provider` — if `provider: 'qwen'` and the tab is a DeepSeek tab, returns `input_not_found`. **Deprecated** — the extension's provider-scoped `getWorkTab` handles tab selection automatically; passing this is rarely needed. |
+| `provider` | string | ✓ | Provider name. Built-ins are `deepseek`, `qwen`, and `chatgpt`; configured providers must be enabled in the extension. Missing or unknown values return `bad_request`. `tongyi` is not routable. |
+| `targetTabId` | number | ✗ | Optional explicit tab ID. The extension accepts it only when the tab's exact hostname matches `provider`; otherwise it returns `ambiguous_provider_tab`. Without it, exactly one tab must match the provider hostname. |
+| `url` | string | ✗ | Optional saved conversation URL. The extension navigates to it before sending, supporting retries in the same conversation. |
 
 All messages are concatenated with `"\n\n"` between them and sent as a single prompt. The chat gets one turn per `/chat` call; multi-turn conversations are expressed by reusing the same `chat` name across calls, not by sending a `messages` array with history — the extension opens the named chat (or navigates to its URL), which already has prior turns in it, and adds the new prompt as the next turn. See [architecture.md#3-one-chat-per-source-url-primary-identity](architecture.md#3-one-chat-per-source-url-primary-identity).
 
@@ -187,10 +194,10 @@ All messages are concatenated with `"\n\n"` between them and sent as a single pr
 |---|---|
 | `content` | Extracted reply. The extraction pass is provider-specific — see [Extraction](#extraction) below. |
 | `chat` | The chat name actually used. Echoed back so callers who relied on the generated `api-<uuid8>` default can reuse it for follow-up calls. |
-| `url` | **The stable chat URL.** This is the primary identity for retry — persist it and pass it to `/open { chatName, url }` on the next call to the same source. Provider-specific format: DeepSeek uses `/a/chat/s/<uuid>`, Qwen uses `/c/<uuid>`. `null` if the provider couldn't capture it (rare; both shipped providers always return a URL on success). |
+| `url` | **The stable chat URL.** Persist it and pass it to `/chat` when retrying the same conversation, or to `/open` to navigate without sending. Provider-specific format; may be `null` if the provider cannot capture it. |
 | `elapsedMs` | Wall clock from server receipt of `/chat` to server receipt of `/reply`. Includes queue time plus extension round-trip. |
 
-**Errors:** every `DSCError` code can appear here, plus the router-specific `no_provider_loaded`. The HTTP status is determined by the code's `http` metadata (see [error-codes.md](error-codes.md)). The client library (`src/client.js`) throws `DSCError` on any non-2xx with the code preserved.
+**Errors:** errors are returned with `error`, `reason`, `retryable`, `retryAfter` (milliseconds), and `userFixable` metadata; optional `details` and `trace` may also be present. The HTTP status is determined by the code's metadata (see [error-codes.md](error-codes.md)). The client library (`src/client.js`) throws `DSCError` on non-2xx responses. Unknown extension error codes are normalized to `internal_error`; `no_provider_loaded` is not a registered code.
 
 **Provider-specific errors:**
 
@@ -275,11 +282,11 @@ Find or create a chat by name, without sending a prompt. **Or** navigate directl
 |---|---|---|---|
 | `chatName` | string | ✓ | The chat name. Used as the response's `chat` field and, in mode A, as the sidebar fuzzy-match target. In mode B, `chatName` is metadata — the navigation is driven by `url`. |
 | `url` | string | ✗ | **The primary identity mechanism.** When present, the extension navigates directly to this URL via `chrome.tabs.update`, skipping the sidebar walk entirely. This is the retry path — persist the URL from `/chat`'s response and pass it here. |
-| `provider` | string | ✗ | Defaults to `'deepseek'`. |
+| `provider` | string | ✓ | Built-in or enabled config provider. |
 
 **Mode A behavior (no `url`):**
 
-1. `getWorkTab(provider)` finds the provider's tab.
+1. The extension resolves exactly one tab for the provider's exact hostname; zero or multiple matches return `ambiguous_provider_tab`.
 2. `content.js` dispatches to `provider.ensureChat(chatName)`.
 3. The provider's `ensureChat` tries to find a chat matching `chatName`. DeepSeek does a structural sidebar walk; Qwen has no sidebar walk and returns `existing: false, mode: 'fresh'` unconditionally.
 4. If a chat is found → navigates to it, returns `{existing: true, mode: 'existing'}`.
@@ -432,7 +439,7 @@ The extension's registration. Sent on startup, on server reconnect (with backoff
 | Field | Meaning |
 |---|---|
 | `version` | Extension version, from `shared.js` `DSC.VERSION`. Currently `'0.2.0'`. See [Version negotiation](#version-negotiation). |
-| `tabUrl` | The URL of the pinned work tab (`chrome.storage.local.workTabId`), or the first-registered tab. This is informational — the server doesn't use it for routing. The per-tab `provider` fields are the routing signal. |
+| `tabUrl` | Informational first provider-tab URL; the server does not use it for routing. The per-tab `provider` fields are the routing signal. |
 | `tabs` | Snapshot of every supported provider tab currently open, each with its `provider` name. Cached by the server; served by `GET /tabs`. |
 
 **Success:**
@@ -547,7 +554,7 @@ The extension's result delivery. Resolves the `/chat` or `/open` or `/reset` pro
 | `mode` | when ok + open/reset | Same semantics as `/open`'s response. |
 | `debug` | when ok + open | Same payload as `/open`'s response. |
 | `chat` | when ok | The chat name actually used. |
-| `error` | when error | `DSCError` code. Must be one of the 21 registered codes. |
+| `error` | when error | `DSCError` code. Must be one of the 24 registered codes. |
 | `reason` | when error | Free-form human-readable reason. |
 | `retryAfter` | when error, retryable | Milliseconds. |
 | `details` | when error | Structured details — e.g., `dom_drift`'s missing required selectors, `invalid_response_format`'s `rawPreview`. |
@@ -870,16 +877,16 @@ Where `provider` appears and where it doesn't. Useful for understanding which la
 
 | Layer | Field | Direction | Required | Behavior |
 |---|---|---|---|---|
-| **Caller → Server** | `provider` on `/chat` | request | ✗ (default `'deepseek'`) | Server defaults; doesn't validate the value. |
-| **Caller → Server** | `provider` on `/open` | request | ✗ (default `'deepseek'`) | Same. |
+| **Caller → Server** | `provider` on `/chat` | request | required | Validated against built-ins and enabled config providers. |
+| **Caller → Server** | `provider` on `/open` | request | required | Same. |
 | **Server queue** | `provider` on queue entry | internal | always set | Stamped at `enqueue()`; used only for `/next` payload. |
 | **Server → Extension** | `provider` on `/next` | response | always present | Echoed from queue entry. |
 | **Extension → Content** | `provider` on `sendMessage` | request | always present | `handleNext` reads from `work.provider` and passes to every `sendToTab` call. |
-| **Content router** | `msg.provider` | dispatcher | always present (falls back to `'deepseek'` for backward compat) | `DSC_PROVIDERS[provider]` lookup; `no_provider_loaded` if missing. |
+| **Content router** | `msg.provider` | dispatcher | always present | `DSC_PROVIDERS[provider]` lookup; unknown provider is an internal registration failure. |
 | **Extension → Server** | — | n/a | — | `/reply` and `/progress` don't carry `provider` — the `requestId` identifies the original entry, which has the provider. |
 | **Server → Caller** | — | n/a | — | `/chat` response doesn't echo `provider` — the caller knows what they sent. If you need to verify, check `url`'s domain. |
 
-**The `provider` string is never transformed.** Whatever the caller sends is what reaches `DSC_PROVIDERS[provider]`. No case normalization, no aliasing, no fallback at intermediate layers. If the caller sends `'DeepSeek'` (capital D), the router looks up `DSC_PROVIDERS['DeepSeek']`, finds nothing, and returns `no_provider_loaded`. This is intentional — silent normalization would hide caller typos. If you need case-insensitivity, add it in `src/client.js`'s `chat()` method (normalize before sending), not in the server or the router.
+**The `provider` string is never transformed.** Names are case-sensitive; the server rejects an unknown name as `bad_request`. Config provider names are available only after they are configured and enabled.
 
 **`provider` is a data field, not control flow.** No module except `content.js` and `background.getWorkTab` branches on it. `src/server.js` threads it through without inspecting it. If you're tempted to add `if (provider === 'qwen') { ... }` to the server, that's a design signal — the behavior belongs in the provider module or in `content.js`'s dispatch, not in the queue.
 
@@ -926,12 +933,12 @@ Every caller-route error response is `{ ok: false, error: <code>, ... }`. The fu
 }
 ```
 
-Not every field is present on every error — `retryAfter` only appears for `rate_limited`, `details` only appears when the provider produces structured data, `trace` only appears when the error originated from a provider module. The `error` field is always one of the 21 registered codes; unknown codes are collapsed to `internal_error` by the client library.
+Not every field is present on every error — `details` and `trace` are optional. `retryAfter` is included in server error bodies and is in milliseconds. The `error` field is one of the 24 registered codes; unknown codes are collapsed to `internal_error` by the client library.
 
 **Two provider-specific codes added in v0.2.0:**
 
 - `invalid_response_format` — Qwen's delimiters not present. `retryable: true, userFixable: false, http: 502`. Bucket A (retry silently).
-- `no_provider_loaded` — router couldn't find the provider module. Raised by `content.js`, not by a provider. This is a **registration bug**, not a runtime failure — the fix is to add the provider to `manifest.json` and reload. The router returns it as a **content-script-level error**, which background.js surfaces as `input_not_found` (since it doesn't recognize the code) — but the `reason` field carries `no_provider_loaded` and the `hostname`. See [providers.md#the-registration-checklist](providers.md#the-registration-checklist).
+- Provider registration failures are not represented by a `no_provider_loaded` public code. Check the configured provider state, extension console, and registration settings.
 
 See [error-codes.md](error-codes.md) for the full table.
 
@@ -951,8 +958,8 @@ The server does **not** reject mismatched versions in v0.2.0. The version field 
 
 | Client | Server | Extension | DeepSeek works | Qwen works |
 |---|---|---|---|---|
-| v0.1.x (no provider field) | v0.2.0 | v0.2.0 | ✓ (defaults to deepseek) | ✗ (client can't request it) |
-| v0.2.0 | v0.1.x | v0.2.0 | ✓ (v0.1 server ignores provider) | ✗ (v0.1 server can't route) |
+| v0.1.x (no provider field) | v0.2.0 | v0.2.0 | ✗ (provider is required) | ✗ (client can't request it) |
+| v0.2.0 | v0.1.x | v0.2.0 | Not supported; old server behavior is not a compatibility guarantee | ✗ (v0.1 server can't route) |
 | v0.2.0 | v0.2.0 | v0.1.x | ✓ | ✗ (old extension has no qwen module) |
 
 **Upgrade both sides together.** The `provider` field and the `url` field on `/chat` are additive to the v0.1.x wire format — nothing breaks, but the multi-provider features require both sides at v0.2.0+.
@@ -963,7 +970,7 @@ The server does **not** reject mismatched versions in v0.2.0. The version field 
 
 Five constraints that are not obvious from the routes alone. Two are v0.1.x; three are new in v0.2.0.
 
-**1. One work tab per provider.** When `provider` is specified, `getWorkTab(provider)` queries that provider's domain and returns the first non-active match. If two Qwen tabs are open, the request goes to the non-active one; if all Qwen tabs are active (rare — only one can be focused), it goes to the first. There is no tab-rotation, no multi-tab parallelism per provider. Two requests against the same provider serialize through the queue.
+**1. Exactly one matching tab per request.** `resolveWorkTab()` matches the requested provider's exact hostname. Zero or multiple matches fail with `ambiguous_provider_tab`; it never picks an arbitrary tab. There is no tab-rotation or multi-tab parallelism per provider. Requests serialize through the queue.
 
 **2. One server, one extension, one browser profile.** Two servers on the same profile would each receive half the `/hello` polls and race for `/next`. Not supported.
 
@@ -973,7 +980,7 @@ Five constraints that are not obvious from the routes alone. Two are v0.1.x; thr
 
 **5. Provider names are case-sensitive and exact.** `'deepseek'`, not `'DeepSeek'`. `'qwen'`, not `'Qwen'`. `'tongyi'`, not `'tongyi.aliyun.com'`. The lookup in `content.js` is `DSC_PROVIDERS[msg.provider]` — JavaScript object key semantics apply.
 
-**6. A provider's domain must be in three places.** `DSC.PROVIDER_DOMAINS` (shared.js), `manifest.json` `host_permissions` + `content_scripts.matches`, and `background.js` `sendToTab` re-injection list. Missing any of them produces a specific, diagnosable error — see [providers.md#the-registration-checklist](providers.md#the-registration-checklist).
+**6. Built-in and config providers have different registration flows.** Built-in drivers are loaded by extension code and require maintainer changes. Selector-based config providers are registered through the Providers page and can be enabled per machine. See [providers.md](providers.md).
 
 ---
 

@@ -33,7 +33,7 @@ Expected: `v22.x.x` or higher. If it's `v20` or lower, upgrade before continuing
 
 **2. Brave or Chrome.** The extension targets Chromium and is tested on Brave 1.60+. Firefox won't work — the manifest uses MV3 with `background.service_worker`, which Firefox handles differently enough that none of the background.js code would run as written. Edge works (it's Chromium) but is untested.
 
-**3. A logged-in DeepSeek account (for steps 5, 7, 8) and a logged-in Qwen account (for step 6).** Open a new tab to `https://chat.deepseek.com/` and log in. Open another tab to `https://chat.qwen.ai/` and log in. You should see a chat input on each. If either shows a login screen, log in before continuing — the extension can't log you in, and every prompt will fail with `logged_out`.
+**3. A logged-in DeepSeek account (for steps 5, 7, 8) and a logged-in Qwen account (for step 6).** Open one tab to `https://chat.deepseek.com/` and log in. Open one tab to `https://chat.qwen.ai/` and log in. Keep exactly one tab open per provider; duplicate tabs make routing ambiguous. If either shows a login screen, log in before continuing — the extension can't log you in, and every prompt will fail with `logged_out`.
 
 **4. Git.** You're going to clone the repo. Check:
 
@@ -153,7 +153,7 @@ You'll see one line:
 [HH:MM:SS] extension connected (0.2.0) | https://chat.deepseek.com/ | 2 tab(s)
 ```
 
-That's the `/hello` registration. The extension found both provider tabs, read their URLs, and told the server it exists. The `2 tab(s)` is the count of supported provider tabs — not just the pinned one.
+That's the `/hello` registration. The extension reported the currently open supported provider tabs. `/tabs` later returns this cached snapshot; it is not a live health check.
 
 **Expected:**
 - `listening on 127.0.0.1:7331`
@@ -168,9 +168,9 @@ The popup's status dot is now **green**.
   2. Extension not reloaded after a change — in `brave://extensions`, click the reload button on the deepseek-connect card.
   3. No provider tab open — the extension needs at least one supported provider tab to register against.
 
-- **`extension connected ... | 0 tab(s)`.** The extension found no provider tabs. Open a fresh `chat.deepseek.com/` or `chat.qwen.ai/` tab and the extension re-registers on the next tab event.
+- **`extension connected ... | 0 tab(s)`.** The extension is connected but found no supported provider tabs. Open one tab for the provider you intend to use; `/hello` refreshes the tab inventory when tabs change.
 
-- **`extension connected ... | 1 tab(s)` when you expected 2.** One of your provider tabs is on a URL that doesn't match `DSC.PROVIDER_DOMAINS`. Check that the URLs are exactly `https://chat.deepseek.com/` and `https://chat.qwen.ai/` (no trailing path like `/login`). If a tab got auto-redirected to a login page, log in and the count will update.
+- **`extension connected ... | 1 tab(s)` when you expected 2.** One tab may be on a non-provider page, such as a login redirect, or may not have finished loading. Check `/tabs`; log in or navigate to the provider root as needed.
 
 - **`EADDRINUSE: 127.0.0.1:7331`.** Another process is on that port. Either kill it (`lsof -i :7331`) or change `EXTENSION_PORT` in `.env` to `7332` and the popup's Port to match.
 
@@ -235,7 +235,7 @@ Six things, in order:
 
 2. **The extension was polling `GET /next`.** The server dispatched the job: `{ action: 'next', provider: 'deepseek', prompt: '...', chatName: 'first-test' }`.
 
-3. **Background called `getWorkTab(null, 'deepseek')`.** Since `provider: 'deepseek'` was specified, background queried `chrome.tabs.query({ url: 'https://chat.deepseek.com/*' })` and picked your DeepSeek tab — bypassing the pinned `workTabId` because the request named a specific provider.
+3. **Background resolved the DeepSeek tab.** The request names `deepseek`; background requires exactly one tab whose hostname matches that provider.
 
 4. **Background sent `sendMessage({ action: 'sendPrompt', provider: 'deepseek', ... })` to `content.js`.** The router looked up `DSC_PROVIDERS['deepseek']` and dispatched to `providers/deepseek.js`'s `sendPrompt`. The DeepSeek provider probed selectors, enabled DeepThink and Search, typed the prompt, clicked send, waited for the answer, and extracted "hello".
 
@@ -245,17 +245,17 @@ Six things, in order:
 
 **If this didn't work:**
 
-- **curl hangs for 90+ seconds, then times out.** The extension never replied. Check the first terminal — if `dispatched` appears with no `probe` after it, the extension crashed or is stuck. In `brave://extensions`, click the "service worker" link; if it's greyed out, reload the extension.
+- **curl waits and then times out.** The default Node client timeout is 180 seconds; plain `curl` has no built-in request deadline unless one is specified. Check the first terminal — if `dispatched` appears with no provider progress or reply, inspect the provider tab and extension console. Restarting the server clears a job that never replies.
 
 - **`{"ok": false, "error": "auth_failed"}`.** Your `-H "Authorization: Bearer ..."` doesn't match `.env`'s `EXTENSION_TOKEN`. Compare exactly.
 
-- **`{"ok": false, "error": "extension_disconnected"}`.** Extension not connected. Step 4's `extension connected` line should have appeared.
+- **The request waits and then times out.** The extension has not polled the server, or is disconnected. Confirm its token and port match `.env`, then reload the extension. There is no `/health` endpoint; `/tabs` is only a cached `/hello` snapshot.
 
-- **`{"ok": false, "error": "input_not_found", "reason": "no_work_tab"}`.** No DeepSeek tab is open. The `provider: 'deepseek'` routing couldn't find a tab to dispatch to. Open `chat.deepseek.com` in a new tab and retry.
+- **`{"ok": false, "error": "ambiguous_provider_tab", ...}`.** No tab or multiple tabs match the requested provider's exact hostname. Open one provider tab or close extras, then retry.
 
-- **`{"ok": false, "error": "input_not_found"}`** (without `no_work_tab`). The DeepSeek tab exists but the input box isn't where the extension expects it. Confirm the tab is on `chat.deepseek.com` (not `/login`), then refresh.
+- **`{"ok": false, "error": "input_not_found"}`.** The matching DeepSeek tab exists but the input box isn't where the extension expects it. Confirm the tab is on `chat.deepseek.com` (not `/login`), then refresh.
 
-- **`{"ok": false, "error": "no_provider_loaded", ...}`** — actually this surfaces as `input_not_found` with `reason: 'no_provider_loaded'`. The DeepSeek provider module didn't register. Check that `manifest.json`'s `content_scripts.js` array includes `"providers/deepseek.js"`. Reload the extension and hard-reload the tab.
+- **`internal_error` with a provider registration failure in the reason/details.** Check that the config provider is enabled, or inspect the extension console and reload the extension and provider tab after built-in driver changes. `no_provider_loaded` is not a registered public error code.
 
 ---
 
@@ -310,7 +310,7 @@ Same content, same shape, different provider and URL. Note that `elapsedMs` is h
 
 Same six steps as DeepSeek, with two differences:
 
-1. **Background called `getWorkTab(null, 'qwen')`.** Provider-scoped tab selection — it queried `chrome.tabs.query({ url: 'https://chat.qwen.ai/*' })` and picked the Qwen tab, bypassing the pinned tab entirely. This is the whole point of multi-provider routing: two tabs are open, the request names one, the extension picks the right one.
+1. **Background resolved the Qwen tab.** The request names `qwen`; background requires exactly one tab whose hostname matches that provider.
 
 2. **`content.js` dispatched to `DSC_PROVIDERS['qwen']` instead of `DSC_PROVIDERS['deepseek']`.** The Qwen provider handled: age-modal dismissal (Qwen shows one on first use per session), anti-bot pacing (~5 seconds of `sleep()` between actions), typing the prompt plus a delimiter instruction, clicking send, and waiting for both `START_QWEN_REPLY` and `END_QWEN_REPLY` to appear before extracting.
 
@@ -318,13 +318,12 @@ The response shape is identical because the multi-provider contract guarantees i
 
 **If this didn't work:**
 
-- **`{"ok": false, "error": "input_not_found", "reason": "no_work_tab"}`.** No Qwen tab is open. Open `chat.qwen.ai` in a new tab.
-
-- **`{"ok": false, "error": "input_not_found"}`** (without `no_work_tab`). The Qwen tab exists but the input box wasn't found. The Qwen provider's selector for the input field is `textarea.message-input-textarea` with fallback to `textarea`. If Qwen redesigned, the input might be somewhere else. F12 the Qwen tab, check whether `document.querySelector('textarea')` returns anything. If not, Qwen's DOM has changed — see [selector-maintenance.md](selector-maintenance.md).
+- **`{"ok": false, "error": "ambiguous_provider_tab", ...}`.** No tab or multiple tabs match Qwen's exact hostname. Open one Qwen tab or close extras, then retry.
+- **`{"ok": false, "error": "input_not_found"}`.** The Qwen tab exists but the input box wasn't found. Check the provider tab and follow [selector-maintenance.md](selector-maintenance.md) if the DOM changed.
 
 - **`{"ok": false, "error": "invalid_response_format"}`.** Qwen produced a reply but didn't wrap it in the required `START_QWEN_REPLY` / `END_QWEN_REPLY` delimiters. The `details.rawPreview` field shows the first 200 chars of what the model actually said. Retry once — the model usually cooperates on attempt 2. If it fails three times in a row, the prompt's delimiter instruction is being ignored — check the actual prompt sent by looking at `step_4_verify_input.promptLen` in the trace.
 
-- **`{"ok": false, "error": "no_provider_loaded"}`** (as `input_not_found` with that reason). The Qwen provider module didn't register. Check that `manifest.json`'s `content_scripts.js` array includes `"providers/qwen.js"`. Reload the extension and hard-reload the tab.
+- **`internal_error` with a provider registration failure in the reason/details.** Check that the config provider is enabled, or inspect the extension console and reload the extension and provider tab after built-in driver changes. `no_provider_loaded` is not a registered public error code.
 
 ---
 

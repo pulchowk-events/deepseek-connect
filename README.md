@@ -2,7 +2,7 @@
 
 # deepseek-connect
 
-A Chromium extension and a Node server that drives real AI chat tabs — DeepSeek, Qwen, and future providers — over a local HTTP API. Any caller can use these chats as a free LLM endpoint without clipboard round-trips, Puppeteer fingerprinting, or credential handling.
+A Chromium extension and a Node server that drives real AI chat tabs — DeepSeek, Qwen, ChatGPT, and configurable providers — over a local HTTP API. Any caller can use these chats without clipboard round-trips, headless-browser automation, or handling provider credentials.
 
 **Contents**
 - [What this is](#what-this-is)
@@ -21,8 +21,8 @@ A Chromium extension and a Node server that drives real AI chat tabs — DeepSee
 
 Two pieces, one protocol, N providers:
 
-1. **A load-unpacked Chromium extension** (Manifest V3, plain JavaScript, no build step) that lives in the user's real Brave/Chrome profile. It finds the chat input on a real provider tab (DeepSeek, Qwen, Tongyi), types a prompt, clicks send, waits for the answer to finish streaming, and reads the reply back out. The DOM work is provider-specific; the routing is not.
-2. **A Node HTTP server** on `127.0.0.1:<port>` that the extension polls. Callers send `POST /chat` with messages and a `provider` field; the server queues the request, the extension dispatches to the right provider module, the reply comes back as `{ content, chat, url, elapsedMs }`.
+1. **A load-unpacked Chromium extension** (Manifest V3, plain JavaScript, no build step) that lives in the user's real browser profile. It drives exactly one open tab for the requested provider. Built-in drivers cover DeepSeek, Qwen, and ChatGPT; additional selector-based providers can be configured from the extension's Providers page.
+2. **A Node HTTP server** on `127.0.0.1:<port>` that the extension polls. Callers send `POST /chat` with messages and a required `provider` field; the server queues the request, the extension dispatches it to the matching provider, and the reply comes back as `{ content, chat, url, elapsedMs }`.
 
 The extension is the client of the server. The server is the client of the extension. HTTP long-poll sits between them because the flow is strictly alternating and the tab is single-threaded anyway — no WebSockets, no sockets, no build step, no shared state file, no credential storage.
 
@@ -61,7 +61,7 @@ The server prints `listening on 127.0.0.1:7331` and waits for the extension.
 - Enable **Developer mode** (top right)
 - Click **Load unpacked** → select the `deepseek-connect/` directory
 - Click the extension icon → paste the same `EXTENSION_TOKEN` from `.env`, plus the port (`7331` by default) → **Save**
-- Open one tab to `https://chat.deepseek.com/` **or** `https://chat.qwen.ai/` and leave it open
+- Open exactly one tab for the provider you intend to call (for example `https://chat.deepseek.com/`, `https://chat.qwen.ai/`, or `https://chatgpt.com/`) and leave it open. Multiple tabs matching the same provider are rejected as ambiguous.
 
 The extension registers with the server. The server terminal should now show:
 
@@ -90,7 +90,7 @@ You get back:
 }
 ```
 
-The `url` is the stable chat identity for retry. On the next call to the same `chat` name, pass `url` to `/open` and the extension navigates directly — no sidebar fuzzy-matching, no dependence on provider title auto-generation.
+The `url` is the stable chat identity for retry. Pass it to `/chat` when resending a prompt, or to `/open` when you only need to navigate. The extension goes directly to that conversation without relying on title matching.
 
 **4. Same prompt, Qwen instead:**
 
@@ -104,7 +104,7 @@ curl -s -X POST http://127.0.0.1:7331/chat \
 
 Same shape, different provider. The extension routes to `providers/qwen.js`, which handles Qwen-specific concerns (age-modal dismissal, anti-bot pacing, strict delimiter enforcement) transparently.
 
-**If `provider` is omitted, it defaults to `deepseek`.** Existing v0.1.x callers work unchanged.
+**`provider` is required** on `/chat`, `/open`, and `/reset`. The server rejects a missing or unknown provider instead of silently routing to another tab.
 
 ## What you get
 
@@ -112,10 +112,12 @@ Same shape, different provider. The extension routes to `providers/qwen.js`, whi
 
 | Route | What it does |
 |---|---|
-| `POST /chat` | Send `{ messages, chat?, provider? }`, receive `{ content, chat, url, elapsedMs }`. The main entry point. |
-| `POST /open` | Find-or-create a chat by name, or navigate directly to a persisted URL. Returns `{ existing, mode, url, debug }`. |
-| `POST /reset` | Reset a chat's state. Currently a no-op alias for `/open`. |
+| `POST /chat` | Send `{ messages, chat?, provider }`, receive `{ content, chat, url, elapsedMs }`. The main entry point. |
+| `POST /open` | Find-or-create a chat by name, or navigate directly to a persisted URL. Requires `chatName` and `provider`. |
+| `POST /reset` | Run the provider's reset behavior. Requires `chatName` and `provider`; current built-in implementations do not delete chat history. |
 | `GET /tabs` | Snapshot of provider tabs currently open, each with a `provider` field. |
+| `GET /version` | Return the server package version and extension build hash. |
+| `GET, POST, PUT, DELETE /providers` | List or manage selector-based config providers. Changes require the extension's Providers page to reconcile permissions and registration. |
 | `GET /next` | Extension long-poll. Not for callers. |
 | `POST /reply` | Extension's reply-to-server. Not for callers. |
 | `POST /progress` | Extension's live phase telemetry. Not for callers. |
@@ -136,7 +138,7 @@ try {
   const { content, url } = await dc.chat({
     messages: [{ role: 'user', content: 'Say hi' }],
     chat: 'my-chat',
-    provider: 'qwen',     // 'deepseek' (default), 'qwen', or a future provider
+    provider: 'qwen',     // required: deepseek, qwen, chatgpt, or an enabled config provider
   });
   console.log(content, url);
 } finally {
@@ -144,7 +146,7 @@ try {
 }
 ```
 
-Errors thrown by the client are `DSCError` instances carrying `{ code, reason, retryable, retryAfter, userFixable, details }`. See [docs/error-codes.md](docs/error-codes.md) for the full 21-code table and the decision rule for each.
+Errors thrown by the client are `DSCError` instances carrying `{ code, reason, retryable, retryAfter, userFixable, details }`. See [docs/error-codes.md](docs/error-codes.md) for the 24-code taxonomy. Error responses include retry metadata; `retryAfter` is in milliseconds.
 
 ## Providers
 
@@ -152,17 +154,14 @@ Currently supported:
 
 | Provider | Status | Notes |
 |---|---|---|
-| `deepseek` | Stable | The original target. DeepThink and Search auto-enabled with hard-fail on verification. Reasoning stream skipped during extraction. |
-| `qwen` | Stable | Added in v0.2.0. Age-modal dismisser runs before every action. Strict delimiter enforcement (`START_QWEN_REPLY` / `END_QWEN_REPLY`) prevents "Thinking..." false positives. 1-1.5s pacing between actions prevents bot detection. |
-| `tongyi` | Domain reserved | `tongyi.aliyun.com` is in `manifest.json` host permissions and `DSC.PROVIDER_DOMAINS`. No provider module yet; adding one requires only a `providers/tongyi.js` file. |
+| `deepseek` | Built-in | DeepThink and Search auto-enabled; reasoning text is excluded from answer extraction. |
+| `qwen` | Built-in | Age-modal handling, paced UI actions, and delimiter-based completion. |
+| `chatgpt` | Built-in | ChatGPT web UI driver with prompt-size checks and bot-challenge detection. |
+| `glm` | Config provider | Seeded selector-based provider for GLM on `chat.z.ai`; manage it through the extension's Providers page. |
+| Other config providers | User-configured | Define selectors, completion, pacing, and extraction through the Providers page; host permission is requested by the extension. |
+| `tongyi` | Not routable | A host permission remains reserved, but there is no provider module or config definition for it. |
 
-Adding a third provider is a **single-file change** plus three small registrations. See [docs/providers.md](docs/providers.md) for the complete walkthrough. The short version:
-
-1. Create `providers/claude.js` (or whatever provider) — a self-contained module exposing `{ name, ensureChat, sendPrompt, checkState, resetChat }` and registering itself into `globalThis.DSC_PROVIDERS['claude']`.
-2. Add the domain to `DSC.PROVIDER_DOMAINS` in `shared.js`.
-3. Add the domain to `manifest.json` (`host_permissions`, `content_scripts.matches`) and add `providers/claude.js` to `content_scripts.js` and `background.js`'s `sendToTab` re-injection list.
-
-Nothing in `content.js`, `src/server.js`, or `src/client.js` needs to change. The router and HTTP pipeline are already universal.
+For selector-based providers, use the Providers page and picker described in [docs/providers.md](docs/providers.md). Writing a new built-in DOM driver is maintainer-level work and requires updating the extension manifest, provider registries, server allowlist, and tests; the old three-registration checklist is not sufficient for that path.
 
 ## Documentation
 
@@ -173,7 +172,7 @@ Nothing in `content.js`, `src/server.js`, or `src/client.js` needs to change. Th
 | [docs/protocol.md](docs/protocol.md) | Writing an integrator or a client for the HTTP API — every route, request shape, response shape, error shape |
 | [docs/error-codes.md](docs/error-codes.md) | Handling a `DSCError` — the full taxonomy, which codes are retryable, which require the user to fix something |
 | [docs/integration-guide.md](docs/integration-guide.md) | Integrating deepseek-connect into a batch wizard or another consumer — lifecycle blueprint, batch loop, per-code error policy, multi-provider threading |
-| [docs/architecture.md](docs/architecture.md) | Understanding why the system is shaped this way — plugin registry, long-poll vs WebSockets, real Chrome vs Puppeteer, one chat per source, sticky tab |
+| [docs/architecture.md](docs/architecture.md) | Understanding the current provider registry, long-poll flow, URL-based chat identity, and strict provider-tab routing |
 | [docs/operations.md](docs/operations.md) | Running this day-to-day — reloading the extension after a code change, reading the trace log, recovering from `logged_out` / `rate_limited` / Qwen's age modal |
 | [docs/selector-maintenance.md](docs/selector-maintenance.md) | A provider DOM change broke extraction — per-provider selector fallbacks, the structural-walk strategy, the diagnostic snippet |
 | [docs/adr/](docs/adr/) | Understanding a specific load-bearing decision — eight ADRs cover the non-obvious choices |
@@ -191,34 +190,34 @@ Nothing in `content.js`, `src/server.js`, or `src/client.js` needs to change. Th
 - Qwen round-trip: age-modal dismissal, anti-bot pacing, strict delimiter enforcement
 - Per-source chat lifecycle: `/open { chatName }` finds an existing chat or navigates to a fresh one
 - **URL-based retry**: `/chat` response includes the actual chat URL; `/open { chatName, url }` navigates directly and skips the sidebar entirely. Proven against DeepSeek; works the same way on Qwen.
-- Sticky work tab: pinned in `chrome.storage` for the default (single-provider) case; provider-scoped queries bypass the pin when a specific provider is requested
+- Strict provider tab selection: exactly one tab must match the requested provider's exact hostname; the extension does not fall back to another provider
 - Queue serialization: concurrent `/chat` calls dispatch one at a time
 - Live progress stream: every content-script phase forwards to the server log while the request is running
 - Navigation guard: aborts with `user_navigated` if the work tab URL changes mid-stream
-- 21-code error taxonomy with `retryable` / `userFixable` / `retryAfter` metadata
+- 24-code error taxonomy with `retryable` / `userFixable` / `retryAfter` metadata
 - `createServer` / `createClient` / `DSCError` exported for direct `require()`
 
 **Not yet shipped (follow-ups):**
 
 - Aggregator `--extension` flag integration in `pulchowk-events-bot` (separate repo; transport + paste-extension exist, provider forwarding is next)
 - Wizard error beeps + needs-review skip (aggregator side)
-- Per-provider work tab ID storage (currently the pinned tab is single; provider-scoped queries bypass it)
+- Sticky or per-provider work-tab ID storage (routing now requires exactly one provider-matching tab per request)
 - Auto-pivot on rate limit (core loop fails with `rate_limited`; the wizard layers the pivot decision)
-- Provider unit tests (`tests/providers/*.test.js`)
-- Playwright e2e test
+- Broader DOM-driver integration coverage beyond the current ChatGPT and config-provider tests
+- Playwright end-to-end test
 - Generic toggle error codes (rename `deepthink_enable_failed` → `reasoning_toggle_failed` with a compatibility alias, deferred to 0.3.0)
 
 ## Constraints
 
-**One work tab at a time, per provider.** The extension's default behavior pins exactly one tab in `chrome.storage.local.workTabId`. When a request specifies a `provider`, the extension queries that provider's domain directly and bypasses the pin — so two providers can run sequentially without fighting over the pinned tab. Two concurrent requests against the same provider would still serialize through the queue.
+**Exactly one open tab per requested provider.** The extension requires one matching tab and rejects zero or multiple matches with `ambiguous_provider_tab`. Requests are serialized through the server queue, including requests for different providers.
 
-**Provider DOMs are not stable.** Both DeepSeek and Qwen ship redesigns regularly. Class names on both are build-hashed. The extension resolves selectors through per-provider tier lists; the primary anchors are structural (text content, element shape, `aria-` attributes) rather than class names. When a provider redesigns, [docs/selector-maintenance.md](docs/selector-maintenance.md) is the recovery playbook, and [docs/providers.md](docs/providers.md) covers the case where a provider needs a fresh selector strategy entirely.
+**Provider DOMs are not stable.** DeepSeek's selectors are maintained in `selectors.js`; Qwen and ChatGPT have driver-specific selectors; config providers use their saved selector definitions. When a provider redesigns, [docs/selector-maintenance.md](docs/selector-maintenance.md) is the recovery playbook, and [docs/providers.md](docs/providers.md) covers selector editing through the Providers page.
 
 **Extension code changes require a reload.** Reloading the unpacked extension does **not** re-inject content scripts into already-open tabs. After any change to `content.js`, `providers/*.js`, `selectors.js`, or `shared.js`, the work tab must be hard-reloaded (`Ctrl+Shift+R`) for the new code to take effect. When multiple provider modules changed, close all provider tabs and reopen one fresh. This is the single most common "my fix didn't work" mistake — see [docs/operations.md#reload-discipline](docs/operations.md#reload-discipline).
 
-**No build step, by design.** Plain JavaScript, load-unpacked. `manifest.json` loads `shared.js → selectors.js → providers/deepseek.js → providers/qwen.js → content.js` in that order; `background.js` uses `importScripts('shared.js')`. If a file grows past ~800 lines, refactor into modules with `import` — but no bundler, no webpack, no vite.
+**No build step, by design.** Plain JavaScript, load-unpacked. `manifest.json` loads `shared.js`, `selectors.js`, the three built-in provider drivers, then `content.js`; config-provider files are registered dynamically. `background.js` uses `importScripts('shared.js')`.
 
-**No per-request server-side timeout in v0.2.0.** If the extension crashes after `/next` returns a job, the server's `inFlight` map blocks the queue until restart. Documented in [docs/protocol.md#queue-state-machine](docs/protocol.md#queue-state-machine).
+**No per-request server-side timeout.** The Node client times out after 180 seconds by default, but that does not cancel the server's in-flight queue entry. If the extension never replies, restart the server to clear the queue. See [docs/protocol.md#queue-state-machine](docs/protocol.md#queue-state-machine).
 
 ## License
 

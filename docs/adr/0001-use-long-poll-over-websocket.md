@@ -42,7 +42,7 @@ No WebSocket. No SSE. No libraries. Node's `node:http` module and the browser's 
 
 ## Alternatives considered
 
-**WebSocket.** Rejected on four grounds: service worker lifecycle management, debug surface, need for reconnect logic, and no workflow benefit (strict alternation). Full reasoning in [architecture.md#1-long-poll-over-websockets](../../architecture.md#1-long-poll-over-websockets).
+**WebSocket.** Rejected on four grounds: service worker lifecycle management, debug surface, need for reconnect logic, and no workflow benefit (strict alternation). Full reasoning in [architecture.md#1-long-poll-over-websockets](../architecture.md#1-long-poll-over-websockets).
 
 **Server-Sent Events.** Rejected for the same reasons as WebSocket, plus the constraint that SSE is one-directional — the extension would still need HTTP POSTs for `/reply`, so the SSE channel adds a second transport without replacing the existing one.
 
@@ -50,8 +50,8 @@ No WebSocket. No SSE. No libraries. Node's `node:http` module and the browser's 
 
 ## References
 
-- [architecture.md#1-long-poll-over-websockets](../../architecture.md#1-long-poll-over-websockets)
-- [protocol.md#long-poll-lifecycle](../../protocol.md#long-poll-lifecycle)
-- [protocol.md#queue-state-machine](../../protocol.md#queue-state-machine)
+- [architecture.md#1-long-poll-over-websockets](../architecture.md#1-long-poll-over-websockets)
+- [protocol.md#long-poll-lifecycle](../protocol.md#long-poll-lifecycle)
+- [protocol.md#queue-state-machine](../protocol.md#queue-state-machine)
 - `src/server.js` `LONG_POLL_MS`, `pump()`, `waiting[]`
 - `background.js` `pollLoop()`

@@ -7,6 +7,8 @@
 - **Amends:** [0003 — one chat per source](0003-one-chat-per-source.md), [0004 — sticky work tab](0004-sticky-work-tab-over-target-tab-id.md), [0007 — structural sidebar walk](0007-structural-sidebar-walk.md)
 - **Superseded by:** —
 
+> **Current implementation note:** This ADR records the original multi-provider design. Current APIs require an explicit provider, and `background.js` requires exactly one exact-host tab match; the optional default-provider and sticky-tab compatibility described in earlier versions no longer apply. Config providers use the Providers page rather than the built-in driver registration checklist.
+
 ## Context
 
 The original architecture was DeepSeek-only. `content.js` contained all DOM manipulation logic, hardcoded to DeepSeek's chat page: sidebar walk from "New chat" text, DeepThink and Search toggle auto-enable, `.ds-assistant-message-main-content` for answer extraction, reasoning stream detection via `.ds-think-content`.
@@ -88,7 +90,7 @@ If the provider string is normalized, defaulted, or interpreted anywhere else, t
 - **Three registration points to miss.** Adding a provider is single-file *for the provider module*, but the three registrations are separate edits in separate files. The `no_provider_loaded` error mode exists specifically because missing a registration is easy. Documented extensively in `providers.md#the-registration-checklist` and the `PROVIDER CONTRACT` comment, but still a real friction point.
 - **Providers share no implementation.** A new provider that needs the same tiered selector pattern as DeepSeek has to copy the pattern (or the code) into its own file. Two providers don't justify a shared `selector-tiers.js` abstraction; a third provider might. The current state is "duplication over premature abstraction" — acceptable, but the trade-off is real.
 - **`shared.js` DSC.ERR is a mirror of `src/errors.js` CODES, not an import.** A new error code requires updating both files. The multi-provider refactor added `INVALID_RESPONSE_FORMAT` to both; the mirror is checked by a test that asserts the key sets match. But the mirror exists because `shared.js` is a classic script and can't `require()` the Node module — a Manifest V3 constraint, not a design choice.
-- **Provider-specific error codes.** `deepthink_enable_failed` and `search_enable_failed` only fire from DeepSeek; `invalid_response_format` only fires from Qwen. A wizard that switches on `err.code` needs to know which provider each code can come from — documented in `error-codes.md#provider-attribution`, but it's a mental model integrators have to build.
+- **Provider-specific error codes.** `deepthink_enable_failed` and `search_enable_failed` apply to DeepSeek; `invalid_response_format` may apply to provider response extraction. Integrators should use the current registry in `error-codes.md`.
 
 ### Neutral
 
@@ -160,7 +162,7 @@ Rejected because the rate window is unknown (could be 30 minutes or 3 hours depe
 - [architecture.md#8-plugin-registry-over-feature-flags](../architecture.md#8-plugin-registry-over-feature-flags) — the decision in prose, with the failure modes each alternative would produce
 - [providers.md](../providers.md) — the how-to for adding a provider, with the registration checklist and the Qwen case study
 - [protocol.md#provider-threading](../protocol.md#provider-threading) — the field's path through every layer
-- [error-codes.md#provider-attribution](../error-codes.md#provider-attribution) — which codes can be raised by which providers
+- [error-codes.md#registered-codes](../error-codes.md#registered-codes) — registered error metadata
 - [selector-maintenance.md#deepseek-selectors](../selector-maintenance.md#deepseek-selectors) and [#qwen-selectors](../selector-maintenance.md#qwen-selectors) — the per-provider selector strategies
 - `shared.js` — the `PROVIDER CONTRACT` comment block (the spec in code)
 - `content.js` — the router (~40 lines, the only file that dispatches by provider name)

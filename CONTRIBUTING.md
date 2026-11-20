@@ -67,7 +67,7 @@ deepseek-connect/
 ├── shared.js             constants, DSC.ERR, DSC.MSG, DSC.VERSION
 ├── selectors.js          tiered selector resolution
 ├── content.js            DOM manipulation (the only file with querySelector)
-├── background.js         poll loop, message router, sticky tab
+├── background.js         poll loop, message router, exact provider-tab routing
 ├── popup.html            status UI
 ├── popup.js              config + status reads
 ├── src/
@@ -198,7 +198,7 @@ DeepSeek redesigns its DOM regularly. Fixing extraction when it breaks is the mo
 5. Test with a real round-trip
 6. Commit with a message that says *what changed in DeepSeek* and *how the new tier finds the element*
 
-Selector PRs are reviewed against one criterion: does the new tier use a stable anchor (text, structure, `aria-*`) or a fragile one (build-hashed class name)? Class-name anchors are rejected. See [docs/architecture.md#7-structural-sidebar-walk-over-class-names](docs/architecture.md#7-structural-sidebar-walk-over-class-names) for why.
+Selector PRs are reviewed against one criterion: does the new tier use a stable anchor (text, structure, `aria-*`) or a fragile one (build-hashed class name)? Class-name anchors are rejected. See [docs/architecture.md#7-structural-sidebar-walk-as-fallback](docs/architecture.md#7-structural-sidebar-walk-as-fallback) for why.
 
 ## Pull request checklist
 
@@ -227,7 +227,7 @@ Five things. Every one of them exists because a version of this was proposed and
 
 **3. Retry logic inside the extension or the client.** Retry is caller policy (see [docs/error-codes.md](docs/error-codes.md) and [docs/integration-guide.md#sendwithretry](docs/integration-guide.md#sendwithretry)). A client that retries silently hides rate-limit conditions and breaks the caller's attempt-counting. The extension does one attempt and reports faithfully; the client throws on non-2xx and lets the caller decide.
 
-**4. New error codes without the metadata.** Every code needs `retryable`, `userFixable`, `retryAfter`, and `http` set in `src/errors.js` before it's raised anywhere. A code without metadata is a code whose cause is ambiguous. See [docs/error-codes.md#adding-a-new-code](docs/error-codes.md#adding-a-new-code).
+**4. New error codes without the metadata.** Every code needs `retryable`, `userFixable`, `retryAfter`, and `http` set in `src/errors.js` before it's raised anywhere. A code without metadata is a code whose cause is ambiguous. See [docs/error-codes.md#registered-codes](docs/error-codes.md#registered-codes).
 
 **5. Class-name anchors for selectors.** A `querySelector('.dc04ec1d')` works today and breaks on the next DeepSeek deploy. Reviewers reject these even if they "work right now" — a selector that has a shelf life of days is not a fix.
 

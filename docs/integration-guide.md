@@ -1,8 +1,8 @@
 # Integration guide
 
-How to wire `deepseek-connect` into a batch wizard. This doc assumes you're a developer or an LLM working on a *different* repository — `pulchowk-events/aggregator`, most likely — and you need to add a `--extension` mode to an existing batch paste loop without breaking the existing `--manual` mode. If you're looking for the wire protocol, read [protocol.md](protocol.md). If you're looking for what each error means, read [error-codes.md](error-codes.md). This doc is the concrete blueprint that shows how the three fit together into a working integration.
+How to integrate `deepseek-connect` into a batch wizard. The aggregator repository is separate and is not included here; this is a reference design, not a description of its current scripts. Before applying any example, inspect the current batch command, transport code, and persistence format in that repository. Do not copy the pseudocode as if it were an existing implementation. For the wire contract, read [protocol.md](protocol.md); for failures, read [error-codes.md](error-codes.md).
 
-Multi-provider support adds two concerns to the integration: how `provider` threads through the transport abstraction, and how a wizard decides whether to pivot between providers on failure. Both are covered below.
+The examples cover provider threading and optional provider pivot policy. `/chat`, `/open`, and `/reset` require an explicit provider. Built-in names are `deepseek`, `qwen`, and `chatgpt`; selector-based config providers must be configured and enabled in the extension before use. `tongyi` is not currently routable.
 
 **Contents**
 - [What you're building](#what-youre-building)
@@ -24,7 +24,7 @@ Multi-provider support adds two concerns to the integration: how `provider` thre
 
 ## What you're building
 
-The `batch paste` command in the aggregator currently has a manual clipboard loop. For each source, it:
+If the target batch command uses a manual clipboard flow, its per-source work commonly looks like this:
 
 1. Copies an LLM prompt to the clipboard
 2. Opens the LLM in a browser for the user
@@ -34,9 +34,9 @@ The `batch paste` command in the aggregator currently has a manual clipboard loo
 6. Writes the extractor to `data/batch/<run>/generated/<name>.js`
 7. Advances to the next source
 
-The user does 76 of those paste round-trips per batch. It takes 80 minutes. It also silently produces the wrong-clipboard-copy bug about once per batch.
+The amount of manual work and its failure modes depend on the target repository and batch size; verify those against its current implementation rather than assuming a fixed source count or runtime.
 
-You're replacing steps 1-5 with an HTTP round-trip. The batch loop *structure* stays identical — same per-source iteration, same identity check, same extraction, same file write, same advance. What changes is the transport underneath: instead of clipboard + human, the loop calls `dc.chat()` and gets `{ content, url }` back in 4-15 seconds.
+An extension transport can replace the manual input/reply exchange with an HTTP round-trip. Preserve the target wizard's existing validation, identity check, extraction, file writing, and review flow. The extension's response includes `{ content, url, elapsedMs }`; actual latency depends on provider and response.
 
 **The design goal is that the batch loop doesn't know which transport it's using.** Same loop, same per-source logic, same error handling — a transport-agnostic interface that happens to have two implementations. That's what lets `--manual` survive as a fallback with zero duplicated orchestration.
 
@@ -48,13 +48,13 @@ Before you write a line of integration code, confirm these are true on the machi
 
 1. **`deepseek-connect` is installed.** Either as a sibling repo via `npm link`, a git dependency in `package.json`, or a relative `require('../../../deepseek-connect/src/server')`. `require('deepseek-connect')` must resolve. If it doesn't, the rest of this doc is moot.
 
-2. **The extension is loaded and connected.** Open `brave://extensions`, load unpacked, set the token in the popup. Open at least one provider tab (`chat.deepseek.com` or `chat.qwen.ai`) per provider the batch will use. The server terminal (once you start it) should print `extension connected (0.2.0) | ... | N tab(s)`.
+2. **The extension is loaded and connected.** Open `brave://extensions`, load unpacked, set the token in the popup. Open exactly one tab for each provider the batch will use. Zero or multiple matching tabs for a requested provider fail with `ambiguous_provider_tab`.
 
 3. **`EXTENSION_TOKEN` is set.** Same value in `.env` and the popup.
 
-4. **You know the current `batch paste` shape.** Read `scripts/batch/paste.js` in the aggregator before writing the integration.
+4. **You have inspected the current batch command.** The aggregator is a separate repository; locate its present entry point and tests instead of assuming it still uses `scripts/batch/paste.js`.
 
-5. **Both provider tabs are logged in** (if the batch mixes providers). A logged-out tab produces `logged_out` on every request routed to it.
+5. **Each selected provider tab is logged in.** A logged-out tab produces `logged_out` on requests routed to it.
 
 ## The transport abstraction
 
@@ -69,16 +69,16 @@ One interface, two implementations. The batch loop only sees the interface.
 class Transport {
   /**
    * Establish the chat for a source. Called once per source, before chat().
-   * Extension: opens the named chat via URL (if persisted) or sidebar
-   *            fuzzy match (if not).
+   * Extension: opens the named chat by URL (if supplied) or by the provider's
+   *            normal ensure-chat behavior.
    * Manual: no-op — the clipboard loop doesn't track chats.
    */
   async open({ chatName, provider, url }) {}
 
   /**
    * Send the prompt, wait for the reply, extract the code block, return it.
-   * Extension: POST /chat with provider field, wait for JSON, return
-   *            { content, url, elapsedMs }.
+   * Extension: POST /chat with required provider and optional saved URL,
+   *            wait for JSON, return { content, url, elapsedMs }.
    * Manual: copy to clipboard, poll for user paste, read reply, extract
    *         via existing extractCodeFromClipboard.
    *
@@ -87,7 +87,7 @@ class Transport {
    * Throws:  DSCError with { code, retryable, retryAfter, userFixable,
    *          details, trace } on failure.
    */
-  async chat({ chatName, provider, prompt }) {}
+  async chat({ chatName, provider, prompt, url }) {}
 
   /**
    * Clean up. Called once, in a finally block, whether the batch succeeded
@@ -142,8 +142,8 @@ class ExtensionTransport extends Transport {
     }
     this.client = createClient({ token: this.token, port: this.boundPort });
     this.started = true;
-    // Readiness probe — fails fast with extension_disconnected if the
-    // extension isn't connected.
+    // /tabs returns the last /hello snapshot. It does not prove that the
+    // extension is connected or that a requested provider has one tab.
     await this.client.tabs();
   }
 
@@ -151,11 +151,12 @@ class ExtensionTransport extends Transport {
     return this.client.open({ chatName, url, provider });
   }
 
-  async chat({ chatName, provider, prompt, timeoutMs }) {
+  async chat({ chatName, provider, prompt, url, timeoutMs }) {
     const result = await this.client.chat({
       messages: [{ role: 'user', content: prompt }],
       chat: chatName,
       provider,
+      url,
       timeoutMs: timeoutMs || 180000,
     });
     return {
@@ -182,8 +183,9 @@ Notes:
 - **`port: EXTENSION_PORT from env`.** Not `port: 0`. The extension's popup is configured for a specific port; a wizard on port 0 would bind fine but the extension would never poll it. `EXTENSION_PORT` in `.env` is the source of truth.
 - **Attach-or-own.** If the port is taken (another wizard, another deepseek-connect instance), `EADDRINUSE` is caught and the transport attaches to the existing server. The `ownsServer` flag tracks whether `shutdown()` should stop the server. This lets two wizards coexist — they share one server, both talk to the same extension, and the queue serializes their requests.
 - **`start()` is separate from the constructor.** Constructor is cheap (no I/O). `start()` binds the socket and does the readiness probe.
-- **`await this.client.tabs()` in `start()`.** This is the readiness probe. It will throw `extension_disconnected` if the extension isn't connected within the client's timeout. Better to fail here than three sources into the batch.
-- **`open()` accepts `url`.** When the wizard has a persisted chat URL from a prior run, it passes it here. The transport forwards it to `/open { chatName, url, provider }`, the extension navigates directly, and the sidebar walk is skipped entirely.
+- **`await this.client.tabs()` in `start()`.** This only confirms the server answered. `/tabs` is the latest `/hello` snapshot and can be empty or stale; before dispatch, verify that exactly one tab is listed for each selected provider. A request with zero or multiple matches fails with `ambiguous_provider_tab`.
+- **Provider availability is not inferred from a successful `start()`.** The extension may not have registered yet, and config providers must be enabled in the extension. Fail preflight clearly rather than treating `/tabs` as a readiness guarantee.
+- **Saved URL on retries.** For retries that send immediately, pass the saved URL with `chat()`: `/chat` forwards `url` to the queued work and the extension navigates before sending. `/open` remains useful when the caller wants to navigate without sending.
 - **Errors propagate as-is.** `dc.chat()` throws `DSCError` with `{ code, retryable, retryAfter, userFixable, details, trace }`. The batch loop's error handler switches on these fields; the transport doesn't wrap or re-interpret them.
 
 ## Lifecycle
@@ -197,12 +199,11 @@ try {
   await transport.start();
   const results = await runBatch(transport, sources);
   printReport(results);
-  process.exit(results.needsReview.length === 0 ? 0 : 1);
+  process.exitCode = results.needsReview.length === 0 ? 0 : 1;
 } catch (err) {
-  // Startup failure — extension disconnected, token missing, port
-  // conflict with no attachable server. Fatal; don't try to run sources.
+  // Fatal startup/configuration failure. Do not start the batch.
   console.error('batch failed to start:', err.message);
-  process.exit(2);
+  process.exitCode = 2;
 } finally {
   await transport.shutdown();
 }
@@ -214,7 +215,7 @@ Three rules:
 
 2. **`start()` failures are fatal, per-source failures aren't.** If `start()` throws, the batch can't run at all. Exit with a distinct code. Per-source failures become `needs-review` entries.
 
-3. **Signal handlers.** If the user hits Ctrl+C mid-batch, the `finally` should still fire. Either `try/finally` around the batch loop, or `process.on('SIGINT', async () => { await transport.shutdown(); process.exit(130); })`.
+3. **Signal handlers.** Keep cleanup in `finally`; avoid calling `process.exit()` before async cleanup completes. If installing a `SIGINT` handler, stop accepting more work, let the loop unwind, run `shutdown()`, then set `process.exitCode = 130`.
 
 ## The batch loop
 
@@ -230,18 +231,13 @@ async function runBatch(transport, sources, chatMap) {
 
     try {
       // Step 1 — determine the provider for this source.
-      // Priority: explicit per-source field > CLI --provider > default
+      // Priority: explicit per-source field > CLI --provider > batch default
       const provider = source.provider || globalOpts.provider || 'deepseek';
+      source.provider = provider;
 
-      // Step 2 — establish the chat. Two paths:
-      //   a) We have a persisted URL from a prior run → navigate directly
-      //   b) First time → open/create by name
+      // Step 2 — use the saved URL, if any. /chat accepts url and navigates
+      // directly before sending, so a retry uses the same conversation.
       const mapEntry = chatMap.get(source.name, provider);
-      if (mapEntry && mapEntry.url) {
-        await transport.open({ chatName: source.name, provider, url: mapEntry.url });
-      } else {
-        await transport.open({ chatName: source.name, provider });
-      }
 
       // Step 3 — send the prompt, with retry
       const prompt = buildPrompt(source);
@@ -249,6 +245,7 @@ async function runBatch(transport, sources, chatMap) {
         chatName: source.name,
         provider,
         prompt,
+        url: mapEntry && mapEntry.url,
       });
 
       // Step 4 — persist the URL for retry
@@ -297,7 +294,7 @@ async function runBatch(transport, sources, chatMap) {
       }
       results.needsReview.push({
         source: source.name,
-        provider: source.provider || 'deepseek',
+        provider: source.provider,
         code: handled.code,
         reason: handled.reason,
         details: handled.details,
@@ -355,13 +352,13 @@ Key design choices:
 
 ## sendWithRetry
 
-The retry policy is its own function because it's shared between the `chat()` call and the `open()` call — both can throw retryable errors, and both should follow the same per-attempt cap.
+The retry policy wraps the `chat()` call so the same prompt, provider, and saved URL can be retried under one bounded policy.
 
 ```js
-async function sendWithRetry(transport, { chatName, provider, prompt, timeoutMs }) {
+async function sendWithRetry(transport, { chatName, provider, prompt, url, timeoutMs }) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      return await transport.chat({ chatName, provider, prompt, timeoutMs });
+      return await transport.chat({ chatName, provider, prompt, url, timeoutMs });
     } catch (err) {
       if (!isRetryable(err)) throw err;
 
@@ -389,7 +386,7 @@ function isRetryable(err) {
   if (typeof err.retryable === 'boolean') return err.retryable;
   // Manual transport: user pressed Ctrl+C, abort.
   if (err.code === 'manual_aborted') return false;
-  return true;
+  return false;
 }
 ```
 
@@ -403,7 +400,7 @@ The per-code decision comes directly from [error-codes.md](error-codes.md). The 
 async function handleError(err, label, source, transport, chatMap, results) {
   const code = err.code || 'unknown';
   const reason = err.reason || err.message || 'unknown error';
-  const currentProvider = source.provider || 'deepseek';
+  const currentProvider = source.provider;
 
   // ── Early returns for codes that need special handling ─────────────
 
@@ -411,15 +408,6 @@ async function handleError(err, label, source, transport, chatMap, results) {
   // skip silently — the user just clicked "Skip" in the popup.
   if (code === 'user_skipped') {
     return { action: 'needs-review', code, reason: 'skipped by user' };
-  }
-
-  // no_provider_loaded: registration bug, not user-fixable. Don't beep.
-  if (reason === 'no_provider_loaded') {
-    return {
-      action: 'needs-review',
-      code: 'no_provider_loaded',
-      reason: `provider "${currentProvider}" module not registered — check manifest.json and background.js`,
-    };
   }
 
   // ── Provider pivot on rate limit ───────────────────────────────────
@@ -492,7 +480,7 @@ function pivotProviderFor(currentProvider) {
 
 Then in the batch loop's catch block, `handleError` returns `{ action: 'retry-source' }`, which the loop interprets by decrementing `i` and re-running the source — but now with `source.provider` set to the fallback.
 
-**The chat map handles the URL separation.** When the source retries on Qwen, `chatMap.get(source.name, 'qwen')` returns `null` (first Qwen attempt for this source), so `transport.open({ chatName, provider: 'qwen' })` navigates to a fresh Qwen chat. The prompt is resent to Qwen, and Qwen's LLM answers without seeing DeepSeek's prior attempt. That's correct — the pivot is a fresh start on a different provider, not a continuation.
+**The chat map handles the URL separation.** When the source retries on Qwen, `chatMap.get(source.name, 'qwen')` returns `null` (first Qwen attempt for this source), so the `/chat` call omits `url` and Qwen starts a fresh chat. The prompt is resent to Qwen, and Qwen's LLM answers without seeing DeepSeek's prior attempt. That's correct — the pivot is a fresh start on a different provider, not a continuation.
 
 **Mark the source so it doesn't pivot twice:**
 
@@ -533,7 +521,7 @@ Key: `<sourceName>::<provider>`. Value: `{ url, at }` where `at` is a Unix times
 
 **When to prune:** the map grows by one entry per source per provider. For a 76-source batch across two providers, that's up to 152 entries — trivial. For a wizard that runs many batches over months, the map accumulates. Prune on a time window (entries older than 30 days) or on a count limit (keep last 500 entries).
 
-**When to clear:** a fresh run directory starts with an empty map. There's no reason to reuse URLs across runs — a batch rerun wants fresh chats so the LLM doesn't see the prior run's attempts.
+**When to clear:** decide based on the batch's retry/resume semantics. Reusing the map resumes the saved conversations; clearing it starts fresh chats. Do not assume a rerun should always discard or always reuse prior URLs.
 
 ## Flag parsing and defaults
 
@@ -570,10 +558,8 @@ function parseProviderFlag(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--provider' && argv[i + 1]) {
       const name = argv[i + 1].toLowerCase();
-      // Validate against the providers the extension knows about
-      const valid = ['deepseek', 'qwen', 'tongyi'];
-      if (!valid.includes(name)) {
-        throw new Error(`--provider must be one of: ${valid.join(', ')}`);
+      if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
+        throw new Error('--provider must be a valid provider name');
       }
       return name;
     }
@@ -588,11 +574,11 @@ Priority order for per-source provider assignment:
 2. `--provider` CLI flag (batch-wide default)
 3. `'deepseek'` (hardcoded fallback)
 
-The `classes.json` field is the escape hatch — if a specific source is known to need Qwen (e.g., DeepSeek always rate-limits it), the user can set it explicitly. The CLI flag is the common case — "run this whole batch on Qwen."
+The `classes.json` field is the escape hatch — if a specific source is known to need another provider, the user can set it explicitly. Validate every selected name against the current `/providers` response before processing: built-ins are `deepseek`, `qwen`, and `chatgpt`; config providers must be enabled in the extension. `tongyi` is not routable.
 
 ## Concurrency
 
-**One batch at a time per server.** The extension pins exactly one work tab per provider (via `getWorkTab(provider)`) and registers with exactly one server token. Two `batch paste` runs starting at the same time would each start their own server (both failing with `EADDRINUSE` on the configured port unless one attaches), and the extension would only be connected to one.
+**Requests are serialized by one server queue.** The extension resolves each request to exactly one tab for its named provider. Multiple consumers may share a server and queue, but their requests still execute serially; avoid sharing a run directory or mutable chat map between processes.
 
 **Two wizards, one server, one queue.** The attach-or-own pattern in `ExtensionTransport` lets two wizards share one server. Their requests queue in FIFO order and dispatch serially. This works but produces interleaved logs (both wizards' requests appear in the same log). For coordinated batches, run them sequentially.
 
@@ -663,9 +649,9 @@ Expected: `OK: {"content":"console.log(42);","url":"https://chat.qwen.ai/c/...",
 | Bug | DeepSeek test | Qwen test |
 |---|---|---|
 | Token mismatch | `auth_failed` | `auth_failed` |
-| Extension not loaded | `extension_disconnected` | `extension_disconnected` |
-| Provider tab not open | `input_not_found` with `no_work_tab` | `input_not_found` with `no_work_tab` |
-| Provider module not registered | `input_not_found` with `no_provider_loaded` | `input_not_found` with `no_provider_loaded` |
+| Extension/server authentication mismatch | `auth_failed` | `auth_failed` |
+| Provider tab missing or duplicated | `ambiguous_provider_tab` | `ambiguous_provider_tab` |
+| Provider module/config unavailable | `bad_request` or `internal_error` | `bad_request` or `internal_error` |
 | Provider's DOM drifted | `input_not_found` or `dom_drift` | `input_not_found` (Qwen) |
 | Qwen's delimiter enforcement broken | — | `invalid_response_format` |
 
@@ -685,8 +671,8 @@ Before submitting the integration PR:
 
 **Batch loop:**
 
-- [ ] `transport.open({ chatName, provider, url? })` called once per source, before `transport.chat()`
-- [ ] `transport.chat()` called with `chat: chatName` and `provider`
+- [ ] A saved URL is passed to `/chat` when sending a retry; use `/open` only when navigating without sending
+- [ ] `transport.chat()` called with `chatName`, `provider`, `prompt`, and optional saved `url`
 - [ ] Per-source failures caught and pushed to `needs-review`, do not abort the batch
 - [ ] `extractFromContent` produces the same code as `extractCodeFromClipboard` in manual mode
 - [ ] Identity check preserved
@@ -712,7 +698,7 @@ Before submitting the integration PR:
 - [ ] `isRetryable()` reads `err.retryable` from metadata
 - [ ] `rate_limited` retries once after `err.retryAfter`, not three times
 - [ ] `user_skipped` skips silently (early-return before bucket-D beep)
-- [ ] `no_provider_loaded` marks needs-review without beeping (not user-fixable)
+- [ ] Provider selection is validated against `/providers`; a config provider must be enabled and routable
 - [ ] `invalid_response_format` (Qwen) retried through the standard bucket-A policy
 - [ ] Bucket A retryable errors retry up to 3 attempts before `needs-review`
 - [ ] Bucket D errors beep immediately, no auto-retry
@@ -731,7 +717,7 @@ Before submitting the integration PR:
 - [ ] `--extension` throws if `EXTENSION_TOKEN` is missing
 - [ ] No flag + token present → `ExtensionTransport`
 - [ ] No flag + token absent → `ManualClipboardTransport`
-- [ ] `--provider <name>` validated against the supported provider list
+- [ ] `--provider <name>` and per-source overrides validated against `/providers` before processing
 
 **Preservation of manual mode:**
 

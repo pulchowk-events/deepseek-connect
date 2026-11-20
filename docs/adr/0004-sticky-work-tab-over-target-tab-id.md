@@ -1,10 +1,10 @@
 # 0004 — Sticky work tab over caller-supplied targetTabId
 
-- **Status:** Accepted
+- **Status:** Superseded
 - **Date:** 2026-11-16
 - **Deciders:** maintainer
 - **Supersedes:** —
-- **Superseded by:** —
+- **Superseded by:** [0008 — multi-provider plugin architecture](0008-multi-provider-plugin.architecture.md), as refined by current exact-provider tab routing
 
 ## Context
 
@@ -35,7 +35,7 @@ Selection algorithm in `getWorkTab()`:
 ### Negative
 
 - **No caller override.** A caller can't say "use tab 42 for this prompt, tab 43 for the next." Every request in a session uses the same tab. For the batch wizard workflow, that's the requirement, not a limitation. For a caller who wants to parallelize across tabs, this extension isn't the right tool.
-- **Session lifetime.** If the user closes the work tab mid-batch, the extension re-picks on next use — which means the batch suddenly types into a *different* DeepSeek tab that the user might be reading. The user has to know not to close the tab mid-batch. See [operations.md#symptom-input_not_found](../../operations.md#symptom-input_not_found).
+- **Session lifetime.** If the user closes the work tab mid-batch, the request now fails unless exactly one matching tab remains. See [operations.md](../operations.md).
 - **Storage coupling.** `chrome.storage.local.workTabId` persists across browser restarts. After a browser restart, the stored ID is stale and the extension re-picks. This is handled but it's an extra state variable to reason about.
 
 ### Neutral
@@ -55,7 +55,7 @@ Selection algorithm in `getWorkTab()`:
 
 ## References
 
-- [architecture.md#4-sticky-work-tab-over-targettabid](../../architecture.md#4-sticky-work-tab-over-targettabid)
-- [protocol.md#post-chat](../../protocol.md#post-chat) — `targetTabId` field
-- [operations.md#symptom-input_not_found](../../operations.md#symptom-input_not_found)
+- [architecture.md#4-exact-provider-tab-routing](../architecture.md#4-exact-provider-tab-routing)
+- [protocol.md#post-chat](../protocol.md#post-chat) — `targetTabId` field
+- [operations.md#symptom-input_not_found](../operations.md#symptom-input_not_found)
 - `background.js` `getWorkTab()`, `chrome.storage.local.workTabId`

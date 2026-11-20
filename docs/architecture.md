@@ -4,6 +4,8 @@ How the pieces fit together and why. Read this before touching code — the modu
 
 Companion docs: [protocol.md](protocol.md) specifies the wire contract that follows from these decisions; [providers.md](providers.md) is the how-to for adding a provider; [selector-maintenance.md](selector-maintenance.md) is the recovery playbook when a provider's DOM changes; the [ADR folder](adr/) records each decision atomically. This doc is the cohesive narrative that ties them together.
 
+> **Current routing contract:** Every work request must name a built-in (`deepseek`, `qwen`, `chatgpt`) or enabled config provider. Background routing requires exactly one tab with that provider's exact hostname; it does not pin a sticky work tab or fall back to another provider. Older sticky-tab descriptions and diagrams below are historical context; see [protocol.md](protocol.md) and [background.js](../background.js) for current behavior.
+
 **Contents**
 - [System overview](#system-overview)
 - [Lifecycle of one prompt](#lifecycle-of-one-prompt)
@@ -12,7 +14,7 @@ Companion docs: [protocol.md](protocol.md) specifies the wire contract that foll
   - [1. Long-poll over WebSockets](#1-long-poll-over-websockets)
   - [2. Real Chrome over Puppeteer](#2-real-chrome-over-puppeteer)
   - [3. One chat per source, URL-primary identity](#3-one-chat-per-source-url-primary-identity)
-  - [4. Sticky work tab with provider-scoped override](#4-sticky-work-tab-with-provider-scoped-override)
+  - [4. Exact provider-tab routing](#4-exact-provider-tab-routing)
   - [5. URL navigation over new-chat button](#5-url-navigation-over-new-chat-button)
   - [6. Answer-block extraction over whole-message](#6-answer-block-extraction-over-whole-message)
   - [7. Structural sidebar walk as fallback](#7-structural-sidebar-walk-as-fallback)
@@ -38,7 +40,7 @@ flowchart TD
     Ext["Extension service worker<br/>background.js"] -->|"GET /next"| Wait
     Wait -->|"action: next<br/>{requestId, prompt, chatName, provider}"| Ext
 
-    Ext -->|"getWorkTab(provider)<br/>(queries provider domain)"| Pinned["Provider tab<br/>(DeepSeek / Qwen / Tongyi)"]
+    Ext -->|"resolveWorkTab(provider)<br/>(requires one exact-host match)"| Pinned["Provider tab<br/>(DeepSeek / Qwen / ChatGPT / config)"]
 
     Ext -->|"chrome.tabs.sendMessage<br/>action: sendPrompt<br/>provider: 'qwen'"| Router["content.js<br/>(router)"]
     Router -->|"DSC_PROVIDERS['qwen']<br/>.sendPrompt(...)"| Prov["providers/qwen.js<br/>(provider module)"]
@@ -86,7 +88,7 @@ sequenceDiagram
     S-->>E: {action, requestId, chatName, provider: "qwen", prompt}
     S->>C: (still waiting, connection open)
 
-    E->>E: getWorkTab(provider="qwen")<br/>queries chat.qwen.ai tabs<br/>bypasses pinned workTabId
+    E->>E: resolveWorkTab(provider="qwen")<br/>requires one exact-host match
     E->>R: sendMessage({action: ensureChat, provider: "qwen"})
     R->>P: DSC_PROVIDERS["qwen"].ensureChat(name)
     P->>D: dismissAgeModal()<br/>wait for input
@@ -117,7 +119,7 @@ sequenceDiagram
 
 Seven things worth naming from the sequence:
 
-**`getWorkTab(provider)` runs before any message dispatch.** This is the multi-provider tab-routing. When `provider` is specified, `getWorkTab` queries that provider's domain directly (`chrome.tabs.query({ url: 'https://chat.qwen.ai/*' })`) and bypasses the pinned `workTabId`. This is what makes "both DeepSeek and Qwen tabs are open, route to Qwen" work correctly. See [decision 4](#4-sticky-work-tab-with-provider-scoped-override).
+**`resolveWorkTab(provider)` runs before any message dispatch.** It requires exactly one tab on the requested provider's exact hostname. Zero or multiple matches fail with `ambiguous_provider_tab`; there is no sticky-tab fallback. See [decision 4](#4-exact-provider-tab-routing).
 
 **`ensureChat` runs per source, before `sendPrompt`, on the provider's own terms.** For DeepSeek, this means "find in sidebar, else navigate to `/`." For Qwen, this means "dismiss age modal, wait for input, return fresh." Each provider decides what "ensure the chat is ready" means — the router doesn't impose a shared meaning. See [decision 3](#3-one-chat-per-source-url-primary-identity).
 
@@ -167,7 +169,7 @@ The rule: **no logic beyond `providerForUrl`, no DOM, no chrome APIs.** It's a c
 
 Every other constant that both background and content need lives here. Every constant that only one side needs lives in that side's file.
 
-**`DSC.ERR` is a mirror of `src/errors.js`'s `CODES`**, not the source of truth. The duplication is a Manifest V3 consequence — `shared.js` is a classic script (no `import`), and content scripts can't `require()` the Node module. The duplication is checked by a test that asserts the two maps agree (see [error-codes.md#adding-a-new-code](error-codes.md#adding-a-new-code)).
+**`DSC.ERR` is a mirror of `src/errors.js`'s `CODES`**, not the source of truth. The duplication is a Manifest V3 consequence — `shared.js` is a classic script (no `import`), and content scripts can't `require()` the Node module. The duplication is checked by a test that asserts the two maps agree (see [error-codes.md#registered-codes](error-codes.md#registered-codes)).
 
 ### `selectors.js` — DeepSeek's DOM contract
 
@@ -197,7 +199,7 @@ if (msg.action === DSC.MSG.SEND_PROMPT) {
 // ...
 ```
 
-The `no_provider_loaded` error is what surfaces when a provider module failed to load (usually a `manifest.json` registration bug — see [providers.md#the-registration-checklist](providers.md#the-registration-checklist)). It's a distinctive error because it means "the router received a request it can't dispatch," which only happens when the provider's content script registration is broken.
+`content.js` reports the internal `no_provider_loaded` condition when a module is missing. It is not a registered public `DSCError`; the server/client may expose it as `internal_error`. For config providers, verify that the provider is enabled and registered; for built-in changes, reload the extension and the provider tab.
 
 The router also emits a `[dsc:router:diag]` console.debug at load time, reporting the URL, hostname, frame context, and registered providers. That diagnostic is what F12 shows when someone asks "is the provider loaded on this tab?"
 
@@ -232,11 +234,11 @@ See [providers.md#case-study-qwen](providers.md#case-study-qwen) for the full re
 
 ~450 lines. The service worker. Everything that talks to `chrome.tabs`, `chrome.storage`, and `fetch` lives here.
 
-The rule: **background owns tab lifecycle and provider routing, not tab content.** It picks the work tab (provider-aware, see [decision 4](#4-sticky-work-tab-with-provider-scoped-override)), navigates it, re-injects content scripts when they crash, and forwards messages to and from the content script. It never reads the DOM directly.
+The rule: **background owns tab lifecycle and provider routing, not tab content.** It resolves a provider-matching tab (see [decision 4](#4-exact-provider-tab-routing)), navigates it, re-injects content scripts when needed, and forwards messages to and from the content script. It never reads the DOM directly.
 
 Two load-bearing pieces for the multi-provider behavior:
 
-**`getWorkTab(targetTabId, provider)`** — provider-aware tab selection. When `provider` is specified, queries that provider's domain directly via `chrome.tabs.query({url: DSC.PROVIDER_DOMAINS[provider] + '*'})` and returns the first non-active match. Bypasses the pinned `workTabId` entirely — because if the user has a DeepSeek tab pinned and a Qwen request arrives, reusing the pinned DeepSeek tab would type Qwen's DOM logic into DeepSeek's page and fail. When `provider` is unset (v0.1.x callers), preserves the sticky behavior: pinned tab first, else first non-active across all supported domains.
+**`resolveWorkTab(targetTabId, provider)`** — resolves the provider tab in `background.js`. It requires an explicit routable provider and exactly one tab with the matching exact hostname; when `targetTabId` is supplied it must match that provider. There is no pinned-tab selection or first-match fallback.
 
 **`register()`** — the `/hello` body includes a per-tab `provider` field so callers can see which provider each tab belongs to without parsing URLs. The `provider` field comes from `DSC.providerForUrl(t.url)`. This is what makes `/tabs` usable for debugging multi-provider state.
 
@@ -256,7 +258,7 @@ The three collections — `queue[]`, `waiting[]`, `inFlight` Map — are the ent
 
 ~180 lines. Zero-dependency HTTP client.
 
-The rule: **client.js doesn't retry, and it threads `provider` through.** Every method throws `DSCError` on non-2xx and returns the parsed body on 2xx. `chat()` and `open()` accept a `provider` parameter and forward it in the request body. The `provider` field defaults to nothing on the client side — if the caller omits it, the server defaults to `'deepseek'`, which preserves v0.1.x caller behavior. A client that retried silently would hide rate-limit conditions and make the caller's attempt-counting wrong. A client that defaulted provider explicitly would change what old callers see — better to leave the default to the server, which has the single source of truth.
+The rule: **client.js doesn't retry, and it threads `provider` through.** Every method throws `DSCError` on non-2xx and returns the parsed body on 2xx. `chat()`, `open()`, and `reset()` accept a provider, and the server rejects missing or unknown names. A client that retried silently would hide rate-limit conditions and make the caller's attempt-counting wrong.
 
 ### `src/errors.js` — the shared taxonomy
 
@@ -307,25 +309,19 @@ Each decision below shapes multiple modules. Reversing any of them requires unde
 
 Qwen has the same behavior — its titles are paraphrases too.
 
-**The URL-based fix:** Every provider's `sendPrompt` returns the actual chat URL in its response. The wizard persists this in `chat-map.json`. On retry, `POST /open { chatName, url }` navigates directly via `chrome.tabs.update({ url })`, skips the sidebar walk entirely, and the LLM sees its prior turn. This was proven end-to-end after the fix: the second prompt to the same chat correctly referenced the first turn's content.
+**The URL-based fix:** Every provider's `sendPrompt` returns the actual chat URL in its response. The caller persists this URL and supplies it to `/chat` to navigate directly before sending a retry, or to `/open` when it needs to navigate without sending. This skips the sidebar walk and keeps the prior conversation context.
 
-**Consequence:** The `url` field on every `/chat` response and every `/reply` body. The `targetUrl` threading through `enqueue` → `pump` → `/next` → `handleNext`. The `if (work.targetUrl)` branch in `handleNext` that navigates directly and skips `ensureChat`. The sidebar walk is still present as `ensureChat`'s fallback (for the first send per source, and for callers that didn't persist the URL), but it's no longer the primary mechanism. See [ADR 0003](adr/0003-one-chat-per-source.md) and its amendment by [ADR 0008](adr/0008-multi-provider-plugin-architecture.md).
+**Consequence:** The `url` field on `/chat` success responses and the `targetUrl` threading through enqueue → `/next` → extension dispatch. The sidebar walk remains a fallback when a URL is not supplied. See [ADR 0003](adr/0003-one-chat-per-source.md) and its amendment by [ADR 0008](adr/0008-multi-provider-plugin.architecture.md).
 
-### 4. Sticky work tab with provider-scoped override
+### 4. Exact provider-tab routing
 
-**Decision:** The extension pins exactly one tab in `chrome.storage.local.workTabId` on first use. **When a request specifies a provider, the extension queries that provider's domain directly and bypasses the pin.** When no provider is specified (v0.1.x callers), the pin is used.
+**Current decision:** The request must specify a provider, and the extension requires exactly one open tab whose hostname matches that provider. A caller-supplied `targetTabId` is accepted only if it matches the same provider. There is no pinned-tab routing or implicit provider fallback.
 
 **Context:** With multiple provider tabs open — which happens, the user might be chatting in a DeepSeek tab while the batch runs against Qwen — the extension needs to route each request to the right tab.
 
-**Alternative considered:** Extend the pinned tab to a per-provider map `{deepseek: 123, qwen: 456}`. Rejected because the persistence is fragile in a different way — when a Qwen tab closes and reopens, its new tab ID is different, and the map needs to be invalidated for that provider. The domain-query approach is simpler: `chrome.tabs.query({url: 'https://chat.qwen.ai/*'})` returns whatever Qwen tabs are currently open, and if there's exactly one, use it. No persistence needed for the provider-scoped path.
+**Why exact-one routing:** Selecting an arbitrary tab when several match could send a prompt to the wrong conversation. Refusing ambiguous matches is safer and gives the caller an actionable error.
 
-**Consequence:** `getWorkTab(targetTabId, provider)` in `background.js` has three branches:
-
-1. `targetTabId` specified → validate it against the requested provider (or against any supported URL if no provider), hard-fail if mismatched.
-2. `provider` specified, no `targetTabId` → query that provider's domain, return first non-active match, hard-fail with `no_work_tab` if none.
-3. Neither → existing sticky behavior: check `workTabId` in storage, pick from all supported domains if stale, cache the pick.
-
-This preserves the v0.1.x behavior for existing callers (they don't send provider, they get sticky-tab), while adding provider-scoped routing for new callers (they send provider, they get the right tab). Both paths work; the distinction is visible in `/tabs`'s `provider` field per tab. See [ADR 0004](adr/0004-sticky-work-tab-over-target-tab-id.md) and its amendment by [ADR 0008](adr/0008-multi-provider-plugin-architecture.md).
+**Consequence:** `resolveWorkTab(targetTabId, provider)` in `background.js` refuses missing or unroutable providers with `bad_request`, and returns `ambiguous_provider_tab` for an invalid target tab or anything other than one exact-host match. See [ADR 0004](adr/0004-sticky-work-tab-over-target-tab-id.md) for the superseded sticky-tab design and [ADR 0008](adr/0008-multi-provider-plugin.architecture.md) for later routing changes.
 
 ### 5. URL navigation over new-chat button
 
@@ -370,7 +366,7 @@ Qwen is stricter: it requires both `START_QWEN_REPLY` and `END_QWEN_REPLY` to ap
 
 **Consequence:** Qwen doesn't have a sidebar walk at all. Its `ensureChat` returns `{existing: false, mode: 'fresh'}` unconditionally — the provider assumes the caller is on a fresh page or will navigate. If a Qwen retry needs to find a chat by name, it can't; it must use the URL. This is documented as a known limitation, mitigated by `chat-map.json` in the aggregator layer. DeepSeek's walk remains for the "no URL yet" case, but its failure no longer blocks the wizard — a missed match just opens a fresh chat, and the retry-from-URL path handles subsequent turns.
 
-See [ADR 0007](adr/0007-structural-sidebar-walk.md) and its amendment by [ADR 0008](adr/0008-multi-provider-plugin-architecture.md), and [selector-maintenance.md](selector-maintenance.md) for the DeepSeek walk's recovery playbook.
+See [ADR 0007](adr/0007-structural-sidebar-walk.md) and its amendment by [ADR 0008](adr/0008-multi-provider-plugin.architecture.md), and [selector-maintenance.md](selector-maintenance.md) for the DeepSeek walk's recovery playbook.
 
 ### 8. Plugin registry over feature flags
 
@@ -398,7 +394,7 @@ See [ADR 0007](adr/0007-structural-sidebar-walk.md) and its amendment by [ADR 00
 2. **The provider contract is documented in code.** `shared.js`'s `PROVIDER CONTRACT` comment block is the spec — the interface is four methods, the registration is three places, and both are visible from the router's top. A contributor reading `content.js` sees the reference to the contract block, reads it, and knows what to implement.
 3. **Provider internals are truly isolated.** `providers/qwen.js` doesn't import anything from `providers/deepseek.js`. `providers/deepseek.js` doesn't know Qwen exists. When a provider redesigns, its file is the only file that changes for that provider's DOM. When a provider is added, its file is the only new file for that provider's DOM.
 
-**Consequence:** The `globalThis.DSC_PROVIDERS` global, the `content.js` router, the three-registration checklist, and the Qwen provider's fully self-contained design (no shared helpers). The cost is the `no_provider_loaded` failure mode when a registration is missed — a distinctive error the router surfaces specifically, with the hostname included, so the diagnosis is "which registration is missing" rather than "why isn't it working." See [ADR 0008](adr/0008-multi-provider-plugin-architecture.md) for the full reasoning.
+**Consequence:** The `globalThis.DSC_PROVIDERS` registry and `content.js` router. Missing registrations may surface as an internal error; config providers are registered dynamically, while built-in modules are loaded by the extension. See [ADR 0008](adr/0008-multi-provider-plugin.architecture.md) for the original design rationale.
 
 ## The two streaming guards
 
@@ -454,7 +450,7 @@ One line per boundary. Useful when tracing "which module is responsible for X".
 - **`content.js` → `providers/*.js`** — the router dispatches by `msg.provider` name. It calls `provider.ensureChat`, `provider.sendPrompt`, `provider.checkState`, `provider.resetChat`, and does nothing else. Four methods, one direction.
 - **`providers/*.js` → `content.js`** — return values from the four methods. Structured objects; no side effects beyond DOM manipulation and `chrome.runtime.sendMessage({type: 'dsc_phase'})`.
 - **`background.js` → `content.js`** via `chrome.tabs.sendMessage` — `ensureChat`, `sendPrompt`, `checkState`, `resetChat`, each with `provider` field. Four actions, all structured, no DOM assumptions in background.
-- **`background.js` → `getWorkTab(provider)`** — tab selection is provider-aware. When `provider` is set, query that domain; when unset, use pinned tab.
+- **`background.js` → `resolveWorkTab(targetTabId, provider)`** — tab selection requires an explicit provider and one exact-host match.
 - **`content.js` → `background.js`** via `chrome.runtime.sendMessage` — `dsc_phase` (progress), `state` (popup UI). Two types, both fire-and-forget.
 - **`background.js` → `src/server.js`** via `fetch` — `/hello`, `/next`, `/reply`, `/progress`. HTTP, authenticated with `EXTENSION_TOKEN`.
 - **`src/server.js` → `src/client.js`** (via the caller) — the HTTP response body is what the caller's `dc.chat()` resolves to. `DSCError` on non-2xx, parsed body on 2xx.

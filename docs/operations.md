@@ -4,6 +4,8 @@ Day-2 runbook for `deepseek-connect`. This doc is indexed by *symptom*, not by c
 
 Multi-provider adds two wrinkles to the runbook. First, the trace phase names are **provider-specific** — DeepSeek emits `probe`/`waitInput`/`toggleDeepthink`, Qwen emits `step_1_dismiss_modal`/`step_2_find_input`. The phase names are the fastest way to identify which provider actually ran. Second, the reload discipline is stricter: **all** provider tabs must be closed before reloading, not just the one you're testing.
 
+> **Current routing/error behavior:** provider choice is required, and exactly one tab must match its exact hostname. Missing or duplicate tabs return `ambiguous_provider_tab`; `/tabs` is only a cached snapshot. The `no_work_tab` and `no_provider_loaded` sections below describe old behavior, not registered public codes. `extension_disconnected` is registered but is not a current readiness probe. For current error metadata see [error-codes.md](error-codes.md).
+
 If you're setting up for the first time, read [getting-started.md](getting-started.md) first. If you're modifying the extension or adding a provider, read [architecture.md](architecture.md) and [providers.md](providers.md) before touching anything here. If you're integrating into a wizard, [integration-guide.md](integration-guide.md) has the caller-side operational concerns.
 
 **Contents**
@@ -14,10 +16,7 @@ If you're setting up for the first time, read [getting-started.md](getting-start
 - [Symptom: batch hangs with no `dispatched` line](#symptom-batch-hangs-with-no-dispatched-line)
 - [Symptom: batch hangs after `dispatched` line](#symptom-batch-hangs-after-dispatched-line)
 - [Symptom: `content` is wrong](#symptom-content-is-wrong)
-- [Symptom: `no_work_tab`](#symptom-no_work_tab)
-- [Symptom: `no_provider_loaded`](#symptom-no_provider_loaded)
 - [Symptom: `logged_out`](#symptom-logged_out)
-- [Symptom: `extension_disconnected`](#symptom-extension_disconnected)
 - [Symptom: `rate_limited`](#symptom-rate_limited)
 - [Symptom: `input_not_found`](#symptom-input_not_found)
 - [Symptom: `dom_drift`](#symptom-dom_drift)
@@ -131,12 +130,11 @@ Find your symptom. Jump to the section.
 | `dispatched` appears but no phase line after it | [Batch hangs after `dispatched` line](#symptom-batch-hangs-after-dispatched-line) |
 | Content is reasoning text, not the answer | [Content is wrong](#symptom-content-is-wrong) |
 | `extract source: 'raw'` in the trace | [Content is wrong](#symptom-content-is-wrong) |
-| `input_not_found` with `reason: 'no_work_tab'` | [`no_work_tab`](#symptom-no_work_tab) |
-| `input_not_found` with `reason: 'no_provider_loaded'` | [`no_provider_loaded`](#symptom-no_provider_loaded) |
+| `ambiguous_provider_tab` | Open exactly one tab for the requested provider |
 | Every request returns `logged_out` | [`logged_out`](#symptom-logged_out) |
-| Every request returns `extension_disconnected` | [`extension_disconnected`](#symptom-extension_disconnected) |
+| Requests wait and then time out | Verify extension poller, token, port, and server log |
 | Every request returns `rate_limited` | [`rate_limited`](#symptom-rate_limited) |
-| Every request returns `input_not_found` (without `no_work_tab`) | [`input_not_found`](#symptom-input_not_found) |
+| Every request returns `input_not_found` | [`input_not_found`](#symptom-input_not_found) |
 | Every request returns `dom_drift` | [`dom_drift`](#symptom-dom_drift) |
 | Qwen returns `invalid_response_format` | [`invalid_response_format`](#symptom-invalid_response_format-qwen) |
 | A prompt fails with `user_navigated` | [`user_navigated`](#symptom-user_navigated) |
@@ -256,7 +254,7 @@ The last `~ <id8> <phase>` line tells you where — and **which provider** based
 
 **Stuck after `probe`, before `sendClick`.**
 - `waitInput {found: false}` — input box not found. See [input_not_found](#symptom-input_not_found).
-- `toggleDeepthink {ok: false}` — DeepThink couldn't be enabled. See [deepthink_enable_failed](error-codes.md#deepthink_enable_failed).
+- `toggleDeepthink {ok: false}` — DeepThink couldn't be enabled. See the [registered error codes](error-codes.md#registered-codes).
 - `setInput {promptLen, typedLen}` with `typedLen < promptLen` — the input didn't accept the full text. Usually a timing issue; retry once.
 
 **Stuck after `sendClick`, no `firstMsg`.** The send clicked but DeepSeek didn't respond. Either the click didn't register (see `send_failed`) or the page is rate-limited. Check the DeepSeek tab visually — if there's no user message visible, the send didn't go through.
@@ -303,6 +301,8 @@ The last `~ <id8> <phase>` line tells you where — and **which provider** based
 
 ## Symptom: `no_work_tab`
 
+The current implementation uses `ambiguous_provider_tab` for missing or duplicate matching tabs. The details below describe an earlier implementation and should not be used to diagnose current errors.
+
 **Diagnosis:** `{"ok": false, "error": "input_not_found", "reason": "no_work_tab"}`. The `reason` field is `no_work_tab`, which means `getWorkTab(provider)` returned `null`. **No tab with the requested provider is open.**
 
 This is a **user-fixable** case: the user needs to open a tab for the provider that the request targets. The `input_not_found` code is technically accurate but the `reason` is what the user sees and acts on.
@@ -325,11 +325,13 @@ The extension re-registers via `/hello` when a new provider tab opens (the tab U
 
 **If `/tabs` shows a tab for the provider but you're still getting `no_work_tab`:** the tab's URL might not match `DSC.PROVIDER_DOMAINS[provider]` exactly. For example, `provider: 'qwen'` looks for URLs starting with `https://chat.qwen.ai/`. A tab at `https://chat.qwen.ai/chat/abc` matches (startsWith), but `https://chat.qwenlm.ai/` does not (old domain). Check the tab's URL in `/tabs`.
 
-**Common cause:** the user closed the Qwen tab thinking they were done with it, then a batch run targets Qwen sources. In batch wizards, add a pre-flight check — see [integration-guide.md#pattern-3--probe-server-readiness-before-a-batch](integration-guide.md#pattern-3--probe-server-readiness-before-a-batch).
+**Common cause:** the user closed the Qwen tab thinking they were done with it, then a batch run targets Qwen sources. Preflight should verify one matching Qwen tab using the current `/tabs` snapshot and still handle `ambiguous_provider_tab` on dispatch. See [integration-guide.md#prerequisites](integration-guide.md#prerequisites).
 
 ---
 
 ## Symptom: `no_provider_loaded`
+
+The content script may log an internal provider-registration failure, but this is not a registered public error code. The current client normalizes unknown extension errors to `internal_error`. See [providers.md](providers.md) for provider registration.
 
 **Diagnosis:** `{"ok": false, "error": "input_not_found", "reason": "no_provider_loaded"}`. The `reason` field is `no_provider_loaded`, which means `content.js`'s router couldn't find `DSC_PROVIDERS[msg.provider]`. **The provider module isn't registered.**
 
@@ -385,6 +387,8 @@ The failing tab's `url` should be a chat URL. If it's a login page (`/login`, `/
 ---
 
 ## Symptom: `extension_disconnected`
+
+The current `/tabs` route is not a live connectivity probe, and requests may wait until their client timeout if the extension is not polling. Verify the extension's token, port, poll loop, and server log instead.
 
 **Diagnosis:** every request returns `extension_disconnected`. The server is up but no extension is talking to it. Three possible causes.
 
@@ -861,9 +865,9 @@ If a provider you expect is `undefined`, its module didn't register. Check `mani
 
 Three situations. In each, the fix is in the provider's selector logic, not in any caller:
 
-1. **`dom_drift` fires with `requiredMissing: ["input"]` or `["toggleDeepThink"]` or `["toggleSearch"]`.** A DeepSeek selector broke. Escalate to [selector-maintenance.md#deepseek](selector-maintenance.md#deepseek).
+1. **`dom_drift` fires with `requiredMissing: ["input"]` or `["toggleDeepThink"]` or `["toggleSearch"]`.** A DeepSeek selector broke. Escalate to [selector-maintenance.md#deepseek-selectors](selector-maintenance.md#deepseek-selectors).
 
-2. **`input_not_found` fires repeatedly on Qwen** (no `no_work_tab` reason, Qwen tab exists, but the input selector doesn't match). The Qwen provider's `selectors.input()` needs a new tier. Escalate to [selector-maintenance.md#qwen](selector-maintenance.md#qwen).
+2. **`input_not_found` fires repeatedly on Qwen** (the Qwen tab exists, but the input selector doesn't match). The provider's input selector may need a new tier. Escalate to [selector-maintenance.md#qwen-selectors](selector-maintenance.md#qwen-selectors).
 
 3. **`chat_not_found` fires on a DeepSeek chat you know exists** — the sidebar fuzzy match failed. Could be a fuzzy-match bug (chat title doesn't contain the source name — common) or a sidebar walk bug. The primary mitigation is URL-based retry (see [getting-started.md#step-7--url-based-retry](getting-started.md#step-7--url-based-retry)) — but if you're seeing this on the first send per source, the sidebar walk is the last resort.
 
