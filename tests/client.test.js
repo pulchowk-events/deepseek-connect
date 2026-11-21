@@ -72,6 +72,7 @@ test('chat() sends POST /chat with the right body and returns the parsed result'
     assert.deepStrictEqual(sent.messages, [{ role: 'user', content: 'hello' }]);
     assert.strictEqual(sent.chat, 'my-chat');
     assert.strictEqual(sent.url, 'https://chat.deepseek.com/a/chat/s/saved-chat');
+    assert.match(sent.requestId, /^[0-9a-f-]{36}$/);
   } finally {
     await srv.close();
   }
@@ -91,6 +92,42 @@ test('chat() throws DSCError with auth_failed on 401', async () => {
         assert.strictEqual(err.http, 401);
         assert.strictEqual(err.retryable, false);
         assert.strictEqual(err.userFixable, true);
+        return true;
+      }
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test('chat() preserves server dispatch-safe retry metadata', async () => {
+  const srv = await mockServer((req, res) => {
+    jsonReply(res, 429, {
+      ok: false,
+      error: 'rate_limited',
+      reason: 'provider rate limited after submit',
+      retryable: false,
+      retryAfter: 30000,
+      userFixable: true,
+      requestId: 'rate-limit-uncertain',
+      executionState: 'outcome_unknown',
+    });
+  });
+  try {
+    const dc = createClient({ token: TOKEN, port: srv.port });
+    await assert.rejects(
+      () => dc.chat({
+        messages: [{ role: 'user', content: 'hello' }],
+        requestId: 'rate-limit-uncertain',
+      }),
+      (err) => {
+        assert.ok(err instanceof DSCError);
+        assert.equal(err.code, CODES.RATE_LIMITED);
+        assert.equal(err.retryable, false);
+        assert.equal(err.retryAfter, 30000);
+        assert.equal(err.userFixable, true);
+        assert.equal(err.requestId, 'rate-limit-uncertain');
+        assert.equal(err.executionState, 'outcome_unknown');
         return true;
       }
     );
@@ -253,4 +290,40 @@ test('client timeout produces extension_timeout', async () => {
   } finally {
     await srv.close();
   }
+});
+
+test('malformed or empty 2xx response is not treated as success', async () => {
+  const srv = await mockServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('');
+  });
+  try {
+    const dc = createClient({ token: TOKEN, port: srv.port });
+    await assert.rejects(
+      () => dc.tabs(),
+      (err) => err.code === CODES.INTERNAL_ERROR && err.reason === 'invalid_success_response'
+    );
+  } finally { await srv.close(); }
+});
+
+test('caller abort reports an uncertain outcome and preserves the request ID', async () => {
+  const srv = await mockServer(() => {});
+  const controller = new AbortController();
+  try {
+    const dc = createClient({ token: TOKEN, port: srv.port });
+    const pending = dc.chat({
+      messages: [{ role: 'user', content: 'possibly submitted' }],
+      requestId: 'abort-request-1',
+      signal: controller.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    await assert.rejects(pending, (err) => {
+      assert.equal(err.code, CODES.EXTENSION_TIMEOUT);
+      assert.equal(err.requestId, 'abort-request-1');
+      assert.equal(err.executionState, 'outcome_unknown');
+      assert.equal(err.retryable, false);
+      return true;
+    });
+  } finally { await srv.close(); }
 });

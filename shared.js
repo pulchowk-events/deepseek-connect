@@ -10,9 +10,9 @@
   'use strict';
 
   const DSC = {
-    VERSION: '0.2.0',
+    VERSION: '0.3.0',
 
-    BUILD_HASH: 'cfg-providers-retry-after-20261120f',
+    BUILD_HASH: 'batch-state-20261121c',
 
     STORAGE: {
       TOKEN: 'dsc_token',
@@ -52,6 +52,8 @@
 
     RESPONSE_TIMEOUT_MS: 90000,
 
+    STAGE_DELAY_MS: 1000,
+
     MSG: {
       ENSURE_CHAT: 'ensureChat',
       SEND_PROMPT: 'sendPrompt',
@@ -79,6 +81,106 @@
     DELIMITER_RE: /^[ \t]*(\S+)[ \t]+START_(\S+)[ \t]*$([\s\S]*?)^[ \t]*\1[ \t]+END_\2[ \t]*$/m,
 
     FENCE_JS_RE: /```(?:js|javascript)\s*\n([\s\S]*?)```/g,
+  };
+
+  // One-shot DOM insertion for prompt text. This intentionally does not
+  // synthesize keystrokes: large prompts can trigger framework watchers for
+  // every character and cause the provider tab to freeze. It also avoids the
+  // clipboard parsing/confirmation behavior of a real Ctrl+V paste.
+  DSC.fillPromptInput = function fillPromptInput(el, text) {
+    if (!el) return { ok: false, method: 'missing' };
+    const value = String(text == null ? '' : text);
+    try { el.focus(); } catch (_) {}
+
+    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+      const proto = el.tagName === 'TEXTAREA'
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (setter && setter.set) {
+        setter.set.call(el, value);
+      } else {
+        el.value = value;
+      }
+      el.dispatchEvent(new Event('beforeinput', { bubbles: true, cancelable: true, data: value, inputType: 'insertFromPaste' }));
+      el.dispatchEvent(new Event('input', { bubbles: true, data: value, inputType: 'insertFromPaste' }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } else {
+      try {
+        const dt = typeof DataTransfer === 'function' ? new DataTransfer() : null;
+        if (dt) dt.setData('text/plain', value);
+        if (typeof ClipboardEvent === 'function') {
+          el.dispatchEvent(new ClipboardEvent('paste', {
+            clipboardData: dt,
+            bubbles: true,
+            cancelable: true,
+          }));
+        }
+      } catch (_) {}
+      if (DSC.readPromptInput(el).length !== value.length) {
+        try {
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          document.execCommand('delete');
+          document.execCommand('insertText', false, value);
+          el.dispatchEvent(new InputEvent('beforeinput', {
+            bubbles: true,
+            cancelable: true,
+            data: value,
+            inputType: 'insertFromPaste',
+          }));
+          el.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            data: value,
+            inputType: 'insertFromPaste',
+          }));
+        } catch (_) {}
+      }
+    }
+
+    const actual = DSC.readPromptInput(el);
+    const normalizedActual = actual.replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n');
+    const normalizedValue = value.replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n');
+    return {
+      ok: actual.length > 0 && normalizedActual === normalizedValue,
+      method: el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' ? 'value' : 'paste',
+      length: actual.length,
+    };
+  };
+
+  DSC.readPromptInput = function readPromptInput(el) {
+    if (!el) return '';
+    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') return el.value || '';
+    return el.innerText || el.textContent || '';
+  };
+
+  DSC.clickSendOnce = function clickSendOnce(button) {
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+    button.click();
+    return true;
+  };
+
+  DSC.waitForPageStable = async function waitForPageStable(timeoutMs, stableMs) {
+    const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
+    const stableFor = Number.isFinite(stableMs) && stableMs >= 0 ? stableMs : 1000;
+    const startedAt = Date.now();
+    let observedUrl = location.href;
+    let stableSince = startedAt;
+    while (Date.now() - startedAt < timeout) {
+      const currentUrl = location.href;
+      if (currentUrl !== observedUrl) {
+        observedUrl = currentUrl;
+        stableSince = Date.now();
+      }
+      if (document.readyState === 'complete' && Date.now() - stableSince >= stableFor) {
+        return { ok: true, url: currentUrl, readyState: document.readyState };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return { ok: false, url: location.href, readyState: document.readyState };
   };
 
   // Idempotent injection: a second load of the same build keeps the first DSC.
@@ -349,22 +451,7 @@
     const stopPresent = () => S.stop.length > 0 && q(S.stop, true) !== null;
 
     function setInput(el, text) {
-      el.focus();
-      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, text);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      } else {
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        sel.removeAllRanges();
-        sel.addRange(range);
-        document.execCommand('delete');
-        document.execCommand('insertText', false, text);
-        el.dispatchEvent(new InputEvent('input', { bubbles: true }));
-      }
+      return DSC.fillPromptInput(el, text);
     }
     function readInput(el) {
       if (!el) return '';
@@ -404,44 +491,125 @@
       return { ok: true, reason: 'config_reset_not_implemented' };
     }
 
-    async function sendPrompt(prompt) {
+    async function sendPrompt(prompt, delimiters, requestId) {
       const startedAt = Date.now();
       const trace = [];
       const T = (phase, extra) => {
-        try { chrome.runtime.sendMessage({ type: 'dsc_phase', phase, extra }).catch(() => {}); } catch (_) { /* port closed */ }
+        try { chrome.runtime.sendMessage({ type: 'dsc_phase', requestId, phase, extra }).catch(() => {}); } catch (_) { /* port closed */ }
         trace.push(Object.assign({ t: Date.now() - startedAt, phase }, extra || {}));
         if (trace.length > 80) trace.splice(1, 1);
       };
       const fail = (error, reason, extra) =>
         Object.assign({ error, reason, trace, elapsedMs: Date.now() - startedAt }, extra || {});
 
+      T('cfg_page_ready', { checking: true });
+      const pageReady = await DSC.waitForPageStable(15000, DSC.STAGE_DELAY_MS);
+      T('cfg_page_ready', { ready: pageReady.ok, readyState: pageReady.readyState });
+      if (!pageReady.ok) return fail(E.INPUT_NOT_FOUND, 'page_not_stable', { details: pageReady });
+
       dismiss();
       const input = await waitFor(findInput, def.timeouts.sendMs);
       T('cfg_input', { found: !!input });
       if (!input) return fail(E.INPUT_NOT_FOUND, 'input_not_found');
 
+      let idleSince = 0;
+      let responseSignature = null;
+      const preflight = await waitFor(() => {
+        const current = findInput();
+        const generating = stopPresent();
+        const responses = S.response.reduce((all, selector) => all.concat(responseAll(selector)), []);
+        const lastEl = responses.length ? responses[responses.length - 1] : null;
+        const lastText = lastEl ? ((lastEl.innerText || lastEl.textContent) || '').trim() : '';
+        const signature = responses.length + ':' + lastText.length + ':' +
+          lastText.slice(0, 60) + ':' + lastText.slice(-60);
+        if (responseSignature !== signature) {
+          responseSignature = signature;
+          idleSince = 0;
+          return null;
+        }
+        if (!current || generating || document.readyState !== 'complete') {
+          idleSince = 0;
+          return null;
+        }
+        if (!idleSince) idleSince = Date.now();
+        if (Date.now() - idleSince < DSC.STAGE_DELAY_MS) return null;
+        return { input: current, inputEmpty: readInput(current).trim() === '', generating: false };
+      }, def.timeouts.sendMs);
+      T('cfg_preflight', {
+        ready: !!preflight && preflight.inputEmpty,
+        inputEmpty: !!preflight && preflight.inputEmpty,
+        generating: stopPresent(),
+        readyState: document.readyState,
+      });
+      if (!preflight) return fail(E.SEND_FAILED, 'provider_busy_or_not_ready');
+      if (!preflight.inputEmpty) {
+        return fail(E.SEND_FAILED, 'input_not_empty_before_send', {
+          details: { inputEmpty: false, recovery: 'The existing composer was left untouched; review or clear it manually before retrying.' },
+        });
+      }
+
       // TYPED: snapshot per-selector counts, then fill the input.
       const before = {};
       for (const s of S.response) before[s] = countOf(s);
-      setInput(input, prompt);
-      await sleep(150);
-      const typedLen = readInput(input).length;
-      T('cfg_typed', { promptLen: prompt.length, typedLen });
-      if (typedLen === 0) return fail(E.SEND_FAILED, 'input_empty_after_set');
+      await sleep(DSC.STAGE_DELAY_MS);
+      const currentInput = findInput();
+      if (!currentInput || readInput(currentInput).trim() !== '' || stopPresent()) {
+        return fail(E.SEND_FAILED, 'pre_paste_state_changed', {
+          inputFound: !!currentInput,
+          inputEmpty: !!currentInput && readInput(currentInput).trim() === '',
+          generating: stopPresent(),
+        });
+      }
+      const pageUrlBeforeSend = location.href;
+      const filled = setInput(currentInput, prompt);
+      await sleep(DSC.STAGE_DELAY_MS);
+      const typedLen = readInput(currentInput).length;
+      T('cfg_typed', { promptLen: prompt.length, typedLen, method: filled.method, exact: filled.ok });
+      if (location.href !== pageUrlBeforeSend) {
+        return fail(E.USER_NAVIGATED, 'page_changed_after_input', { inputRetained: typedLen > 0 });
+      }
+      if (!filled.ok || typedLen !== prompt.length) return fail(E.SEND_FAILED, 'input_not_set');
 
       // PACED
-      const gap = def.pacingMs - (Date.now() - lastSendAt);
-      if (gap > 0) await sleep(gap);
-      await sleep(Math.max(300, Math.round(def.pacingMs / 3)));
-      T('cfg_paced', { pacingMs: def.pacingMs });
+      const gap = Math.max(DSC.STAGE_DELAY_MS, def.pacingMs - (Date.now() - lastSendAt));
+      await sleep(gap);
+      T('cfg_paced', { pacingMs: gap });
 
       // SENT
       const btn = await waitFor(findSend, def.timeouts.sendMs);
       if (!btn) return fail(E.SEND_FAILED, 'send_button_not_found');
-      btn.click();
+      if (location.href !== pageUrlBeforeSend) {
+        return fail(E.USER_NAVIGATED, 'page_changed_before_send', { inputRetained: true });
+      }
+      if (stopPresent() || readInput(currentInput) !== prompt || currentInput.isConnected === false) {
+        return fail(E.SEND_FAILED, 'pre_send_state_changed', {
+          inputMatchesPrompt: readInput(currentInput) === prompt,
+          generating: stopPresent(),
+        });
+      }
+      await sleep(DSC.STAGE_DELAY_MS);
+      const stableButton = findSend();
+      if (location.href !== pageUrlBeforeSend) {
+        return fail(E.USER_NAVIGATED, 'page_changed_before_send', { inputRetained: true });
+      }
+      if (!stableButton || stopPresent() || readInput(currentInput) !== prompt) {
+        return fail(E.SEND_FAILED, 'send_control_not_stable', {
+          sendReady: !!stableButton,
+          generating: stopPresent(),
+          inputMatchesPrompt: readInput(currentInput) === prompt,
+        });
+      }
+      if (!DSC.clickSendOnce(stableButton)) return fail(E.SEND_FAILED, 'send_button_disabled');
       lastSendAt = Date.now();
       const sentAt = lastSendAt;
       T('cfg_sent', { ms: sentAt - startedAt });
+      await sleep(DSC.STAGE_DELAY_MS);
+      const postClickInput = findInput();
+      T('cfg_submit_observed', {
+        inputCleared: !!postClickInput && readInput(postClickInput).trim() === '',
+        generating: stopPresent(),
+        responseCount: S.response.reduce((sum, selector) => sum + countOf(selector), 0),
+      });
 
       // Unfiltered: first selector whose count grew. Used only as send evidence.
       function newResponseEls() {

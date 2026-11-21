@@ -8,6 +8,9 @@
   // not add a second onMessage listener, which would double-send prompts.
   const loadKey = DSC.BUILD_HASH + ':' + (chrome.runtime && chrome.runtime.id);
   if (globalThis.__dsc_content_loaded === loadKey) return;
+  if (globalThis.__dsc_content_listener) {
+    chrome.runtime.onMessage.removeListener(globalThis.__dsc_content_listener);
+  }
   globalThis.__dsc_content_loaded = loadKey;
 
   // Provider contract lives in shared.js (search for "PROVIDER CONTRACT").
@@ -17,7 +20,7 @@
   //
   // msg.provider is required. There is no default provider.
 
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  const contentListener = (msg, sender, sendResponse) => {
     (async () => {
       try {
         if (!msg || !msg.action) return sendResponse({ error: 'no_action' });
@@ -53,7 +56,16 @@
           return sendResponse(await provider.ensureChat(msg.name));
         }
         if (msg.action === DSC.MSG.SEND_PROMPT) {
-          return sendResponse(await provider.sendPrompt(msg.prompt, msg.delimiters));
+          const result = await provider.sendPrompt(msg.prompt, msg.delimiters, msg.requestId);
+          if (result && !result.error && result.url && result.url !== location.href) {
+            return sendResponse({
+              error: DSC.ERR.USER_NAVIGATED,
+              reason: 'provider_url_changed_before_reply',
+              details: { replyUrl: result.url, currentUrl: location.href },
+              trace: result.trace,
+            });
+          }
+          return sendResponse(result);
         }
         if (msg.action === DSC.MSG.CHECK_STATE) {
           return sendResponse(await provider.checkState());
@@ -68,7 +80,9 @@
       }
     })();
     return true; // async response
-  });
+  };
+  globalThis.__dsc_content_listener = contentListener;
+  chrome.runtime.onMessage.addListener(contentListener);
 
   console.debug('[dsc:router:diag]', {
     href: location.href,

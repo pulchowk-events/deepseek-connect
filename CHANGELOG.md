@@ -13,20 +13,28 @@ server. Upgrade both sides together.
 ### Changed
 
 - Provider selection is required for `/chat`, `/open`, and `/reset`; routing requires exactly one exact-host tab and has no sticky-tab fallback.
-- `/chat` accepts a saved `url` for direct retry navigation. Error responses include `retryable`, `retryAfter` (milliseconds), and `userFixable` metadata.
+- `/chat` accepts a saved `url` for exact-conversation navigation on explicitly selected requests. Error responses include `retryable`, `retryAfter` (milliseconds), and `userFixable` metadata.
 - DeepSeek rate-limit delays use milliseconds, and navigation during streaming reports the registered `user_navigated` code.
+- Prompt insertion now uses a single paste-equivalent DOM operation instead of character typing, avoiding tab freezes and send-button spam.
+- Popup and provider setup UI have been polished for clearer connection, configuration, and action states.
+- Request logs omit prompt text; progress/trace diagnostics are bounded and redact prompt/reply-like fields.
+- Error retryability is constrained by dispatch state; post-dispatch errors are not marked safe to replay.
+
+### Added
+
+- Stable `requestId` correlation and bounded in-memory deduplication for identical submissions.
+- `/status` queue/extension snapshot, input and payload limits, queue and dispatched-request deadlines, caller disconnect handling, and `executionState` metadata.
+- Late replies release the quarantined in-flight slot; a same-ID identical request can retrieve a cached late terminal result.
 
 ### Planned
 
 - Aggregator `--extension` flag integration in `pulchowk-events-bot` (transport + paste-extension exist; provider forwarding to the transport is next)
 - Wizard error beeps and `needs-review` skip on the aggregator side
 - Auto-pivot on rate limit as a wizard-level policy (the pivot pattern is documented; the aggregator's transport doesn't implement it yet)
-- Provider unit tests (`tests/providers/*.test.js`)
+- Additional provider unit tests (`tests/providers/*.test.js`)
 - Playwright end-to-end test (`tests/e2e.test.js`)
 - `POST /cancel/:requestId` route
-- `GET /status` route
 - `GET /health` route
-- Per-request server-side timeout (fixes the "extension dies mid-flight" queue block)
 - `/reset` with `delete: true` flag for actual chat deletion
 - Protocol version negotiation (`PROTOCOL_VERSION_MISMATCH`)
 - Extension popup "Skip site" button (`user_skipped` error code)

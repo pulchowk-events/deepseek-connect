@@ -74,8 +74,8 @@ const META = {
     human: 'Not logged in to provider. Log in and retry.',
   },
   [CODES.RESPONSE_TIMEOUT]: {
-    retryable: true, userFixable: true, http: 504,
-    human: 'No answer within timeout; check the work tab (streaming paused?).',
+    retryable: false, userFixable: true, http: 504,
+    human: 'No answer within timeout; the prompt may have been submitted. Verify the provider tab before retrying.',
   },
   [CODES.SEND_FAILED]: {
     retryable: true, userFixable: false, http: 502,
@@ -86,8 +86,8 @@ const META = {
     human: 'Work tab navigated mid-stream; result discarded to avoid stale read.',
   },
   [CODES.INVALID_RESPONSE_FORMAT]: {
-    retryable: true, userFixable: false, http: 502,
-    human: 'Model reply did not include the required delimiters. Retry may succeed; if it repeats, the prompt enforcement needs strengthening.',
+    retryable: false, userFixable: false, http: 502,
+    human: 'Model reply did not include the required delimiters. The prompt was submitted; inspect the reply before deciding whether to retry.',
   },
   [CODES.AMBIGUOUS_PROVIDER_TAB]: {
     retryable: false, userFixable: true, http: 409,
@@ -107,8 +107,8 @@ const META = {
     human: 'Extension stopped polling; will retry as soon as it reconnects.',
   },
   [CODES.EXTENSION_TIMEOUT]: {
-    retryable: true, userFixable: false, http: 504,
-    human: 'Extension did not respond in time; safe to retry.',
+    retryable: false, userFixable: true, http: 504,
+    human: 'Extension did not respond in time. Dispatch may have occurred; verify the provider tab before retrying.',
   },
   [CODES.PROTOCOL_VERSION_MISMATCH]: {
     retryable: false, userFixable: true, http: 500,
@@ -136,7 +136,7 @@ const META = {
   },
   [CODES.CANCELLED]: {
     retryable: false, userFixable: false, http: 499,
-    human: 'Request cancelled by caller via POST /cancel.',
+    human: 'The caller stopped waiting. This does not cancel work already dispatched to the provider.',
   },
   [CODES.USER_SKIPPED]: {
     retryable: false, userFixable: true, http: 499,
@@ -152,12 +152,14 @@ class DSCError extends Error {
     this.name = 'DSCError';
     this.code = code;
     this.reason = opts.reason || meta.human;
-    this.retryable = opts.retryable ?? meta.retryable;
-    this.retryAfter = opts.retryAfter || 0;
-    this.userFixable = opts.userFixable ?? meta.userFixable;
+    this.retryable = typeof opts.retryable === 'boolean' ? opts.retryable : meta.retryable;
+    this.retryAfter = Number.isFinite(opts.retryAfter) && opts.retryAfter >= 0 ? opts.retryAfter : 0;
+    this.userFixable = typeof opts.userFixable === 'boolean' ? opts.userFixable : meta.userFixable;
     this.http = opts.http ?? meta.http;
     this.details = opts.details || undefined;
     this.trace = opts.trace || undefined;
+    this.requestId = opts.requestId || undefined;
+    this.executionState = opts.executionState || undefined;
   }
   toJSON() {
     return {
@@ -169,6 +171,8 @@ class DSCError extends Error {
       userFixable: this.userFixable,
       details: this.details,
       trace: this.trace,
+      requestId: this.requestId,
+      executionState: this.executionState,
     };
   }
 }
@@ -194,9 +198,13 @@ function fromReply(body) {
   const code = body && body.error && META[body.error] ? body.error : CODES.INTERNAL_ERROR;
   return new DSCError(code, {
     reason: body && body.reason,
+    retryable: body && body.retryable,
     retryAfter: body && body.retryAfter,
+    userFixable: body && body.userFixable,
     details: body && body.details,
     trace: body && body.trace,
+    requestId: body && body.requestId,
+    executionState: body && body.executionState,
   });
 }
 

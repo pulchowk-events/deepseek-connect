@@ -6,6 +6,8 @@
 - **Supersedes:** —
 - **Superseded by:** [0008 — multi-provider plugin architecture](0008-multi-provider-plugin.architecture.md), as refined by current exact-provider tab routing
 
+> This ADR records a superseded design, not current behavior. The extension no longer pins `chrome.storage.local.workTabId`; it requires exactly one tab matching the explicitly selected provider's exact hostname and validates any supplied `targetTabId`.
+
 ## Context
 
 With multiple DeepSeek tabs open — which happens, the user might be chatting in one while the batch runs in another — the extension needs to pick one for automation. It must be consistent across requests, or different requests would land in different tabs.

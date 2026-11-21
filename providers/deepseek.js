@@ -57,6 +57,15 @@
     return findByText(document, 'button', /^send$/i);
   }
 
+  async function waitForFindSend(timeout) {
+    return waitFor(() => {
+      const button = findSendButton();
+      if (!button) return null;
+      if (button.disabled || button.getAttribute('aria-disabled') === 'true') return null;
+      return button;
+    }, { timeout: timeout || 10000, interval: 100 });
+  }
+
   function findToggle(kind) {
     const logical = kind === 'deepthink' ? 'toggleDeepThink' : 'toggleSearch';
     const r = globalThis.DSC_SELECTORS && globalThis.DSC_SELECTORS.resolve(logical);
@@ -216,6 +225,53 @@
     return input;
   }
 
+  function findGenerationControl() {
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      if (!visible(el)) continue;
+      const label = [
+        el.getAttribute('aria-label'),
+        el.getAttribute('title'),
+        el.getAttribute('data-testid'),
+        el.textContent,
+      ].filter(Boolean).join(' ');
+      if (/\bstop(?:\s+generating)?\b/i.test(label)) return el;
+    }
+    return null;
+  }
+
+  async function waitForAutomationIdle(timeout) {
+    const startedAt = Date.now();
+    let idleSince = 0;
+    let responseSignature = null;
+    let latest = null;
+    while (Date.now() - startedAt < timeout) {
+      const input = findInput();
+      const busy = !!findGenerationControl();
+      const messages = findAssistantMessages();
+      const lastText = messages.length ? (messages[messages.length - 1].textContent || '').trim() : '';
+      const signature = messages.length + ':' + lastText.length + ':' +
+        lastText.slice(0, 60) + ':' + lastText.slice(-60);
+      latest = {
+        readyState: document.readyState,
+        inputFound: !!(input && visible(input) && !input.disabled),
+        inputEmpty: !!input && readInputValue(input).trim() === '',
+        generating: busy,
+        responseStable: responseSignature === null || responseSignature === signature,
+      };
+      if (responseSignature !== signature) {
+        responseSignature = signature;
+        idleSince = 0;
+      } else if (latest.readyState === 'complete' && latest.inputFound && !busy) {
+        if (!idleSince) idleSince = Date.now();
+        if (Date.now() - idleSince >= DSC.STAGE_DELAY_MS) return { ok: true, state: latest };
+      } else {
+        idleSince = 0;
+      }
+      await sleep(200);
+    }
+    return { ok: false, state: latest };
+  }
+
   async function openNewChat() {
     const btn = findNewChatButton();
     if (!btn) return { ok: false, error: DSC.ERR.CHAT_NOT_FOUND, reason: 'new_chat_button_not_found' };
@@ -306,18 +362,7 @@
   }
 
   function setInputValue(input, text) {
-    input.focus();
-    if (input.tagName === 'TEXTAREA') {
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-      setter.call(input, text);
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-    } else {
-      // contenteditable
-      input.textContent = '';
-      document.execCommand('insertText', false, text);
-      input.dispatchEvent(new InputEvent('input', { bubbles: true }));
-    }
+    return DSC.fillPromptInput(input, text);
   }
 
   function readInputValue(input) {
@@ -432,14 +477,14 @@
     return { content: raw, source: 'raw' };
   }
 
-  async function sendPrompt(prompt, delimiters) {
+  async function sendPrompt(prompt, delimiters, requestId) {
     const startedAt = Date.now();
     const trace = [];
     const T = (phase, extra) => {
       // Broadcast live so background can POST /progress; final trace below
       // still carries the full sequence in the /reply payload.
       try {
-        chrome.runtime.sendMessage({ type: 'dsc_phase', phase, extra }).catch(() => {});
+        chrome.runtime.sendMessage({ type: 'dsc_phase', requestId, phase, extra }).catch(() => {});
       } catch (_) { /* no-op if port closed */ }
       trace.push(Object.assign({ t: Date.now() - startedAt, phase }, extra || {}));
       if (trace.length > 60) trace.splice(1, 1);
@@ -448,6 +493,11 @@
       { error, reason, trace, elapsedMs: Date.now() - startedAt },
       extra || {}
     );
+
+    T('pageReady', { checking: true });
+    const pageReady = await DSC.waitForPageStable(15000, DSC.STAGE_DELAY_MS);
+    T('pageReady', { ready: pageReady.ok, readyState: pageReady.readyState });
+    if (!pageReady.ok) return fail(DSC.ERR.INPUT_NOT_FOUND, 'page_not_stable', { details: pageReady });
 
     // Phase 1: DOM probe
     const probe = globalThis.DSC_SELECTORS ? globalThis.DSC_SELECTORS.probeDom() : null;
@@ -469,9 +519,21 @@
     }
 
     // Phase 2: input
+    T('preflight', { checking: 'input_and_provider_idle' });
+    const idle = await waitForAutomationIdle(15000);
+    T('preflight', Object.assign({ ready: idle.ok }, idle.state || {}));
+    if (!idle.ok) {
+      return fail(DSC.ERR.SEND_FAILED, idle.state && idle.state.generating
+        ? 'provider_busy_before_send' : 'provider_not_ready', { details: idle.state });
+    }
     const input = await waitForInputReady(5000);
     T('waitInput', { found: !!input });
     if (!input) return fail(DSC.ERR.INPUT_NOT_FOUND, 'input_not_found');
+    if (readInputValue(input).trim() !== '') {
+      return fail(DSC.ERR.SEND_FAILED, 'input_not_empty_before_send', {
+        details: { inputEmpty: false, recovery: 'The existing composer was left untouched; review or clear it manually before retrying.' },
+      });
+    }
 
     if (detectLoggedOut()) return fail(DSC.ERR.LOGGED_OUT, 'logged_out');
 
@@ -479,25 +541,79 @@
     const dt = await ensureToggleOn('deepthink', DSC.ERR.DEEPTHINK_ENABLE_FAILED);
     T('toggleDeepthink', { ok: dt.ok, reason: dt.reason });
     if (!dt.ok) return fail(DSC.ERR.DEEPTHINK_ENABLE_FAILED, dt.reason);
+    await sleep(DSC.STAGE_DELAY_MS);
 
     const sr = await ensureToggleOn('search', DSC.ERR.SEARCH_ENABLE_FAILED);
     T('toggleSearch', { ok: sr.ok, reason: sr.reason });
     if (!sr.ok) return fail(DSC.ERR.SEARCH_ENABLE_FAILED, sr.reason);
+    await sleep(DSC.STAGE_DELAY_MS);
 
     // Phase 4: set input
     const before = findAssistantMessages().length;
-    setInputValue(input, prompt);
-    await sleep(100);
-    const typedLen = readInputValue(input).length;
-    T('setInput', { promptLen: prompt.length, typedLen, msgBefore: before });
-    if (typedLen === 0) return fail(DSC.ERR.SEND_FAILED, 'input_empty_after_set');
+    const currentInput = await waitForInputReady(5000);
+    if (!currentInput || readInputValue(currentInput).trim() !== '' || findGenerationControl()) {
+      return fail(DSC.ERR.SEND_FAILED, 'pre_paste_state_changed', {
+        inputFound: !!currentInput,
+        inputEmpty: !!currentInput && readInputValue(currentInput).trim() === '',
+        generating: !!findGenerationControl(),
+      });
+    }
+    const pageUrlBeforeSend = location.href;
+    const filled = setInputValue(currentInput, prompt);
+    await sleep(DSC.STAGE_DELAY_MS);
+    const typedLen = readInputValue(currentInput).length;
+    T('setInput', { promptLen: prompt.length, typedLen, method: filled.method, exact: filled.ok, msgBefore: before });
+    if (location.href !== pageUrlBeforeSend) {
+      return fail(DSC.ERR.USER_NAVIGATED, 'page_changed_after_input', { inputRetained: typedLen > 0 });
+    }
+    if (!filled.ok || typedLen !== prompt.length) return fail(DSC.ERR.SEND_FAILED, 'input_not_set');
 
     // Phase 5: click send
-    const sendBtn = findSendButton();
+    const sendBtn = await waitForFindSend(10000);
     if (!sendBtn) return fail(DSC.ERR.SEND_FAILED, 'send_button_not_found');
-    sendBtn.click();
+    if (location.href !== pageUrlBeforeSend) {
+      return fail(DSC.ERR.USER_NAVIGATED, 'page_changed_before_send', { inputRetained: true });
+    }
+    if (findGenerationControl() || readInputValue(currentInput) !== prompt || currentInput.isConnected === false) {
+      return fail(DSC.ERR.SEND_FAILED, 'pre_send_state_changed', {
+        inputMatchesPrompt: readInputValue(currentInput) === prompt,
+        generating: !!findGenerationControl(),
+      });
+    }
+    await sleep(DSC.STAGE_DELAY_MS);
+    const finalSendBtn = await waitForFindSend(2000);
+    if (location.href !== pageUrlBeforeSend) {
+      return fail(DSC.ERR.USER_NAVIGATED, 'page_changed_before_send', { inputRetained: true });
+    }
+    if (!finalSendBtn || findGenerationControl() || readInputValue(currentInput) !== prompt) {
+      return fail(DSC.ERR.SEND_FAILED, 'send_control_not_stable', {
+        sendReady: !!finalSendBtn,
+        generating: !!findGenerationControl(),
+        inputMatchesPrompt: readInputValue(currentInput) === prompt,
+      });
+    }
+    if (!DSC.clickSendOnce(finalSendBtn)) return fail(DSC.ERR.SEND_FAILED, 'send_button_disabled');
     const sendClickedAt = Date.now();
     T('sendClick', { ms: sendClickedAt - startedAt });
+    const submission = await waitFor(() => {
+      const postClickInput = findInput();
+      const assistantCount = findAssistantMessages().length;
+      const state = {
+        inputCleared: !!postClickInput && readInputValue(postClickInput).trim() === '',
+        generating: !!findGenerationControl(),
+        assistantCount,
+      };
+      return state.inputCleared || state.generating || assistantCount > before ? state : null;
+    }, { timeout: 15000, interval: 200 });
+    T('submitObserved', Object.assign({ accepted: !!submission }, submission || {
+      inputCleared: false, generating: false, assistantCount: findAssistantMessages().length,
+    }));
+    if (!submission) {
+      return fail(DSC.ERR.SEND_FAILED, 'send_not_registered', {
+        inputRetained: readInputValue(findInput()).length > 0,
+        details: { recovery: 'The send click was issued but UI acceptance was not observed; inspect the provider tab before retrying.' },
+      });
+    }
 
     // Phase 6: wait for reply.
     // This provider streams reasoning first (.ds-think-content), answer later

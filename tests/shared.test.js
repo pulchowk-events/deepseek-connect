@@ -11,6 +11,34 @@ test('shared.js exposes the registered user_navigated error code', () => {
   assert.equal(DSC.ERR.USER_NAVIGATED, CODES.USER_NAVIGATED);
 });
 
+test('shared.js exposes the one-shot prompt and guarded send helpers', () => {
+  assert.equal(typeof DSC.fillPromptInput, 'function');
+  assert.equal(typeof DSC.readPromptInput, 'function');
+  assert.equal(typeof DSC.clickSendOnce, 'function');
+  assert.deepEqual(DSC.fillPromptInput(null, 'hello'), { ok: false, method: 'missing' });
+  assert.equal(DSC.clickSendOnce({ disabled: true, getAttribute: () => null, click: () => { throw new Error('clicked'); } }), false);
+});
+
+test('waitForPageStable waits for a complete document and stable URL', async () => {
+  const saved = { document: globalThis.document, location: globalThis.location };
+  try {
+    let href = 'https://provider.example/';
+    globalThis.location = { get href() { return href; } };
+    globalThis.document = { readyState: 'loading' };
+    const pending = DSC.waitForPageStable(1000, 100);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    href = 'https://provider.example/chat';
+    globalThis.document.readyState = 'complete';
+    const result = await pending;
+    assert.equal(result.ok, true);
+    assert.equal(result.url, href);
+    assert.equal(result.readyState, 'complete');
+  } finally {
+    globalThis.document = saved.document;
+    globalThis.location = saved.location;
+  }
+});
+
 const base = () => ({
   schema: 1, name: 'myprov', label: 'My Prov', domains: ['Chat.Example.com'],
   selectors: { input: ['#in'], send: ['#send'], response: ['.msg'] },

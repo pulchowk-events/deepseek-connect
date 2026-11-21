@@ -129,6 +129,8 @@ Four methods, one property. That's the entire interface.
 
 **`trace` is mandatory in `sendPrompt`'s return, even on failure.** It carries per-phase timing to the server log. See [protocol.md#post-progress](protocol.md#post-progress) for the shape — an array of `{ t, phase, ...extra }` objects. A provider that omits trace breaks the `~ <id8> <phase>` live logging the wizard depends on.
 
+**Gate each UI transition on observed state.** Before filling, wait for a complete, stable page, a visible/enabled empty input, and no active generation control; verify the existing response is stable where response selectors are available. After filling, read the input back and re-check that the page, input, and enabled send control still match the expected state. Click once only, then wait for UI evidence that submission was accepted. Emit progress phases for checks and observed state using the request ID. Built-in drivers use a 1-second minimum inter-stage pause; config drivers honor their configured pacing with a 1-second floor. If a provider exposes no reliable generation control, document that limitation and use stable response observation rather than claiming certain idleness.
+
 **`debug` in `ensureChat`'s return is strongly encouraged.** It's surfaced in `/open`'s response, which is the only way to diagnose why a sidebar walk failed without opening F12 on the work tab.
 
 Everything else — selector strategy, pacing, modal dismissal, delimiter enforcement — is provider-specific and belongs inside the provider module.
@@ -152,7 +154,7 @@ PROVIDER_DOMAINS: {
 
 `DSC.providerForUrl(url)` reads this map. `background.js#getWorkTab(provider)` reads this map. Adding the entry here is what makes `/chat { provider: 'claude' }` route to the claude.ai tab.
 
-**The URL prefix must end with `/`.** `providerForUrl` uses `url.startsWith(prefix)`. A prefix of `'https://claude.ai'` (no slash) would match `https://claude.ai.attacker.com` — a prefix with the trailing slash avoids that class of bug.
+**Routing compares parsed hostnames exactly.** `https://claude.ai.attacker.com` must never match `claude.ai`; do not implement hostname routing with string-prefix checks. Provider URL records should use the canonical provider origin.
 
 ### 2. Update `manifest.json`
 
@@ -474,7 +476,7 @@ curl -s -X POST http://127.0.0.1:7331/chat \
 
 Expected on success: `{ content: "ping", chat: "claude-test", url: "https://claude.ai/chat/...", elapsedMs: N }`.
 
-Expected current failures include `ambiguous_provider_tab` (missing/duplicate provider tab), `input_not_found` (input unavailable), and `response_timeout` (completion detector did not finish). Provider registration problems may surface as `internal_error`.
+Expected current failures include `ambiguous_provider_tab` (missing/duplicate provider tab), `input_not_found` (input unavailable), and `response_timeout` (completion detector did not finish). A response timeout may occur after the prompt was submitted; inspect the provider tab before retrying. Provider registration problems may surface as `internal_error`.
 
 The error code itself is the diagnosis. Match it against the three registrations:
 
