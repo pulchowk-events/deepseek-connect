@@ -245,11 +245,11 @@ Six things, in order:
 
 **If this didn't work:**
 
-- **curl waits and then times out.** The default Node client timeout is 180 seconds; plain `curl` has no built-in request deadline unless one is specified. Check the first terminal — if `dispatched` appears with no provider progress or reply, inspect the provider tab and extension console. Restarting the server clears a job that never replies.
+- **curl waits and then times out.** `curl` has no built-in deadline unless one is specified; the server defaults to a 120-second queue deadline and a 960-second dispatched-request deadline. Check `/status` and inspect the provider tab. A timeout after `dispatched` is `outcome_unknown`, not cancellation; do not resend under a new request ID until the tab is reconciled.
 
 - **`{"ok": false, "error": "auth_failed"}`.** Your `-H "Authorization: Bearer ..."` doesn't match `.env`'s `EXTENSION_TOKEN`. Compare exactly.
 
-- **The request waits and then times out.** The extension has not polled the server, or is disconnected. Confirm its token and port match `.env`, then reload the extension. There is no `/health` endpoint; `/tabs` is only a cached `/hello` snapshot.
+- **The request waits and then times out.** Confirm the extension's token and port match `.env`, then inspect `/status`. The server starts on the port in `.env`, while the popup has its own saved port setting. `/tabs` is only a cached `/hello` snapshot, not a readiness check.
 
 - **`{"ok": false, "error": "ambiguous_provider_tab", ...}`.** No tab or multiple tabs match the requested provider's exact hostname. Open one provider tab or close extras, then retry.
 
@@ -321,7 +321,7 @@ The response shape is identical because the multi-provider contract guarantees i
 - **`{"ok": false, "error": "ambiguous_provider_tab", ...}`.** No tab or multiple tabs match Qwen's exact hostname. Open one Qwen tab or close extras, then retry.
 - **`{"ok": false, "error": "input_not_found"}`.** The Qwen tab exists but the input box wasn't found. Check the provider tab and follow [selector-maintenance.md](selector-maintenance.md) if the DOM changed.
 
-- **`{"ok": false, "error": "invalid_response_format"}`.** Qwen produced a reply but didn't wrap it in the required `START_QWEN_REPLY` / `END_QWEN_REPLY` delimiters. The `details.rawPreview` field shows the first 200 chars of what the model actually said. Retry once — the model usually cooperates on attempt 2. If it fails three times in a row, the prompt's delimiter instruction is being ignored — check the actual prompt sent by looking at `step_4_verify_input.promptLen` in the trace.
+- **`invalid_response_format`.** Qwen returned a reply that could not be extracted. Inspect the provider tab and the bounded error details; this occurs after prompt submission and is not automatically retryable. Treat any model-produced code as untrusted and validate it in the caller before saving or using it.
 
 - **`internal_error` with a provider registration failure in the reason/details.** Check that the config provider is enabled, or inspect the extension console and reload the extension and provider tab after built-in driver changes. `no_provider_loaded` is not a registered public error code.
 
@@ -374,13 +374,13 @@ The `debug.sideFound: false` is expected — the sidebar walk didn't run at all.
 
 No `probe`, no `step_*` phases. The extension navigated the tab, verified the input is there via `checkState`, and returned. The whole thing takes ~2-3 seconds (mostly the tab navigation + React mount).
 
-**Then** — send a follow-up prompt to the same URL:
+**Then** — send a new follow-up prompt to the same URL. This is safe because the previous `/chat` completed successfully; it is not a timeout-retry recipe:
 
 ```bash
 curl -s -X POST http://127.0.0.1:7331/chat \
   -H "Authorization: Bearer demo-token-12345" \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"What did I ask you to reply with, one message ago?"}],"chat":"first-test","provider":"deepseek"}' \
+  -d '{"messages":[{"role":"user","content":"What did I ask you to reply with, one message ago?"}],"chat":"first-test","provider":"deepseek","url":"https://chat.deepseek.com/a/chat/s/ae834e91-aed2-4254-bb12-6b8b7c1dc7d5"}' \
   | python3 -m json.tool
 ```
 
@@ -403,27 +403,19 @@ Three things:
 
 1. **`/open` with `url` navigated directly.** Background called `chrome.tabs.update(tab.id, { url: 'https://chat.deepseek.com/a/chat/s/ae834e91-...' })`, waited for the tab to complete loading, waited 800ms for React to mount, and called the DeepSeek provider's `checkState()` to verify the input is present. No `ensureChat` — no sidebar walk. This is what makes the URL path reliable when the sidebar walk isn't.
 
-2. **`/chat` to the same chat URL.** The `chatName: 'first-test'` and the tab already being on the URL meant `/chat` didn't need to navigate again — `ensureChat` returned `{ok: true, existing: true, mode: 'existing'}` because `findChatInSidebar('first-test')` matched the chat title (which DeepSeek auto-named something close to "first-test — reply with exactly: hello"). Wait — the sidebar walk *did* run in step 7's second call, because the second prompt didn't pass a `url` to `/chat`.
-
-Actually let me trace this more carefully. `/chat` doesn't accept a `url` parameter — it only takes `provider` and `chat`. So when you called `/chat` with `chat: 'first-test'`, background's `handleNext` had `work.targetUrl = null` (since `/chat` didn't set it) and called `ensureChat('first-test')`. `ensureChat` on DeepSeek does the sidebar walk, which found the chat titled "first-test — reply with exactly: hello", and clicked it. That's why the LLM saw the prior turn — the sidebar walk worked here because the chat title actually contains "first-test".
-
-So actually **two mechanisms** contributed: `/open { url }` navigated the tab to the chat URL, then the follow-up `/chat` was already on the right chat. The `ensureChat` call was a no-op (`existing: true`) because the tab was already on the chat, but even if it hadn't been, the sidebar walk would have found it.
-
-The key insight: **the URL mechanism is more reliable than the sidebar walk.** The DeepSeek sidebar fuzzy-match works only when the chat title happens to contain the source name — and DeepSeek paraphrases titles, so it often doesn't. The URL mechanism always works — the URL contains the UUID, which is stable for the chat's lifetime.
-
-**In a batch wizard**, the wizard persists the URL from `/chat`'s response and passes it to `/open` on every retry. The sidebar walk becomes a fallback for the first send per source.
+2. **`/chat` with the saved URL.** `/chat` accepts `url` and navigates to that exact provider conversation before sending. This avoids relying on sidebar title matching.
 
 **If this didn't work:**
 
-- **`{"ok": true, "existing": false, "mode": "fresh"}` from `/open`.** The URL navigation failed and fell through to `ensureChat`, which then found no matching chat (because you're on a fresh page). The stale URL case. This can happen if the chat was deleted, or if the URL from step 5 is from an old session where the UUID has been invalidated. Refresh the tab, and either re-open the chat manually or start a fresh `/chat` to get a new URL.
+- **`/open` rejects a stale or mismatched URL.** The extension does not fall back to another chat or provider. Verify the provider hostname and conversation URL in the tab; if the saved conversation is gone, explicitly choose a new chat and record its URL.
 
-- **The follow-up `/chat` returns something like "I don't have prior context in this conversation."** Either the URL navigation went to the wrong chat, or the follow-up `/chat` opened a fresh chat instead of reusing the existing one. Check `ensureChat`'s response — if `existing: false, mode: 'fresh'`, the sidebar walk didn't find the chat. Look at `debug.leafPreview` — if the chat title isn't in the list, that's why. This is exactly the case URL-based retry is designed to fix; the wizard should pass the `url` to `/chat` (which requires the `/chat` route to accept it — see [Extending the protocol](protocol.md#extending-the-protocol) — OR use the two-call pattern above: `/open { url }` first, then `/chat`).
+- **The follow-up `/chat` returns something like "I don't have prior context in this conversation."** Verify the exact URL and provider tab, then manually inspect that conversation. Do not send further prompts until the identity is clear.
 
 ---
 
-## Step 8 — Same chat, second turn
+## Step 8 — Same chat, another turn
 
-The full retry pattern: same chat, new prompt, LLM sees prior turn.
+This sends a new prompt after the prior request completed. It demonstrates conversation continuity; it is not a recipe for replaying a timed-out request.
 
 Send a third prompt to the same chat, again with the URL:
 
@@ -437,7 +429,7 @@ curl -s -X POST http://127.0.0.1:7331/open \
 curl -s -X POST http://127.0.0.1:7331/chat \
   -H "Authorization: Bearer demo-token-12345" \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"What was the first thing I asked you in this conversation?"}],"chat":"first-test","provider":"deepseek"}' \
+  -d '{"messages":[{"role":"user","content":"What was the first thing I asked you in this conversation?"}],"chat":"first-test","provider":"deepseek","url":"https://chat.deepseek.com/a/chat/s/ae834e91-aed2-4254-bb12-6b8b7c1dc7d5"}' \
   | python3 -m json.tool
 ```
 
@@ -454,7 +446,7 @@ Expected:
 
 The LLM recalls the very first message even though you've sent two more prompts since. That's stateful chat behavior — the provider navigated to the URL, the tab loaded the full conversation, and the LLM answered in context.
 
-**This is what a batch wizard does on retry.** It persists the URL after every `/chat` success, then on retry: `/open { url }` to navigate, then `/chat` to send the refined prompt. The LLM sees the failed attempt from the prior turn and produces a better second attempt.
+For a new follow-up prompt, persist the returned URL and include it in `/chat` or navigate with `/open` first. For an uncertain timeout, do not send a new prompt; inspect the tab and use the original `requestId` to recover a late result. See [protocol.md](protocol.md) for exact idempotency and restart limitations.
 
 ### What just happened
 
@@ -462,7 +454,7 @@ Same as step 7 — `/open { url }` navigated, `/chat` sent, LLM answered in cont
 
 **If this didn't work:**
 
-- **The LLM says "I don't have prior context."** Same diagnosis as step 7. Check whether `ensureChat` found the chat. Look at the `url` field in the response — if it's `null` or a different UUID, the tab ended up somewhere unexpected.
+- **The LLM says "I don't have prior context."** Verify the exact URL and selected provider tab manually. Do not send further prompts until the conversation identity is clear.
 
 - **The LLM says something plausible but wrong** (a hallucinated first message). The chat was probably reused but the LLM's context window is truncated — DeepSeek has a context limit, and if the conversation is very long, earlier turns get dropped. For a batch wizard, this only matters if a single source has 20+ retry attempts in the same chat; the practical limit is fine for 3-attempt retry policies.
 
@@ -475,19 +467,19 @@ You have:
 - The `deepseek-connect` extension loaded in your browser, authenticated to the server via `EXTENSION_TOKEN`
 - A running HTTP server on `127.0.0.1:7331` that queues prompts and returns provider-specific replies
 - A working `/chat` route with `provider` selection: DeepSeek and Qwen both functional
-- A working `/open` route with URL-based navigation for retry
-- Per-provider chat lifecycle: same chat, second turn, LLM sees prior context
-- Live progress telemetry in the server log: every phase of every prompt is visible as it happens, with provider-specific phase names
+- A working `/open` route with URL-based navigation
+- Per-provider chat lifecycle: follow-up turns use the same conversation URL
+- Best-effort progress telemetry in the server log, correlated by request ID
 - The multi-provider plugin system: two provider tabs open simultaneously, each request routed to the right one
 
-That's the entire functional surface. Everything else is either a helper (`/tabs`, `/reset`), extension-side (`/hello`, `/next`, `/reply`, `/progress`), or a refinement (better error handling, retries, beeps).
+The extension returns provider UI output; the caller must validate identity, syntax, and verdicts before accepting or saving it. The extension does not execute generated code. Timeouts are not cancellation, and automatic retries are limited to failures explicitly marked retryable and definitely not dispatched.
 
 ## Where to go next
 
 You've used the API. Now read the docs that make it navigable:
 
 - **[protocol.md](protocol.md)** — the full route reference. You'll need `POST /chat`'s request shape, the provider field threading, and `GET /tabs`'s response shape for anything beyond the basic flow.
-- **[error-codes.md](error-codes.md)** — the 21 failure codes with the decision rule for each, including the two provider-specific ones (`invalid_response_format`, `deepthink_enable_failed`).
+- **[error-codes.md](error-codes.md)** — registered failures, retry metadata, and dispatch-state recovery rules.
 - **[providers.md](providers.md)** — if you want to add a third provider (Claude, Gemini, whatever). The contract, the registration checklist, the Qwen case study.
 - **[integration-guide.md](integration-guide.md)** — the batch wizard blueprint. Same walkthrough you just did, but as a Node integration: `require('deepseek-connect')`, transport abstraction, batch loop, error policy, provider threading, provider-pivot on rate limit.
 - **[architecture.md](architecture.md)** — the "why" behind every decision you just exercised. The eight load-bearing choices are pinned to ADRs there, including the plugin registry that makes the two-provider setup work.

@@ -31,8 +31,8 @@ The extension is a client of the local server; the server is a client of the ext
 ### Negative
 
 - **Requires install.** One-time `brave://extensions` → Load unpacked. Not a `npm install`-and-go experience. This is the main cost.
-- **Requires an open tab.** The extension needs at least one `chat.deepseek.com` tab to drive. If the user closes the tab mid-batch, the next request fails with `input_not_found`.
-- **Single-tab constraint.** One extension drives one tab. Multi-tab parallelism isn't possible (see [ADR 0004](0004-sticky-work-tab-over-target-tab-id.md)). For a batch that processes 76 sources serially, this is fine — serial is the requirement, not a limitation.
+- **Requires a matching open tab.** Each request requires exactly one tab on the selected provider's exact hostname. No match or multiple matches fails explicitly; the extension does not switch providers or pick an arbitrary tab.
+- **Serialized work.** The server dispatches one request at a time across all providers, even if tabs for several providers are open. Different requests do not run in parallel.
 - **Manifest V3 lifecycle.** Service workers get killed after ~30s of inactivity. The extension must handle restart gracefully. See [ADR 0001](0001-use-long-poll-over-websocket.md) for how the long-poll accommodates this.
 
 ### Neutral
@@ -61,5 +61,5 @@ The extension is a client of the local server; the server is a client of the ext
 
 - [architecture.md#2-real-chrome-over-puppeteer](../architecture.md#2-real-chrome-over-puppeteer)
 - `manifest.json` — MV3, content script match on `chat.deepseek.com`
-- `background.js` — `chrome.tabs` interaction, sticky tab
+- `background.js` — `chrome.tabs` interaction and exact-provider tab routing
 - `README.md#why-it-exists` — the problem statement this addresses

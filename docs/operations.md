@@ -4,7 +4,7 @@ Day-2 runbook for `deepseek-connect`. This doc is indexed by *symptom*, not by c
 
 Multi-provider adds two wrinkles to the runbook. First, the trace phase names are **provider-specific** — DeepSeek emits `probe`/`waitInput`/`toggleDeepthink`, Qwen emits `step_1_dismiss_modal`/`step_2_find_input`. The phase names are the fastest way to identify which provider actually ran. Second, the reload discipline is stricter: **all** provider tabs must be closed before reloading, not just the one you're testing.
 
-> **Current routing/error behavior:** provider choice is required, and exactly one tab must match its exact hostname. Missing or duplicate tabs return `ambiguous_provider_tab`; `/tabs` is only a cached snapshot. The `no_work_tab` and `no_provider_loaded` sections below describe old behavior, not registered public codes. `extension_disconnected` is registered but is not a current readiness probe. For current error metadata see [error-codes.md](error-codes.md).
+> **Current routing/error behavior:** provider choice is required, and exactly one tab must match its exact hostname. Missing or duplicate tabs return `ambiguous_provider_tab`; `/tabs` is only a cached snapshot. `no_work_tab` and `no_provider_loaded` are not registered public codes, and `extension_disconnected` is not a current readiness probe. For current error metadata see [error-codes.md](error-codes.md).
 
 If you're setting up for the first time, read [getting-started.md](getting-started.md) first. If you're modifying the extension or adding a provider, read [architecture.md](architecture.md) and [providers.md](providers.md) before touching anything here. If you're integrating into a wizard, [integration-guide.md](integration-guide.md) has the caller-side operational concerns.
 
@@ -34,7 +34,7 @@ If you're setting up for the first time, read [getting-started.md](getting-start
 
 ## Log format
 
-Everything below assumes you can read the server's log. It's the primary operational surface — every prompt that ever runs leaves a trail, and nearly every symptom is diagnosed by finding the trail's last line.
+The server log is a useful diagnostic surface, but it intentionally does not contain prompts or full replies. Correlate a request using its `requestId` (or its first eight characters in trace lines), then inspect `/status` and the selected provider tab as needed.
 
 Three line formats. Every line starts with `[HH:MM:SS]`.
 
@@ -47,7 +47,7 @@ Three line formats. Every line starts with `[HH:MM:SS]`.
 [HH:MM:SS] x failed <id> | <reason>
 ```
 
-`<label>` is the prompt truncated to 60 chars, or `[open] chat-name` / `[reset] chat-name` for the mode-specific routes. `<id>` is a UUID; `<id8>` is the first 8 chars, used in every follow-up line.
+`<label>` is the provider, operation mode, and bounded chat name; prompt text is not logged. `<id>` is the request ID; `<id8>` is its first 8 characters, used in progress/trace lines.
 
 **Progress line** — one per `dsc_phase` message from the provider module:
 
@@ -64,15 +64,15 @@ The two leading spaces distinguish progress from request lines. `<phase>` is pro
   trace[err] <id8>  <t>ms <phase> <json-extra>
 ```
 
-The `trace` lines are redundant with the `~` lines (they're the same data, printed again at completion). They exist so a batch's final summary has the per-request timing without scrolling back through hundreds of `~` lines.
+The `trace` lines repeat bounded, redacted phase metadata for diagnosis. Prompt/reply/text/URL/token-like fields are redacted; strings, arrays, objects, nesting, and trace tails are bounded.
 
 **Identifying the provider from the log.** Three places:
 
-1. The `/hello` line: `extension connected (0.2.0) | <tabUrl> | N tab(s)` — `<tabUrl>` is one of the open provider tabs (usually the pinned one).
+1. The `/hello` line: `extension connected (0.2.0) | <tabUrl> | N tab(s)` — `<tabUrl>` is one of the supported provider tabs.
 2. The `~ <id8> <phase>` lines — the phase names are provider-specific. `probe`, `waitInput`, `toggleDeepthink` = DeepSeek. `step_1_dismiss_modal`, `step_2_find_input` = Qwen.
 3. The `chatName` in the enqueued line — the wizard convention is to name the chat after the source, but there's no provider marker in the name unless the wizard adds one.
 
-If you need to check which provider served a specific request, grep the id8 in the log and look at the phase names.
+If you need to check which provider served a specific request, correlate the request ID in `/status` and look at the bounded phase lines. Missing progress does not prove that the request was not dispatched.
 
 ## Phase names by provider
 
@@ -82,12 +82,15 @@ The single most useful diagnostic. Each provider emits its own phase sequence; m
 
 | Phase | `extra` | Meaning |
 |---|---|---|
+| `pageReady` | `{checking}` / `{ready, readyState}` | Document and URL stable before provider interaction. |
 | `probe` | `{healthy, degraded, requiredMissing}` | Every required selector resolved. `requiredMissing: []` means the DOM looks right. |
-| `waitInput` | `{found: bool}` | The chat input was found (and enabled) within 5s. |
+| `preflight` | `{ready, readyState, inputFound, inputEmpty, generating, responseStable}` | Input is available/empty and the prior response is idle/stable. |
+| `waitInput` | `{found: bool}` | The chat input was found and enabled. |
 | `toggleDeepthink` | `{ok: bool, reason?}` | DeepThink verified on, or clicked and verified. |
 | `toggleSearch` | `{ok: bool, reason?}` | Search verified on, or clicked and verified. |
 | `setInput` | `{promptLen, typedLen, msgBefore}` | Prompt typed into the input. `typedLen === promptLen` means the full text landed. |
 | `sendClick` | `{ms}` | Send button clicked, `ms` is the click duration. |
+| `submitObserved` | `{accepted, inputCleared, generating, assistantCount}` | Provider UI showed evidence the one send click was accepted. |
 | `firstMsg` | `{msgs, url}` | First assistant message of this response appeared. `url` is the captured `streamUrl` (last 8 chars). |
 | `reasoning` | `{len}` | Reasoning stream is growing (DeepThink only). `len` is the whole message text length. |
 | `answerStarted` | *(none)* | The answer block (`.ds-assistant-message-main-content`) appeared. |
@@ -95,24 +98,27 @@ The single most useful diagnostic. Each provider emits its own phase sequence; m
 | `replyDone` | `{completedBy, sawNew, stableLen}` | Completion detected. `completedBy: 'stable'` means text stopped growing. |
 | `extract` | `{source, contentLen, rawLen}` | Extraction ran. `source: 'delimiter'` = markers found, `'fence'` = JS fence fallback, `'raw'` = raw text. |
 
-A **successful DeepSeek prompt** emits: `probe` → `waitInput` → `toggleDeepthink` → `toggleSearch` → `setInput` → `sendClick` → `firstMsg` → (`reasoning` if DeepThink) → `answerStarted` → `answer` → `replyDone` → `extract`.
+A **successful DeepSeek prompt** includes: `pageReady` → `probe` → `preflight` → `waitInput` → `toggleDeepthink` → `toggleSearch` → `setInput` → `sendClick` → `submitObserved` → `firstMsg` → (`reasoning` if DeepThink) → `answerStarted` → `answer` → `replyDone` → `extract`. Polling/state observations may repeat; failures stop at their last completed stage.
 
 ### Qwen (`providers/qwen.js`)
 
 | Phase | `extra` | Meaning |
 |---|---|---|
+| `pageReady` | `{checking}` / `{ready, readyState}` | Document and URL stable before provider interaction. |
 | `step_1_dismiss_modal` | `{action: 'checking for age modal'}` | Age modal dismisser ran (before every action). |
 | `step_2_find_input` | `{action: 'locating input field'}` | Searching for `textarea.message-input-textarea`. |
+| `step_2a_preflight` | `{ready, readyState, inputEmpty, generating, assistantCount}` | Empty composer and stable, idle chat verified before paste. |
 | `step_3_type_prompt` | `{action: 'typing prompt'}` | Prompt + delimiter instruction injected into input. |
 | `step_4_verify_input` | `{promptLen, typedLen}` | Input value read back. `promptLen` includes the ~154-char delimiter instruction. |
-| `step_5_click_send` | `{action: 'clicking send button'}` | Send button clicked. |
-| `step_6_send_clicked` | *(none)* | Click registered, waiting for network to initiate. |
+| `step_5_click_send` | `{action: 'clicking send button'}` | Waiting for a usable send control and rechecking the prompt. |
+| `step_6_send_clicked` | `{ms}` | One send click issued. |
+| `step_6a_submit_observed` | `{accepted, inputCleared, generating, assistantCount}` | UI evidence that submission was accepted. |
 | `step_7_wait_for_reply` | *(none)* | Polling for both delimiters. |
 | `step_7a_first_msg` | *(none)* | First assistant message appeared in the DOM. |
 | `step_7b_streaming` | `{len}` | Stream growing (used for timeout diagnostics). |
 | `step_8_reply_done` | `{len}` | Both `START_QWEN_REPLY` and `END_QWEN_REPLY` detected. |
 
-A **successful Qwen prompt** emits: `step_1_dismiss_modal` → `step_2_find_input` → `step_3_type_prompt` → `step_4_verify_input` → `step_5_click_send` → `step_6_send_clicked` → `step_7_wait_for_reply` → `step_7a_first_msg` → `step_7b_streaming` → `step_8_reply_done`. Total elapsed is typically 7-10s (vs. DeepSeek's 4-8s) because of the ~5s pre-send pacing.
+A **successful Qwen prompt** includes: `pageReady` → `step_1_dismiss_modal` → `step_2_find_input` → `step_2a_preflight` → `step_3_type_prompt` → `step_4_verify_input` → `step_5_click_send` → `step_6_send_clicked` → `step_6a_submit_observed` → `step_7_wait_for_reply` → `step_7a_first_msg` → `step_7b_streaming` → `step_8_reply_done`. Polling/state observations may repeat; failures stop at their last completed stage. The minimum pre-send UI pacing adds several seconds before response monitoring.
 
 **A failed prompt stops at the phase that failed.** The last `~` line before `x failed` is the diagnosis. If it stops at `step_2_find_input`, that's `input_not_found` on Qwen. If it stops at `probe`, that's `dom_drift` on DeepSeek.
 
@@ -126,7 +132,7 @@ Find your symptom. Jump to the section.
 
 | What you see | Section |
 |---|---|
-| `curl /chat` hangs forever, no `dispatched` in log | [Batch hangs with no `dispatched` line](#symptom-batch-hangs-with-no-dispatched-line) |
+| `/chat` ends in queue timeout, no `dispatched` in log | [Batch hangs with no `dispatched` line](#symptom-batch-hangs-with-no-dispatched-line) |
 | `dispatched` appears but no phase line after it | [Batch hangs after `dispatched` line](#symptom-batch-hangs-after-dispatched-line) |
 | Content is reasoning text, not the answer | [Content is wrong](#symptom-content-is-wrong) |
 | `extract source: 'raw'` in the trace | [Content is wrong](#symptom-content-is-wrong) |
@@ -140,7 +146,7 @@ Find your symptom. Jump to the section.
 | A prompt fails with `user_navigated` | [`user_navigated`](#symptom-user_navigated) |
 | Qwen keeps showing an age modal | [Qwen's age modal keeps appearing](#symptom-qwens-age-modal-keeps-appearing) |
 | Qwen takes 3x as long as DeepSeek | [Qwen is much slower than DeepSeek](#symptom-qwen-is-much-slower-than-deepseek) |
-| First request after a crash hangs | [Queue blocked by a crashed extension](#symptom-queue-blocked-by-a-crashed-extension) |
+| A request times out after `dispatched` | [Dispatched request has an uncertain outcome](#symptom-queue-blocked-by-a-crashed-extension) |
 | Changes to a provider module don't take effect | [Reload discipline](#reload-discipline) |
 
 If your symptom isn't in the table, the diagnosis loop is:
@@ -148,6 +154,9 @@ If your symptom isn't in the table, the diagnosis loop is:
 ```bash
 # 1. Is the extension connected, and which provider tabs does it see?
 curl -s -H "Authorization: Bearer $EXTENSION_TOKEN" http://127.0.0.1:7331/tabs | python3 -m json.tool
+
+# 1a. Check polling and queued/in-flight request IDs (not provider UI readiness)
+curl -s -H "Authorization: Bearer $EXTENSION_TOKEN" http://127.0.0.1:7331/status | python3 -m json.tool
 
 # 2. What's the last line in the server log for the failing request?
 # (Find the request id from your failing curl, grep the log for it)
@@ -159,7 +168,7 @@ curl -s -H "Authorization: Bearer $EXTENSION_TOKEN" http://127.0.0.1:7331/tabs |
 # (F12 in the specific provider's tab, check the console for errors)
 ```
 
-99% of the time, step 3 is the answer, and the phase name tells you which provider it was.
+Progress helps locate the last observed provider phase, but it is best-effort telemetry. A missing phase is not evidence that dispatch did not happen.
 
 ---
 
@@ -241,7 +250,7 @@ If the curl hangs and the log shows only `<- enqueued`, no `-> dispatched`, the 
 
 ## Symptom: batch hangs after `dispatched` line
 
-**Diagnosis:** the server dispatched the job to the extension (`-> dispatched` appeared) but the extension never replied (`ok done` / `x failed` never appeared). The job is stuck.
+**Diagnosis:** the server dispatched the job to the extension (`-> dispatched` appeared) but no reply has arrived yet. The server will return `extension_timeout` at the dispatched-request deadline; caller timeout may happen sooner. A timeout after dispatch is an uncertain outcome, not proof the provider never received the prompt.
 
 The last `~ <id8> <phase>` line tells you where — and **which provider** based on the phase name.
 
@@ -255,11 +264,11 @@ The last `~ <id8> <phase>` line tells you where — and **which provider** based
 **Stuck after `probe`, before `sendClick`.**
 - `waitInput {found: false}` — input box not found. See [input_not_found](#symptom-input_not_found).
 - `toggleDeepthink {ok: false}` — DeepThink couldn't be enabled. See the [registered error codes](error-codes.md#registered-codes).
-- `setInput {promptLen, typedLen}` with `typedLen < promptLen` — the input didn't accept the full text. Usually a timing issue; retry once.
+- `setInput {promptLen, typedLen}` with `typedLen < promptLen` — the input did not accept the full text. Inspect the provider tab and the returned `executionState` before deciding whether a new attempt is safe.
 
-**Stuck after `sendClick`, no `firstMsg`.** The send clicked but DeepSeek didn't respond. Either the click didn't register (see `send_failed`) or the page is rate-limited. Check the DeepSeek tab visually — if there's no user message visible, the send didn't go through.
+**Stuck after `sendClick`, no `firstMsg`.** The send interaction may have occurred but DeepSeek has not shown a new assistant message. Check the tab visually for a user turn, rate-limit, challenge, or ongoing generation. Do not infer non-dispatch from the absence of `firstMsg`.
 
-**Stuck after `firstMsg`, before `answerStarted`.** The reasoning stream is running but the answer never started. DeepThink on complex prompts can take 60+ seconds. Wait for the 90s timeout. If it times out, see `response_timeout`.
+**Stuck after `firstMsg`, before `answerStarted`.** The provider has not reported an answer block. Check the browser tab for a login, challenge, error, or ongoing generation. The request's configured/server deadline determines when an explicit timeout is returned; `response_timeout` does not prove the prompt was never submitted.
 
 ### Qwen-specific stops
 
@@ -269,15 +278,15 @@ The last `~ <id8> <phase>` line tells you where — and **which provider** based
 
 **Stuck after `step_2_find_input`, before `step_3_type_prompt`.** The input selector didn't find anything. Qwen's input is `textarea.message-input-textarea` with fallback to `textarea`. If Qwen redesigned, the input might be somewhere else. F12 the Qwen tab: `document.querySelector('textarea')` — does it return anything? If not, Qwen's DOM changed.
 
-**Stuck after `step_5_click_send`, before `step_6_send_clicked`.** The click didn't register. Qwen's anti-bot pacing should prevent this, but if it happens, retry. If it happens repeatedly, the pacing may need adjustment — see [Qwen is much slower than DeepSeek](#symptom-qwen-is-much-slower-than-deepseek).
+**Stuck after `step_5_click_send`, before `step_6_send_clicked`.** The driver did not confirm the click. Inspect the provider tab before retrying; phase names alone do not prove that the prompt was or was not accepted.
 
 **Stuck after `step_7_wait_for_reply`, no `step_8_reply_done`.** The delimiters never appeared. The model produced a reply but didn't wrap it in `START_QWEN_REPLY` / `END_QWEN_REPLY`. This is the `invalid_response_format` case — see [invalid_response_format](#symptom-invalid_response_format-qwen).
 
 ### General
 
-**Hangs indefinitely with no trace line at `x failed`.** This is the [queue blocked by a crashed extension](#symptom-queue-blocked-by-a-crashed-extension) case. The extension crashed after `/next` but before `/reply`. Restart the server.
+**No trace line and the request has not dispatched.** Check `/status`, extension popup token/port, and the server's queue deadline. Queue expiry returns a `not_dispatched` failure; an empty or stale `/tabs` snapshot alone is not proof of extension readiness.
 
-**The work tab shows the prompt but it hasn't been sent.** The input was typed but `sendClick` didn't fire, or fired and didn't register. Manually click send in the tab to unblock (the provider will detect the assistant message and complete normally). Then check the `sendClick` trace — if `ms` is present but no `firstMsg` follows, that's the bug; see `send_failed`.
+**The work tab shows the prompt but no answer is visible.** Do not click send or resubmit blindly. Check whether a user turn was created and whether the provider is still generating. If dispatch status is uncertain, keep the same request ID and wait for a late reply; do not make a new request until the tab has been inspected.
 
 ---
 
@@ -299,43 +308,19 @@ The last `~ <id8> <phase>` line tells you where — and **which provider** based
 
 ---
 
-## Symptom: `no_work_tab`
+## Symptom: `ambiguous_provider_tab`
 
-The current implementation uses `ambiguous_provider_tab` for missing or duplicate matching tabs. The details below describe an earlier implementation and should not be used to diagnose current errors.
+**Diagnosis:** the extension did not find exactly one tab matching the explicitly requested provider's exact hostname, or the supplied `targetTabId` does not match that provider. It does not silently select another provider or tab.
 
-**Diagnosis:** `{"ok": false, "error": "input_not_found", "reason": "no_work_tab"}`. The `reason` field is `no_work_tab`, which means `getWorkTab(provider)` returned `null`. **No tab with the requested provider is open.**
-
-This is a **user-fixable** case: the user needs to open a tab for the provider that the request targets. The `input_not_found` code is technically accurate but the `reason` is what the user sees and acts on.
-
-**Confirm:**
-
-```bash
-curl -s -H "Authorization: Bearer $EXTENSION_TOKEN" http://127.0.0.1:7331/tabs | python3 -m json.tool
-```
-
-Look at the `provider` field for each tab. If you requested `provider: 'qwen'` but the `tabs` array has no entries with `provider: 'qwen'`, that's the diagnosis.
-
-**Fix:** open a tab to the requested provider's domain:
-
-- `provider: 'deepseek'` → open `https://chat.deepseek.com/`
-- `provider: 'qwen'` → open `https://chat.qwen.ai/`
-- `provider: 'tongyi'` → open `https://tongyi.aliyun.com/` (note: no provider module yet — this would return `no_provider_loaded`, not `no_work_tab`, after the tab opens)
-
-The extension re-registers via `/hello` when a new provider tab opens (the tab URL change triggers `register()`), and the next `/chat` finds it.
-
-**If `/tabs` shows a tab for the provider but you're still getting `no_work_tab`:** the tab's URL might not match `DSC.PROVIDER_DOMAINS[provider]` exactly. For example, `provider: 'qwen'` looks for URLs starting with `https://chat.qwen.ai/`. A tab at `https://chat.qwen.ai/chat/abc` matches (startsWith), but `https://chat.qwenlm.ai/` does not (old domain). Check the tab's URL in `/tabs`.
-
-**Common cause:** the user closed the Qwen tab thinking they were done with it, then a batch run targets Qwen sources. Preflight should verify one matching Qwen tab using the current `/tabs` snapshot and still handle `ambiguous_provider_tab` on dispatch. See [integration-guide.md#prerequisites](integration-guide.md#prerequisites).
+**Fix:** open exactly one tab for the requested provider, close duplicate matching tabs, and verify any `targetTabId` against the current browser tab. `/tabs` is only a cached snapshot from the last extension registration; it is useful for diagnosis but does not establish live readiness. The request itself performs the authoritative routing check.
 
 ---
 
-## Symptom: `no_provider_loaded`
+## Provider registration failure
 
-The content script may log an internal provider-registration failure, but this is not a registered public error code. The current client normalizes unknown extension errors to `internal_error`. See [providers.md](providers.md) for provider registration.
+The content router reports `no_provider_loaded` internally when `DSC_PROVIDERS[msg.provider]` is absent. This is not a registered public error code, so do not depend on a particular public code or decision bucket; preserve the returned request identity and diagnostics, and treat it as a failure requiring review.
 
-**Diagnosis:** `{"ok": false, "error": "input_not_found", "reason": "no_provider_loaded"}`. The `reason` field is `no_provider_loaded`, which means `content.js`'s router couldn't find `DSC_PROVIDERS[msg.provider]`. **The provider module isn't registered.**
-
-This is **not user-fixable** — it's a **developer registration bug**. The user cannot fix it from the CLI. It surfaces as `input_not_found` at the code level (because `background.js` doesn't recognize the code `no_provider_loaded`), but the correct classification is bucket E (skip silently, mark `needs-review`), not bucket D (beep).
+This is generally a provider registration or stale-injection problem, not something a batch caller can fix by retrying. Check the provider configuration and extension build, reload the extension, then reload the provider tab. Do not retry under a new request ID unless the failed request is confirmed `not_dispatched`.
 
 **Confirm** by checking the content script's console on the failing provider tab:
 
@@ -354,13 +339,13 @@ And check whether `[dsc:router:diag]` appears in the console at all:
 // If it's present, look at the registeredProviders array
 ```
 
-**Fix** — three registrations must be in place (see [providers.md#the-registration-checklist](providers.md#the-registration-checklist)):
+**Fix for built-in drivers:** verify the registration checklist in [providers.md#the-registration-checklist](providers.md#the-registration-checklist):
 
 1. `providers/<name>.js` in `manifest.json`'s `content_scripts.js` array (loaded before `content.js`).
 2. `providers/<name>.js` in `background.js`'s `sendToTab` re-injection files list.
 3. `DSC.PROVIDER_DOMAINS['<name>'] = '<url-prefix>/'` in `shared.js`.
 
-If any of these is missing, add it. Then reload the extension and hard-reload the provider tab (see [reload discipline](#reload-discipline)).
+If any built-in registration is missing, correct it, then reload the extension and provider tab (see [reload discipline](#reload-discipline)). For a config provider, verify that it is enabled in the Providers page, its definition has the expected exact domain, and the extension has its host permission; do not add a hand-written driver module.
 
 **This symptom appearing intermittently** (works on first request, fails on retry) usually means the `background.js` re-injection list is missing the provider. The first request works because the content script was already injected; a mid-run crash triggers re-injection with the old file list, and the retry fails. See [providers.md#the-registration-checklist](providers.md#the-registration-checklist) for why this is the hardest of the three to catch.
 
@@ -386,102 +371,49 @@ The failing tab's `url` should be a chat URL. If it's a login page (`/login`, `/
 
 ---
 
-## Symptom: `extension_disconnected`
+## Symptom: queued request times out
 
-The current `/tabs` route is not a live connectivity probe, and requests may wait until their client timeout if the extension is not polling. Verify the extension's token, port, poll loop, and server log instead.
+The server accepted the request but no poller dispatched it before the queue deadline. Check `/status` for `registered`, `extensionResponsive`, `queued`, `inFlight`, and `lastPollAt`; `/tabs` is a cached tab snapshot, not a connectivity or provider-readiness probe.
 
-**Diagnosis:** every request returns `extension_disconnected`. The server is up but no extension is talking to it. Three possible causes.
+Check that the extension is loaded, its token and configured port match the server, and its poll loop is active. The server reports the bound port from `/status`; the popup must target that port. Opening a provider tab is not required for extension registration, but exactly one matching tab is required when the request is routed.
 
-**Cause 1 — Extension not loaded.** Check `brave://extensions`. If deepseek-connect isn't in the list, click Load unpacked and select the directory. If it's in the list but disabled, toggle it on.
-
-**Cause 2 — Token mismatch.** The popup's token and `.env`'s `EXTENSION_TOKEN` differ. Compare byte-for-byte. If they differ:
-
-1. Open the popup, correct the token, click Save
-2. Reload the extension (brave://extensions → reload)
-3. Check the server log for a new `extension connected` line
-
-**Cause 3 — No provider tab open.** Open `https://chat.deepseek.com/` or `https://chat.qwen.ai/` and wait 2 seconds. The extension registers on the next tab event.
-
-**Confirm the fix:**
-
-```bash
-curl -s -H "Authorization: Bearer $EXTENSION_TOKEN" http://127.0.0.1:7331/tabs | python3 -m json.tool
-```
-
-Expected:
-
-```json
-{
-  "ok": true,
-  "tabs": [
-    { "id": ..., "url": "https://chat.deepseek.com/...", "provider": "deepseek", ... }
-  ]
-}
-```
-
-If `tabs` is empty, the extension is connected but doesn't see any provider tabs — open one.
+After confirming the error is `not_dispatched`, correct the cause and retry with a new request ID; the old ID is deduplicated to its original failure. If the request timed out after dispatch, it is `outcome_unknown`: inspect the provider tab before recovery and do not replay under a new ID.
 
 ---
 
 ## Symptom: `rate_limited`
 
-**Diagnosis:** the provider is throttling the account. The reply contains text matching "too many requests" or "rate limit". The most common failure for a batch running many sources back to back.
+**Diagnosis:** the provider reported a rate limit. Check `retryable` and `executionState` on the actual error; an error code alone does not establish that the prompt was not submitted.
 
 **Fix:**
 
-1. **Wait 30 seconds.** The `rate_limited` error carries `retryAfter: 30000`. The wizard's retry policy should `await sleep(err.retryAfter)` before the retry. This is automatic in a well-built wizard.
+1. **Retry only if the response says `retryable: true` and `executionState: "not_dispatched"`.** Honor the returned `retryAfter` (currently often 30,000 ms); bound the attempts. If the state is `outcome_unknown`, inspect the tab and do not replay automatically.
 
-2. **If retries still fail**, the rate window has moved. Restart the batch after a longer pause (2-5 minutes).
+2. If a safe retry still fails, pause and report the provider's returned error; do not loop indefinitely.
 
-**Multi-provider pivot.** If the wizard supports multiple providers and the source wasn't already on a fallback provider, retry the same prompt on the other provider instead of waiting:
+**Multi-provider pivot is caller policy, not automatic failover.** Only consider a different provider after the current request is confirmed not dispatched or the operator has reconciled its outcome. A pivot is a new request and must use the explicitly selected provider and that provider's own saved conversation URL.
 
-```js
-// Pseudocode — see integration-guide.md#pattern-2--provider-aware-pivot-on-rate-limit
-if (err.code === 'rate_limited') {
-  if (currentProvider === 'deepseek') {
-    retryWithProvider('qwen');
-  } else if (currentProvider === 'qwen') {
-    retryWithProvider('deepseek');
-  }
-}
-```
+**Prevention.** If this happens regularly, lower the caller's request rate or pause between items. Do not send concurrent work expecting provider-level parallelism; the server dispatches one item at a time.
 
-Note that each provider gets its own chat — the retry on Qwen should use `chat: \`${source.name}-qwen\`` (or similar), not the DeepSeek chat name. The `chat-map.json` in [integration-guide.md](integration-guide.md) keys on `(source.name, provider)` pairs for this reason.
-
-**Prevention.** If this happens regularly, the batch is running too fast for the account's quota. Options:
-
-- Increase the pause between sources (add a `--delay` flag to the batch wizard)
-- Disable DeepThink for prompts that don't need reasoning (DeepSeek only — the extension's auto-enable can't be bypassed per-request in v0.2.0)
-- Use the provider-pivot pattern to spread load across both providers
-- Use a different account (out of scope — one profile, one account per provider)
-
-The extension **cannot** do anything about rate limits. It reports them accurately, and the caller's policy decides what to do.
+The extension does not switch providers or silently replay prompts. The caller chooses any explicit provider change.
 
 ---
 
 ## Symptom: `input_not_found`
 
-**Diagnosis:** the work tab doesn't have a chat input box where the extension expects one. The `reason` field distinguishes the causes.
+The extension returns `input_not_found` when a supported provider driver cannot find a usable chat input. Missing, duplicate, or mismatched provider tabs use `ambiguous_provider_tab`; provider registration failures are diagnostics, not a public `no_provider_loaded` code.
 
-**`reason: 'no_work_tab'`** — see [no_work_tab](#symptom-no_work_tab). No provider tab is open.
+Check `executionState` before recovery. Retry only when the error explicitly reports `not_dispatched` and `retryable: true`; if dispatch is uncertain, inspect the provider tab first.
 
-**`reason: 'no_provider_loaded'`** — see [no_provider_loaded](#symptom-no_provider_loaded). Registration bug.
-
-**`reason: 'input_not_found'`** (or any other reason string without a `no_*` prefix) — the tab exists and the provider module is registered, but the input selector didn't match. Four causes, in order of frequency:
-
-**Cause 1 — Wrong URL.** The tab is on a non-chat page. Confirm:
+**Cause 1 — Provider page state.** Confirm the provider tab is on its chat view:
 
 ```bash
 curl -s -H "Authorization: Bearer $EXTENSION_TOKEN" http://127.0.0.1:7331/tabs | python3 -m json.tool
 ```
 
-The failing tab's `url` must be a provider chat URL. If it's `/login`, `/app`, or a settings page, navigate to the provider root and retry.
+If the tab shows a login page, use the [logged_out recovery](#symptom-logged_out). If it is on another page on the same provider hostname, navigate to the chat view. Wait for loading or blocking dialogs to clear, and retry only if the failed request is confirmed not dispatched.
 
-**Cause 2 — Tab closed.** The extension selected the tab but it closed between selection and dispatch. Open a fresh provider tab and retry.
-
-**Cause 3 — Loading state.** The tab is still loading. The extension's `waitForInputReady(5000)` times out after 5 seconds. If the page is genuinely slow to load (network, cold cache), retry — it usually succeeds on attempt 2.
-
-**Cause 4 — DOM drift.** The input selector matched before, but the provider's DOM changed. Check the `probe` field on the error:
+**Cause 2 — DOM drift.** The provider's controls changed or the input selector no longer matches. Check the `probe` field on a `dom_drift` error:
 
 ```json
 {
@@ -493,7 +425,7 @@ The failing tab's `url` must be a provider chat URL. If it's `/login`, `/app`, o
 }
 ```
 
-`requiredMissing: ["input"]` means the input selector returned null. That's [dom_drift](#symptom-dom_drift). Escalate to [selector-maintenance.md](selector-maintenance.md).
+`requiredMissing: ["input"]` means the required input selector returned null. Escalate to [selector-maintenance.md](selector-maintenance.md).
 
 **Qwen-specific:** Qwen's `input_not_found` doesn't carry a `probe` field (Qwen's provider doesn't use `selectors.js`). The `reason` is just `'input_not_found'`. To diagnose:
 
@@ -504,6 +436,14 @@ document.querySelector('textarea')                          // fallback
 ```
 
 If both return null, Qwen's input has moved. The Qwen provider needs a new selector tier — see [selector-maintenance.md](selector-maintenance.md).
+
+---
+
+## Symptom: `send_failed` during readiness checks
+
+The provider driver records a stage trace and stops rather than overwriting a non-empty composer or clicking an unstable send control. For `input_not_empty_before_send`, the existing text was deliberately preserved; inspect it and clear it yourself only after confirming it is not an unsent prompt. For `provider_busy_or_not_ready` or `send_control_not_stable`, let the page finish loading or generation settle, then retry only if `executionState` is `not_dispatched`.
+
+For `send_not_registered`, the send click was already issued but the driver did not observe the composer clearing, generation starting, or a new assistant message. This is not safe to replay automatically. Inspect the provider tab first; if the prompt is present or running, wait for that response rather than sending again. Stage progress is correlated with the original `requestId`; use it together with the final `trace` to see which guard stopped the transition.
 
 ---
 
@@ -554,22 +494,9 @@ The `details` array names which required selector broke. The `probe` field shows
 
 ## Symptom: `invalid_response_format` (Qwen)
 
-**Diagnosis:** `{"ok": false, "error": "invalid_response_format", "details": {"rawPreview": "..."}}`. Qwen produced a reply but didn't wrap it in `START_QWEN_REPLY` / `END_QWEN_REPLY`. The Qwen provider's strict-delimiter extraction refuses to extract anything not properly delimited.
+**Diagnosis:** Qwen produced a reply but the configured delimiters were not found, so extraction failed rather than returning an ambiguous fragment. The optional `details.rawPreview` is a short excerpt of provider output in the HTTP error; it is not written to server logs and should be handled as untrusted model output.
 
-**Confirm** by looking at `details.rawPreview` — the first 200 chars of what the model actually said. Two cases:
-
-1. **`rawPreview` shows prose** (e.g., "Sure, here's the extractor:") — the model started replying but never produced the delimiters. Retry once; the model usually cooperates on attempt 2.
-2. **`rawPreview` shows code or structured content** — the model produced an answer but wrapped it differently (maybe in markdown fences, or in different delimiters). This means the model is ignoring the delimiter instruction. The prompt enforcement needs strengthening.
-
-**Fix:**
-
-1. **Retry once.** The Qwen provider's retry policy retries `invalid_response_format` up to 3 times (bucket A — retryable, not user-fixable). The wizard should already do this. If you're seeing it manually, just resend the same curl.
-2. **If it fails 3 times in a row**, the model is consistently ignoring the delimiter instruction. Check the actual prompt sent by examining `step_4_verify_input.promptLen` in the trace — it should be ~154 chars longer than your original prompt (the delimiter instruction the provider appends). If it's not, the provider's prompt construction broke.
-3. **If the prompt looks right but the model still ignores it**, the model may be in a state where it prioritizes other instructions over the delimiter one. Try a different prompt formulation — the batch wizard's prompt may need to move the delimiter instruction to the top, not the end, or use stronger language ("CRITICAL: You MUST..." instead of "IMPORTANT: You MUST...").
-
-**Why this happens on Qwen specifically:** Qwen streams a "Thinking..." preamble before the answer. The strict-delimiter requirement is what prevents the provider from returning "Thinking..." as the content. A DeepSeek-style stability detector would return whatever text was there when it stabilized — and on Qwen, that's often the preamble. The strict delimiter requirement is a trade-off: it prevents false positives, at the cost of occasionally failing on genuine replies where the model didn't follow the instruction.
-
-**The error is bucket A** — retry silently, don't beep. The retry usually succeeds, and if it doesn't, the source lands in `needs-review` for the operator to investigate.
+Inspect the provider tab and the bounded trace/preview. Confirm whether the prompt and a new assistant turn are present, then decide whether a new prompt is appropriate. This failure occurs after dispatch and is not marked retryable. Do not copy model-produced code into a trusted location or execute it; the caller must perform syntax, identity, and verdict checks.
 
 ---
 
@@ -579,7 +506,7 @@ The `details` array names which required selector broke. The `probe` field shows
 
 **Cause:** the user clicked into a different chat while a prompt was streaming, or the provider auto-redirected (session expiry mid-stream, for example).
 
-**Fix:** retry the request. The batch wizard's retry policy should already do this — `user_navigated` is `retryable: true, userFixable: true` (bucket C), so it retries twice before beeping.
+**Fix:** inspect the tab and conversation, then decide whether a new prompt is appropriate. `user_navigated` is not retryable by default because the original may have been submitted and its result is discarded to avoid returning a response from the wrong conversation.
 
 **If it happens repeatedly:** the user is actively clicking around in the work tab during the batch. Tell them to leave the work tab alone while a batch is running. This is the one failure mode where the fix is procedural, not code.
 
@@ -589,7 +516,7 @@ The `details` array names which required selector broke. The `probe` field shows
 
 ## Symptom: Qwen's age modal keeps appearing
 
-**Diagnosis:** Qwen's "Confirm your age" modal appears repeatedly during a batch, blocking the input. The Qwen provider has a `dismissAgeModal()` function that runs before every action, but it's not catching every case.
+**Diagnosis:** a modal or other blocking page UI may be preventing access to the chat input. The Qwen driver attempts to dismiss its known age modal, but other consent/challenge UI is not guaranteed to be handled.
 
 **Confirm** by looking at the trace — if a Qwen request fails with `input_not_found` after `step_1_dismiss_modal`, the modal dismissal ran but didn't dismiss the modal that was actually present.
 
@@ -607,62 +534,34 @@ The `details` array names which required selector broke. The `probe` field shows
 
 For urgent cases: run the dismisser manually by clicking the modal's "Continue" / "I'm over 18" / "Accept" button in the Qwen tab. The next prompt will proceed.
 
-**If the modal appears on every prompt:** that's a stronger signal — Qwen is flagging the automation. Slow down the pacing (the provider uses 1000-1500ms sleeps; try increasing to 2000ms). The trade-off is slower batches, but a batch that completes slowly is better than one that stalls on a modal every 3 prompts.
+**If the modal appears repeatedly:** complete only the provider's legitimate UI step in the browser, then verify the chat is usable. The extension does not bypass bot challenges or authentication.
 
 ---
 
 ## Symptom: Qwen is much slower than DeepSeek
 
-**Diagnosis:** Qwen requests take 7-10 seconds, DeepSeek requests take 4-8 seconds. This is **expected behavior**, not a bug.
+**Diagnosis:** Qwen's driver includes pacing between UI interactions. Total duration also depends on page readiness and provider generation; fixed latency/success estimates are not guarantees.
 
-**Why:** Qwen's provider inserts explicit `sleep()` calls between every action to prevent the React app from dropping the send click and to avoid triggering the age modal:
-
-- 1000ms after dismissing the modal (wait for it to settle)
-- 1000ms after finding the input (ensure UI is stable)
-- 1500ms after typing (let React register the input value)
-- 1000ms before clicking send
-- 1500ms after clicking send (wait for network to initiate)
-
-Total: ~5 seconds of pure pacing, on top of the model's own generation time (which is typically 2-4 seconds).
-
-**Do not reduce the pacing to speed things up.** The pacing is what prevents two failure modes:
-
-1. **Dropped send clicks** — Qwen's React app gets overloaded if you send too fast. Without the sleeps, the send click fails about 10% of the time, and the failure is `send_failed` (retryable but frustrating).
-2. **Age modal triggers** — Qwen uses the age modal as a bot-defense signal. Fast action sequences trigger it more often.
-
-The pacing trade-off was made during development after observing that fast actions led to significantly worse reliability. The current pacing produces a 99%+ first-attempt success rate on Qwen; reducing it drops below 90%. A 5-second-per-prompt overhead is worth a 10% failure rate.
-
-**If you need faster batches:**
-
-1. **Route sources to DeepSeek when possible.** DeepSeek is faster (no pacing overhead). Pivot to Qwen only when DeepSeek rate-limits.
-2. **Batch in parallel across providers.** Two sources, one on DeepSeek and one on Qwen, run concurrently (they're on different tabs). See [integration-guide.md](integration-guide.md) for the pattern.
-3. **Accept the slower pace.** A batch of 76 sources on Qwen takes ~10-13 minutes vs. 6-8 minutes on DeepSeek. That's still faster than the clipboard loop, and it doesn't fail.
-
-**If Qwen is taking 20+ seconds per prompt:** something is wrong. Check the trace for where the time is going. If most time is in `step_7_wait_for_reply`, the model is generating a very long reply (check `step_8_reply_done.len`). If most time is in `step_2_find_input`, the input selector is slow — Qwen's DOM might have grown large. If most time is in `step_1_dismiss_modal`, the modal dismissal is running repeatedly — check whether the modal is actually being dismissed or just found repeatedly.
+Keep the workflow sequential; this server has one in-flight request across all providers. Compare elapsed time and the last observed progress phase. Long generation can be provider-side; missing progress can also mean telemetry delivery failed. Check the tab rather than assuming a specific phase caused the delay.
 
 ---
 
 ## Symptom: queue blocked by a crashed extension
 
-**Diagnosis:** every new `/chat` hangs. The server log shows `-> dispatched <id>` for a previous request but no `ok done` or `x failed` for it. The previous request is stuck in `inFlight` forever, blocking the queue.
+**Diagnosis:** a dispatched request reached its deadline without a reply, so its outcome is uncertain. Check `/status` for the request ID and `inFlight` state. The server quarantines this slot and does not dispatch later jobs into it.
 
-**This is the v0.2.0 "extension dies mid-flight" bug**, documented in [protocol.md#queue-state-machine](protocol.md#queue-state-machine). It happens when the extension picks up a job via `/next`, then crashes (service worker killed, tab crashed, browser closed) before posting `/reply`.
+**Recovery:**
 
-**Fix:** restart the server.
+1. Inspect the exact provider tab for the user prompt and any assistant response, login page, challenge, or ongoing generation.
+2. If a late reply arrives, the server releases the slot. Repeat the original request with the same `requestId` and identical payload to retrieve the cached terminal result without redispatch.
+3. If there is no reply and the tab has been manually reconciled, stop/restart the server only after recording what happened. Restart clears in-memory request IDs and cannot prove whether the prompt was submitted.
 
 ```bash
-# Ctrl+C the running server
-# Then restart:
+# Only after inspecting and reconciling the provider tab:
 node --env-file=.env src/server.js
 ```
 
-After restart, the queue is empty, the extension reconnects via `/hello`, and the next `/chat` dispatches normally.
-
-**If restarting the server doesn't clear it**, the extension is genuinely crashed, not just offline. Reload the extension (brave://extensions → reload) and hard-reload every provider tab. Then restart the server again.
-
-**Prevention:** none in v0.2.0. The per-request server-side timeout is designed but not shipped. In practice, the extension crashing mid-stream is rare — most failures are graceful (`dom_drift`, `input_not_found`, `response_timeout`), which return via `/reply` and clean up `inFlight` correctly.
-
-**Multi-provider note:** if two providers are being driven concurrently (two requests in-flight at once — which shouldn't happen since the queue is serialized, but could happen if the wizard bypasses the queue and calls `/next` directly), a crash on one provider could block the other. The queue serialization should prevent this; if you observe it, something is bypassing the queue.
+Queued requests time out separately if an in-flight slot remains quarantined. Their `executionState` is `not_dispatched`, so those requests can be considered independently. No extension/server restart can cancel work already running in a provider tab.
 
 ---
 
@@ -675,7 +574,7 @@ cd deepseek-connect
 node --env-file=.env src/server.js
 ```
 
-Stop: Ctrl+C. The server's `SIGINT` handler calls `server.stop()`, which rejects all in-flight and queued promises with `{ code: 'cancelled' }`, clears the queue, and closes the socket. The extension gets a network error on its next `/next` poll, retries with backoff, and reconnects once the server is back.
+Stop: Ctrl+C. `server.stop()` fails queued requests as `not_dispatched` and dispatched requests as `outcome_unknown`, clears local state, and closes the socket. It does not cancel provider work. An extension that is still configured retries connection and registers again when the server returns.
 
 Restart after a code change:
 
@@ -760,12 +659,11 @@ One machine, one Chrome profile, one server, one extension. This is what the qui
 
 ### Multi-provider considerations
 
-If the batch mixes providers (DeepSeek for some sources, Qwen for others, with pivot on rate limit):
+If the batch explicitly routes different sources to different providers:
 
-1. **Open both provider tabs** before starting the batch. See [no_work_tab](#symptom-no_work_tab) for what happens if one is missing.
-2. **Log into both providers** in the same browser session. Different accounts, same Chrome profile — the extension can't tell which account is logged into which tab, and doesn't care.
-3. **Monitor rate limits independently.** DeepSeek and Qwen have separate quotas. A DeepSeek rate limit doesn't affect Qwen and vice versa.
-4. **The Qwen tab needs to stay open even during DeepSeek-only phases.** If the wizard pivots to Qwen on the 5th source, the Qwen tab must have been open the whole time. Opening it mid-batch causes a `hello` re-registration, which is fine, but the first request after it opens might race with the registration.
+1. **Select the provider per source.** The extension never performs automatic failover. A provider change is a caller decision and must not be used to retry an `outcome_unknown` request.
+2. **Open and log in to each provider tab before its request is dispatched.** Exactly one matching provider hostname must be open when each request runs; `/tabs` is not a readiness guarantee.
+3. **Keep the run sequential.** The server dispatches one request at a time even when multiple provider tabs are open.
 
 ### Restart discipline after provider changes
 

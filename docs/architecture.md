@@ -131,7 +131,11 @@ Seven things worth naming from the sequence:
 
 **`/reply` resolves the caller's promise; `pump()` advances the queue.** These are two separate operations inside the same HTTP handler. Resolve happens first, so the caller gets its content even if the next `pump()` throws.
 
-**The caller's connection stays open the entire time.** No heartbeats, no keep-alive trickery, no chunked encoding. It's a plain HTTP request that doesn't return for 4-15 seconds (typical — Qwen is a bit slower than DeepSeek due to pacing) or 90 seconds (timeout). Node's `http.createServer` handles this fine, but a reverse proxy in front of it wouldn't. That's why [protocol.md#constraints](protocol.md#constraints) says "loopback only."
+**The caller's connection stays open the entire time.** The server handles the request/reply round trip as a plain HTTP request. Queue deadline defaults to 120 seconds; dispatched-request and Node client deadlines default to 960 seconds. A caller may use a shorter timeout, which does not cancel provider work. If dispatch may have occurred, the terminal error is `outcome_unknown`.
+
+### Request correlation and recovery
+
+The client creates or preserves one `requestId` across caller, queue, `/next`, provider progress, and `/reply`. The server deduplicates identical submissions in a bounded in-memory cache; conflicting payloads for the same ID return 409. A request is terminally `completed`, definitely `not_dispatched`, or `outcome_unknown`. After dispatch, timeout does not free the queue slot: the server quarantines it until a late reply or shutdown, so another request cannot be mistaken for it. Repeating the exact same request ID after a late reply retrieves the cached terminal result without redispatch. The cache is lost on server restart, so inspect the provider tab before recovery after a restart.
 
 ## Module boundaries
 
@@ -250,7 +254,7 @@ The `dsc_phase` listener is a separate `chrome.runtime.onMessage.addListener` th
 
 The rule: **server.js owns the queue, not the request semantics.** It doesn't know what a "prompt" is, what "delimiters" are, or what "provider" means — all three are opaque fields that get threaded from the HTTP request through `enqueue()` → `pump()` → `/next` → `/reply` → the caller's response. The semantics belong to the provider.
 
-The three collections — `queue[]`, `waiting[]`, `inFlight` Map — are the entire state. `pump()` is the only place jobs move between them. `enqueue()` is the only place jobs enter `queue[]`. `/reply` is the only place jobs exit `inFlight`. See [protocol.md#queue-state-machine](protocol.md#queue-state-machine) for the state diagram and the "extension dies mid-flight" hole (which is real and documented as a v0.2.0 limitation).
+The main runtime collections are `queue[]`, `waiting[]`, and the `inFlight` Map, with request identity and a bounded completed-request cache. `pump()` is the dispatch point; `enqueue()` adds jobs; `/reply` removes active work. Queue expiry removes definitely undispatched work. A dispatched timeout reports uncertain outcome but keeps the slot quarantined until reply or shutdown. See [protocol.md#queue-state-machine](protocol.md#queue-state-machine).
 
 **Provider threading** is a one-line addition to `enqueue`'s entry object (`provider: req.provider || 'deepseek'`) and a one-line addition to `pump`'s `/next` payload. That's the entire server-side multi-provider surface — ~4 lines of code total. If server.js ever grows provider-specific logic beyond those 4 lines, that's a design bug — provider details should not reach the queue layer.
 
@@ -264,7 +268,7 @@ The rule: **client.js doesn't retry, and it threads `provider` through.** Every 
 
 ~200 lines. `CODES`, `META`, `DSCError` class, four helpers. Imported by both `src/server.js` and `src/client.js`, and mirrored (not imported) in `shared.js`.
 
-The rule: **errors.js is the single source of truth for codes.** 21 codes as of v0.2.0, including the multi-provider-specific `INVALID_RESPONSE_FORMAT`. A code that isn't in `CODES` isn't a code — providers that raise unregistered codes get collapsed to `internal_error` by the client, which loses the wizard's ability to switch on them. When Qwen was added and needed `invalid_response_format`, the code was registered in `errors.js` in the same commit as the provider, not raised ad-hoc from `qwen.js`. See [error-codes.md](error-codes.md).
+The rule: **errors.js is the source of registered codes and default metadata.** Errors can add request identity and execution state; server-side `retryable` is overridden to false when dispatch may have occurred. Unknown extension codes are surfaced as `internal_error` with diagnostic context. See [error-codes.md](error-codes.md).
 
 ## The eight load-bearing decisions
 
@@ -438,7 +442,7 @@ Six things that are out of scope by design, each for a specific reason.
 
 **5. It does not interpret the reply.** Delimiter extraction, fence extraction, raw fallback — those are three text-manipulation passes, not a parser. The provider doesn't validate that the extracted text is valid JavaScript, doesn't check that it references the source name, doesn't know whether it's a code block or a prose reply. Those are the caller's concern (the batch wizard's identity check). The provider's contract is "here's what the assistant said between the delimiters (or the fences, or the whole thing)" — the caller decides what to do with it.
 
-**6. It does not retry.** A single `sendPrompt` call is a single attempt. If the provider reports `send_failed`, the extension does not internally retry. It returns the error to the background, which posts `/reply { status: 'error' }`, which the caller sees as a `DSCError`. Retry policy lives in the caller (see [integration-guide.md#sendwithretry](integration-guide.md#sendwithretry)). Putting retry inside `sendPrompt` would make the trace opaque and would conflate "the extension tried and gave up" with "the caller will try again."
+**6. It does not retry.** A single `sendPrompt` call is a single attempt. The caller may retry only when the error says `retryable: true` and `executionState: "not_dispatched"`; it must not replay an uncertain request under a new ID. See [integration-guide.md#safe-retry-and-recovery](integration-guide.md#safe-retry-and-recovery).
 
 ## Data flow between modules
 
@@ -454,7 +458,7 @@ One line per boundary. Useful when tracing "which module is responsible for X".
 - **`content.js` → `background.js`** via `chrome.runtime.sendMessage` — `dsc_phase` (progress), `state` (popup UI). Two types, both fire-and-forget.
 - **`background.js` → `src/server.js`** via `fetch` — `/hello`, `/next`, `/reply`, `/progress`. HTTP, authenticated with `EXTENSION_TOKEN`.
 - **`src/server.js` → `src/client.js`** (via the caller) — the HTTP response body is what the caller's `dc.chat()` resolves to. `DSCError` on non-2xx, parsed body on 2xx.
-- **`src/client.js` → caller's batch loop** — `chat()`, `open()`, `reset()`, `tabs()`. `DSCError` on failure with `{ code, retryable, userFixable, retryAfter, details }`.
+- **`src/client.js` → caller's batch loop** — `chat()`, `open()`, `reset()`, `tabs()`, `status()`. `DSCError` on failure with `{ code, retryable, userFixable, retryAfter, details, trace, requestId, executionState }` where available.
 - **`src/server.js` `enqueue` → `pump` → `/next` → `background.handleNext` → `sendToTab`** — the `provider` string threads through every hop, unchanged. Four hops, four assignments, no transformation.
 
 When a bug appears at one of these boundaries, the fix belongs on the side that owns the contract:

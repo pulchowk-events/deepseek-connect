@@ -52,8 +52,14 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function loadConfig() {
   const s = await chrome.storage.local.get([DSC.STORAGE.TOKEN, DSC.STORAGE.PORT]);
   const token = s[DSC.STORAGE.TOKEN];
-  const port = s[DSC.STORAGE.PORT] || DSC.DEFAULT_PORT;
+  const port = Number(s[DSC.STORAGE.PORT] || DSC.DEFAULT_PORT);
   if (!token) return null;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    state.connected = false;
+    state.lastError = 'invalid_port: configure a port from 1 to 65535';
+    broadcast();
+    return null;
+  }
   return { token, port, baseUrl: 'http://127.0.0.1:' + port };
 }
 
@@ -78,7 +84,11 @@ async function apiFetch(cfg, path, init) {
   }
   try {
     const res = await fetch(cfg.baseUrl + path, fetchInit);
-    const json = await res.json().catch(() => ({}));
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch (_) {
+      throw new Error('invalid_json_response_' + path.slice(1));
+    }
     if (controller && controller.signal.aborted) throw new Error('aborted');
     if (!res.ok) {
       const err = new Error(json.error || ('http_' + res.status));
@@ -174,34 +184,90 @@ async function sendToTab(tabId, msg) {
 
 // Resolve when the tab reports status=complete, or after timeoutMs.
 function waitForTabComplete(tabId, timeoutMs) {
-  return new Promise((resolve) => {
-    const onUpd = (id, info) => {
-      if (id === tabId && info.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(onUpd);
-        resolve();
-      }
-    };
-    chrome.tabs.onUpdated.addListener(onUpd);
-    setTimeout(() => {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let checking = false;
+    let lastUrl = null;
+    let stableSince = 0;
+    let pollTimer = null;
+    const finish = (error) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (pollTimer) clearTimeout(pollTimer);
       chrome.tabs.onUpdated.removeListener(onUpd);
-      resolve();
-    }, timeoutMs);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+      if (error) reject(error);
+      else resolve();
+    };
+    const check = () => {
+      if (done || checking) return;
+      checking = true;
+      chrome.tabs.get(tabId, (tab) => {
+        checking = false;
+        if (done) return;
+        if (chrome.runtime.lastError || !tab) {
+          finish(new Error('target_tab_unavailable_during_navigation'));
+          return;
+        }
+        const now = Date.now();
+        if (tab.status !== 'complete') {
+          lastUrl = tab.url || null;
+          stableSince = 0;
+        } else if (tab.url !== lastUrl) {
+          lastUrl = tab.url || null;
+          stableSince = now;
+        } else if (!stableSince) {
+          stableSince = now;
+        } else if (now - stableSince >= 1000) {
+          finish();
+          return;
+        }
+        pollTimer = setTimeout(check, 200);
+      });
+    };
+    const onUpd = (id) => {
+      if (id === tabId) check();
+    };
+    const onRemoved = (id) => {
+      if (id === tabId) finish(new Error('target_tab_closed_during_navigation'));
+    };
+    const timer = setTimeout(() => finish(new Error('navigation_timeout')), timeoutMs);
+    chrome.tabs.onUpdated.addListener(onUpd);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+    check();
   });
 }
 
 let activeRequestId = null;
 
+async function reportProgress(cfg, requestId, phase, extra) {
+  try {
+    await apiFetch(cfg, '/progress', {
+      method: 'POST',
+      body: JSON.stringify({ requestId, phase, extra }),
+    });
+  } catch (e) {
+    console.warn('[dsc:progress] report failed', String(requestId || '').slice(0, 8), phase, e.message);
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || msg.type !== 'dsc_phase') return;
-  if (!activeRequestId) return;
-  const rid = activeRequestId;
+  const rid = msg.requestId;
+  if (!rid || rid !== activeRequestId) {
+    console.warn('[dsc:progress] dropped phase without matching active request', String(rid || '').slice(0, 8));
+    return;
+  }
   (async () => {
     const cfg = await loadConfig();
     if (!cfg) return;
     await apiFetch(cfg, '/progress', {
       method: 'POST',
       body: JSON.stringify({ requestId: rid, phase: msg.phase, extra: msg.extra }),
-    }).catch(() => {});
+    }).catch((e) => {
+      console.warn('[dsc:progress] report failed', rid.slice(0, 8), String(msg.phase || '').slice(0, 80), e.message);
+    });
   })();
 });
 
@@ -245,38 +311,74 @@ async function replyError(cfg, requestId, error, reason, details) {
   });
 }
 
-async function handleNext(cfg, work) {
-  const resolved = await resolveWorkTab(work.targetTabId, work.provider);
-  if (!resolved.tab) {
-    await replyError(cfg, work.requestId, resolved.error, resolved.reason, resolved.details);
-    return;
-  }
-  const tab = resolved.tab;
+function traceShowsPromptDispatch(trace) {
+  if (!Array.isArray(trace)) return false;
+  return trace.some((entry) => entry && [
+    'sendClick', 'step_6_send_clicked', 'gpt_sent', 'cfg_sent',
+  ].includes(entry.phase));
+}
 
+async function handleNext(cfg, work) {
+  let promptMayHaveBeenDispatched = false;
   try {
+    if (!work || typeof work.requestId !== 'string' || !work.requestId ||
+        !['prompt', 'open', 'reset'].includes(work.mode) ||
+        typeof work.provider !== 'string' ||
+        typeof work.chatName !== 'string' ||
+        (work.mode === 'prompt' && typeof work.prompt !== 'string')) {
+      if (work && typeof work.requestId === 'string') {
+        await replyError(cfg, work.requestId, DSC.ERR.BAD_REQUEST, 'malformed_work_item');
+        return;
+      }
+      throw new Error('malformed_work_item');
+    }
     activeRequestId = work.requestId;
+    await reportProgress(cfg, work.requestId, 'tabResolving', { provider: work.provider });
+    const resolved = await resolveWorkTab(work.targetTabId, work.provider);
+    if (!resolved.tab) {
+      activeRequestId = null;
+      await replyError(cfg, work.requestId, resolved.error, resolved.reason, resolved.details);
+      return;
+    }
+    const tab = resolved.tab;
+    await reportProgress(cfg, work.requestId, 'waitingPageStable', { tabId: tab.id });
+    await waitForTabComplete(tab.id, 15000);
+    await reportProgress(cfg, work.requestId, 'providerTabStable', { tabId: tab.id });
     // If the caller supplied a persisted chat URL (retry path), navigate
     // directly and skip the sidebar walk entirely. The URL contains the
     // UUID, which is stable for the chat's lifetime -- no fuzzy matching
     // needed, no dependence on provider's title auto-generation.
     let ensured;
     if (work.targetUrl) {
-      try {
-        await chrome.tabs.update(tab.id, { url: work.targetUrl });
-        await waitForTabComplete(tab.id, 15000);
-        await new Promise((r) => setTimeout(r, 800));
-        const st = await sendToTab(tab.id, { action: DSC.MSG.CHECK_STATE, provider: work.provider });
-        if (!st || !st.inputFound) {
-          throw Object.assign(new Error('url-nav: input not found after navigate'), {
-            code: DSC.ERR.INPUT_NOT_FOUND,
-          });
-        }
-        ensured = { ok: true, existing: true, mode: 'existing', url: work.targetUrl };
-      } catch (e) {
-        // Fall through to ensureChat as a safety net -- the URL might be
-        // stale (chat deleted, provider relocated the UUID).
-        ensured = null;
+      if (DSC.providerForUrl(work.targetUrl) !== work.provider) {
+        throw Object.assign(new Error('saved_chat_url_provider_mismatch'), {
+          code: DSC.ERR.AMBIGUOUS_PROVIDER_TAB,
+        });
       }
+      await chrome.tabs.update(tab.id, { url: work.targetUrl });
+      await waitForTabComplete(tab.id, 15000);
+      const current = await chrome.tabs.get(tab.id);
+      if (!current || !DSC.tabMatchesProvider(current.url, work.provider)) {
+        throw Object.assign(new Error('saved_chat_url_redirected_to_different_host'), {
+          code: DSC.ERR.AMBIGUOUS_PROVIDER_TAB,
+          details: { provider: work.provider, url: current && current.url },
+        });
+      }
+      const requestedPath = new URL(work.targetUrl).pathname.replace(/\/+$/, '');
+      const actualPath = new URL(current.url).pathname.replace(/\/+$/, '');
+      if (requestedPath !== actualPath) {
+        throw Object.assign(new Error('saved_chat_url_redirected_to_different_conversation'), {
+          code: DSC.ERR.CHAT_NOT_FOUND,
+        });
+      }
+      await new Promise((r) => setTimeout(r, DSC.STAGE_DELAY_MS));
+      const st = await sendToTab(tab.id, { action: DSC.MSG.CHECK_STATE, provider: work.provider });
+      if (!st || !st.inputFound) {
+        throw Object.assign(new Error('url-nav: input not found after navigate'), {
+          code: (st && st.loggedOut) ? DSC.ERR.LOGGED_OUT : DSC.ERR.INPUT_NOT_FOUND,
+        });
+      }
+      ensured = { ok: true, existing: true, mode: 'existing', url: current.url };
     }
     if (!ensured) {
       ensured = await sendToTab(tab.id, {
@@ -290,7 +392,7 @@ async function handleNext(cfg, work) {
       // fresh / and retry once. URL nav is robust; button text is not.
       await chrome.tabs.update(tab.id, { url: DSC.PROVIDER_DOMAINS[work.provider] });
       await waitForTabComplete(tab.id, 15000);
-      await new Promise((r) => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, DSC.STAGE_DELAY_MS));
       ensured = await sendToTab(tab.id, {
         action: DSC.MSG.ENSURE_CHAT,
         name: work.chatName,
@@ -303,6 +405,10 @@ async function handleNext(cfg, work) {
         details: (ensured && ensured.details) || ensured,
       });
     }
+    await reportProgress(cfg, work.requestId, 'chatReady', {
+      existing: !!ensured.existing,
+      mode: ensured.mode || null,
+    });
     state.currentChat = work.chatName;
     broadcast();
 
@@ -344,14 +450,17 @@ async function handleNext(cfg, work) {
       return;
     }
 
+    promptMayHaveBeenDispatched = true;
     const result = await sendToTab(tab.id, {
       action: DSC.MSG.SEND_PROMPT,
       prompt: work.prompt,
       delimiters: work.delimiters,
       provider: work.provider,
+      requestId: work.requestId,
     });
 
     if (result && result.error) {
+      activeRequestId = null;
       await apiFetch(cfg, '/reply', {
         method: 'POST',
         body: JSON.stringify({
@@ -363,6 +472,9 @@ async function handleNext(cfg, work) {
           details: result.details,
           probe: result.probe,
           trace: result.trace,
+          executionState: Array.isArray(result.trace)
+            ? (traceShowsPromptDispatch(result.trace) ? 'outcome_unknown' : 'not_dispatched')
+            : 'outcome_unknown',
         }),
       });
       return;
@@ -394,8 +506,12 @@ async function handleNext(cfg, work) {
         error: e.code || 'background_error',
         reason: e.message,
         details: e.details,
+        executionState: promptMayHaveBeenDispatched ? 'outcome_unknown' : 'not_dispatched',
+        retryable: !promptMayHaveBeenDispatched,
       }),
-    }).catch(() => {});
+    }).catch((replyError) => {
+      console.error('[dsc:reply] failed to report error', String(work && work.requestId || '').slice(0, 8), replyError.message);
+    });
   }
 }
 
@@ -484,7 +600,17 @@ async function pollLoop() {
     }
 
     if (!work || work.action === 'idle') continue;
-    if (work.action !== 'next') continue;
+    if (work.action !== 'next') {
+      if (typeof work.requestId === 'string') {
+        await replyError(cfg, work.requestId, DSC.ERR.BAD_REQUEST, 'unexpected_poll_action')
+          .catch((e) => console.error('[dsc:reply] unexpected action report failed', e.message));
+      }
+      state.lastError = 'unexpected_poll_action';
+      state.connected = false;
+      broadcast();
+      await sleep(DSC.RECONNECT_BACKOFF_MS[0]);
+      continue;
+    }
 
     await handleNext(cfg, work);
   }

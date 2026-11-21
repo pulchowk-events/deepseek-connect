@@ -11,7 +11,7 @@ The examples cover provider threading and optional provider pivot policy. `/chat
 - [ExtensionTransport implementation](#extensiontransport-implementation)
 - [Lifecycle](#lifecycle)
 - [The batch loop](#the-batch-loop)
-- [sendWithRetry](#sendwithretry)
+- [Safe retry and recovery](#safe-retry-and-recovery)
 - [Error policy](#error-policy)
 - [Provider pivot](#provider-pivot)
 - [chat-map.json — the persistence layer](#chat-mapjson--the-persistence-layer)
@@ -87,7 +87,7 @@ class Transport {
    * Throws:  DSCError with { code, retryable, retryAfter, userFixable,
    *          details, trace } on failure.
    */
-  async chat({ chatName, provider, prompt, url }) {}
+  async chat({ chatName, provider, prompt, url, requestId, timeoutMs, signal }) {}
 
   /**
    * Clean up. Called once, in a finally block, whether the batch succeeded
@@ -118,7 +118,7 @@ class ExtensionTransport extends Transport {
     super();
     this.token = opts.token || process.env.EXTENSION_TOKEN;
     if (!this.token) throw new Error('ExtensionTransport: EXTENSION_TOKEN required');
-    const defaultPort = parseInt(process.env.EXTENSION_PORT, 10) || 7331;
+    const defaultPort = Number(process.env.EXTENSION_PORT || 7331);
     this.port = opts.port != null ? opts.port : defaultPort;
     this.server = createServer({ token: this.token, port: this.port, log: () => {} });
     this.client = null;
@@ -157,7 +157,9 @@ class ExtensionTransport extends Transport {
       chat: chatName,
       provider,
       url,
-      timeoutMs: timeoutMs || 180000,
+      requestId,
+      timeoutMs,
+      signal,
     });
     return {
       content: result.content,
@@ -183,9 +185,9 @@ Notes:
 - **`port: EXTENSION_PORT from env`.** Not `port: 0`. The extension's popup is configured for a specific port; a wizard on port 0 would bind fine but the extension would never poll it. `EXTENSION_PORT` in `.env` is the source of truth.
 - **Attach-or-own.** If the port is taken (another wizard, another deepseek-connect instance), `EADDRINUSE` is caught and the transport attaches to the existing server. The `ownsServer` flag tracks whether `shutdown()` should stop the server. This lets two wizards coexist — they share one server, both talk to the same extension, and the queue serializes their requests.
 - **`start()` is separate from the constructor.** Constructor is cheap (no I/O). `start()` binds the socket and does the readiness probe.
-- **`await this.client.tabs()` in `start()`.** This only confirms the server answered. `/tabs` is the latest `/hello` snapshot and can be empty or stale; before dispatch, verify that exactly one tab is listed for each selected provider. A request with zero or multiple matches fails with `ambiguous_provider_tab`.
+- **Preflight with `/status` and `/tabs`.** They help diagnose server registration and cached tabs, but neither proves provider login/UI readiness. The request itself performs strict provider-tab matching and fails explicitly if zero or multiple matches exist.
 - **Provider availability is not inferred from a successful `start()`.** The extension may not have registered yet, and config providers must be enabled in the extension. Fail preflight clearly rather than treating `/tabs` as a readiness guarantee.
-- **Saved URL on retries.** For retries that send immediately, pass the saved URL with `chat()`: `/chat` forwards `url` to the queued work and the extension navigates before sending. `/open` remains useful when the caller wants to navigate without sending.
+- **Saved URL on safe new attempts.** Pass the saved URL when a caller has determined another provider turn is appropriate. After an uncertain timeout, do not send a new request; inspect the tab and retain the original request ID for late-result recovery.
 - **Errors propagate as-is.** `dc.chat()` throws `DSCError` with `{ code, retryable, retryAfter, userFixable, details, trace }`. The batch loop's error handler switches on these fields; the transport doesn't wrap or re-interpret them.
 
 ## Lifecycle
@@ -211,7 +213,7 @@ try {
 
 Three rules:
 
-1. **`shutdown()` in `finally`.** Whether the batch succeeded, failed partway, or crashed, the server needs to stop *if we own it*. If we attached to an existing server, leave it running. See [protocol.md#queue-state-machine](protocol.md#queue-state-machine) — the "extension dies mid-flight" hole is real and server-restart is the only recovery.
+1. **`shutdown()` in `finally`.** Stop the server only if this process started it. Stopping clears in-memory request identity and does not cancel provider work; inspect uncertain requests before restarting. If attached to an existing server, leave it running.
 
 2. **`start()` failures are fatal, per-source failures aren't.** If `start()` throws, the batch can't run at all. Exit with a distinct code. Per-source failures become `needs-review` entries.
 
@@ -239,9 +241,9 @@ async function runBatch(transport, sources, chatMap) {
       // directly before sending, so a retry uses the same conversation.
       const mapEntry = chatMap.get(source.name, provider);
 
-      // Step 3 — send the prompt, with retry
+      // Step 3 — retry only definitely undispatched attempts
       const prompt = buildPrompt(source);
-      const result = await sendWithRetry(transport, {
+      const result = await sendWithSafeRetry(transport, {
         chatName: source.name,
         provider,
         prompt,
@@ -253,7 +255,7 @@ async function runBatch(transport, sources, chatMap) {
         chatMap.set(source.name, provider, { url: result.url, at: Date.now() });
       }
 
-      // Step 5 — validate and extract
+      // Step 5 — validate and extract. Never execute generated code.
       const extracted = extractFromContent(result.content, source.name);
       if (!extracted) {
         results.needsReview.push({
@@ -280,14 +282,26 @@ async function runBatch(transport, sources, chatMap) {
         continue;
       }
 
-      // Step 7 — write the file
+      // Also run syntax-only validation and the caller's acceptance/verdict
+      // checks here. All must pass before any generated file is saved.
+      if (!validateJavaScriptSyntax(extracted) || !checkAcceptanceVerdict(result.content, source)) {
+        results.needsReview.push({
+          source: source.name,
+          provider,
+          code: 'validation_failed',
+          requestId: result.requestId,
+        });
+        continue;
+      }
+
+      // Step 7 — write the file only after validation succeeds
       const outPath = path.join(runDir, 'generated', source.name + '.js');
       fs.writeFileSync(outPath, extracted);
       results.ok.push({ source: source.name, provider, elapsedMs: result.elapsedMs });
       printLine(label, 'ok', result.elapsedMs + 'ms');
 
     } catch (err) {
-      const handled = await handleError(err, label, source, transport, chatMap, results);
+      const handled = await handleError(err, label, source, results);
       if (handled.action === 'retry-source') {
         i--;  // re-run this source with the new provider
         continue;
@@ -321,8 +335,15 @@ class ChatMap {
     this.path = path.join(runDir, 'chat-map.json');
     this.data = {};
     try {
-      this.data = JSON.parse(fs.readFileSync(this.path, 'utf8'));
-    } catch (_) { /* fresh run — empty map */ }
+      const parsed = JSON.parse(fs.readFileSync(this.path, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('chat-map.json must contain an object');
+      }
+      this.data = parsed;
+    } catch (err) {
+      if (err.code === 'ENOENT') return;
+      throw err;
+    }
   }
 
   get(sourceName, provider) {
@@ -350,47 +371,29 @@ Key design choices:
 - **Stored in `data/batch/<run>/chat-map.json`.** Same lifecycle as the run directory. A fresh run starts with an empty map; retries within a run reuse the URLs.
 - **Written after every successful `/chat`.** If the process crashes mid-batch, the map has the URLs for all completed sources — a restarted batch can pick up where it left off.
 
-## sendWithRetry
+## Safe retry and recovery
 
-The retry policy wraps the `chat()` call so the same prompt, provider, and saved URL can be retried under one bounded policy.
+Retry only when the server proves the request was not dispatched. Each confirmed-safe attempt gets a new ID because the old ID is deduplicated to its original failure. If dispatch may have occurred, stop and surface the request ID for inspection; do not generate a new ID and replay.
 
 ```js
-async function sendWithRetry(transport, { chatName, provider, prompt, url, timeoutMs }) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
+async function sendWithSafeRetry(transport, params) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const requestId = crypto.randomUUID();
     try {
-      return await transport.chat({ chatName, provider, prompt, url, timeoutMs });
+      return await transport.chat({ ...params, requestId });
     } catch (err) {
-      if (!isRetryable(err)) throw err;
-
-      // rate_limited is special-cased — one delayed retry, not three
-      if (err.code === 'rate_limited') {
-        if (attempt >= 2) throw err;
-        await sleep(err.retryAfter || 30000);
-        continue;
-      }
-
-      // Bucket A and C: retry up to 3 with err.retryAfter between attempts.
-      if (attempt < 3) {
-        await sleep(err.retryAfter || 0);
-        continue;
-      }
-
-      throw err;
+      if (err.executionState !== 'not_dispatched' ||
+          err.retryable !== true ||
+          attempt === maxAttempts) throw err;
+      if (err.retryAfter > 0) await sleep(err.retryAfter);
     }
   }
-}
-
-function isRetryable(err) {
-  // Trust DSCError's metadata, don't switch on code. New codes added in
-  // errors.js get the right retry policy for free.
-  if (typeof err.retryable === 'boolean') return err.retryable;
-  // Manual transport: user pressed Ctrl+C, abort.
-  if (err.code === 'manual_aborted') return false;
-  return false;
+  throw new Error('unreachable');
 }
 ```
 
-**`invalid_response_format` (Qwen) goes through this loop automatically.** It's `retryable: true, userFixable: false` — bucket A. The policy retries it up to 3 times. The model usually cooperates on attempt 2.
+If the caller's own timeout or abort occurs after dispatch, `executionState` is `outcome_unknown`. Report the request ID, inspect the provider tab, and wait for a late reply; after a late reply, repeating the identical request with the same ID retrieves the cached result without dispatching a second prompt. This cache is bounded and lost on server restart. After a restart, inspect the provider tab before any retry.
 
 ## Error policy
 
@@ -401,64 +404,69 @@ async function handleError(err, label, source, transport, chatMap, results) {
   const code = err.code || 'unknown';
   const reason = err.reason || err.message || 'unknown error';
   const currentProvider = source.provider;
+  const failure = {
+    code, reason, requestId: err.requestId, executionState: err.executionState,
+    retryable: err.retryable, retryAfter: err.retryAfter,
+    userFixable: err.userFixable, details: err.details, trace: err.trace,
+  };
 
   // ── Early returns for codes that need special handling ─────────────
 
-  // user_skipped: metadata says userFixable, but the correct behavior is
-  // skip silently — the user just clicked "Skip" in the popup.
+  // user_skipped is registered but no current route emits it.
   if (code === 'user_skipped') {
-    return { action: 'needs-review', code, reason: 'skipped by user' };
+    return Object.assign({ action: 'needs-review' }, failure, { reason: 'skipped by user' });
   }
 
   // ── Provider pivot on rate limit ───────────────────────────────────
   // If the wizard has multi-provider support and hasn't already tried
   // the fallback, pivot instead of skipping.
 
-  if (code === 'rate_limited' && canPivot(currentProvider, source)) {
+  if (code === 'rate_limited' && err.retryable === true &&
+      err.executionState === 'not_dispatched' && canPivot(currentProvider, source)) {
     const fallback = pivotProviderFor(currentProvider);
     // Mark the source to be retried on the fallback provider
     source.provider = fallback;
-    return { action: 'retry-source', code, reason: `pivoting to ${fallback}` };
+    source._pivotedFrom = currentProvider;
+    return Object.assign({ action: 'retry-source', reason: `pivoting to ${fallback}` }, failure);
   }
 
-  // ── Bucket E — skip silently ───────────────────────────────────────
+  // Keep the failure visible for operator review.
 
   if (!err.retryable && !err.userFixable) {
-    return { action: 'needs-review', code, reason, details: err.details };
+    return Object.assign({ action: 'needs-review' }, failure);
   }
 
   // ── Bucket D — beep immediately ────────────────────────────────────
 
   if (!err.retryable && err.userFixable) {
     await beep3x(reason, currentProvider);
-    return { action: 'needs-review', code, reason, details: err.details };
+    return Object.assign({ action: 'needs-review' }, failure);
   }
 
   // ── Bucket C — retry then beep ─────────────────────────────────────
-  // (retries already exhausted in sendWithRetry)
+  // (safe retries already exhausted in sendWithSafeRetry)
 
   if (err.retryable && err.userFixable) {
     await beep3x(reason, currentProvider);
-    return { action: 'needs-review', code, reason, details: err.details };
+    return Object.assign({ action: 'needs-review' }, failure);
   }
 
-  // ── Bucket A/B — retryable, not user-fixable, retries exhausted ────
-  // Just skip. The user can see the code in the report.
+  // The caller's bounded retry helper has already exhausted safe retries.
 
-  return { action: 'needs-review', code, reason, details: err.details };
+  return Object.assign({ action: 'needs-review' }, failure);
 }
 ```
 
-The `handleError` function needs to know the current provider (for the beep message and pivot decisions). It's passed via the `source` object, which has been updated by the batch loop before `sendWithRetry` was called.
+The `handleError` function receives the source's explicitly selected provider. It preserves the failure metadata for review; a pivot is allowed only after a known `not_dispatched` result.
 
 Two places the wizard **must not** deviate from [error-codes.md](error-codes.md):
 
-1. **`rate_limited` retries once, not three times.** A third prompt inside DeepSeek's rate window makes the next window longer.
-2. **`user_skipped` skips silently.** Handled above by an early return.
+1. Retry only when both `retryable === true` and `executionState === "not_dispatched"`.
+2. Keep unknown/outcome-uncertain requests visible for human review.
 
 ## Provider pivot
 
-The recommended pattern for multi-provider wizards: **try DeepSeek first, pivot to Qwen on rate limit.** Or vice versa, depending on which provider you have better quota on.
+Provider pivot is optional caller policy, not built-in failover. Only pivot after the original request is confirmed `not_dispatched`; never pivot an `outcome_unknown` request because the first provider may already have received the prompt.
 
 ```js
 function canPivot(currentProvider, source) {
@@ -478,7 +486,7 @@ function pivotProviderFor(currentProvider) {
 }
 ```
 
-Then in the batch loop's catch block, `handleError` returns `{ action: 'retry-source' }`, which the loop interprets by decrementing `i` and re-running the source — but now with `source.provider` set to the fallback.
+Before returning to the loop, record the old provider in `_pivotedFrom`, set the explicitly selected fallback provider, and create a fresh request ID for the new request. Keep separate chat URLs by `(sourceName, provider)`.
 
 **The chat map handles the URL separation.** When the source retries on Qwen, `chatMap.get(source.name, 'qwen')` returns `null` (first Qwen attempt for this source), so the `/chat` call omits `url` and Qwen starts a fresh chat. The prompt is resent to Qwen, and Qwen's LLM answers without seeing DeepSeek's prior attempt. That's correct — the pivot is a fresh start on a different provider, not a continuation.
 
@@ -492,7 +500,7 @@ source.provider = fallback;
 
 The `_pivotedFrom` field is a flag — if it's set, `canPivot` returns false and the source won't try the other provider.
 
-**The pivot decision is a policy, not a protocol.** `deepseek-connect` doesn't have a "pivot" API. The wizard catches `rate_limited`, changes the `provider` field on its next request, and sends again. The server routes to the new provider. The extension dispatches to the new provider module. Everything works because `provider` is a data field threaded through every layer.
+**The pivot decision is a policy, not a protocol.** `deepseek-connect` does not choose a fallback provider. The caller changes the provider only when its recovery policy proves that doing so will not duplicate an already-dispatched prompt.
 
 ## chat-map.json — the persistence layer
 
@@ -580,17 +588,13 @@ The `classes.json` field is the escape hatch — if a specific source is known t
 
 **Requests are serialized by one server queue.** The extension resolves each request to exactly one tab for its named provider. Multiple consumers may share a server and queue, but their requests still execute serially; avoid sharing a run directory or mutable chat map between processes.
 
-**Two wizards, one server, one queue.** The attach-or-own pattern in `ExtensionTransport` lets two wizards share one server. Their requests queue in FIFO order and dispatch serially. This works but produces interleaved logs (both wizards' requests appear in the same log). For coordinated batches, run them sequentially.
-
-**Parallelism across providers is possible.** A single wizard can issue two concurrent requests — one on DeepSeek, one on Qwen — and they'll serialize through the queue. Since DeepSeek's latency is 4-8s and Qwen's is 7-10s, running them concurrently gives you the slower one's time, not their sum. But the queue is serialized: the second request waits for the first to complete. So "concurrent" only helps if the two requests are for different sources — two sources complete in one round-trip time instead of two.
-
-**For true parallelism across providers**, the server would need to support concurrent jobs (different `inFlight` entries for different providers). That's a v0.3.0 feature. For now, sequential is the only guaranteed-correct model.
+**One server, one serialized queue.** Multiple callers may share a server, but every request—including requests for different providers—runs sequentially. Concurrent caller submissions wait FIFO; they do not produce provider-level parallelism. Prefer one sequential batch runner to keep source ordering and logs understandable.
 
 **Advisory lock.** Write `data/batch/.lock` on `start()` with `{ pid, startedAt, runId }`. If the file exists and the pid is alive, refuse to start. Delete the file in `shutdown()`. This catches the common case — a user starting two `batch paste` runs in two terminals.
 
 ## Smoke test before a full batch
 
-Before running a 76-source batch, prove the integration works on one source per provider.
+Before a batch, prove the integration works with one prompt per selected provider.
 
 **DeepSeek smoke test:**
 
@@ -642,7 +646,7 @@ const { ExtensionTransport } = require("./scripts/batch/lib/transport-extension"
 '
 ```
 
-Expected: `OK: {"content":"console.log(42);","url":"https://chat.qwen.ai/c/...","elapsedMs":...,"chat":"smoke-qwen","provider":"qwen"}`. Note the `elapsedMs` will be 7-10s (Qwen's pacing).
+Expected: a successful response with the requested provider and returned chat URL. Elapsed time varies with UI readiness and provider generation.
 
 **What each smoke test catches:**
 
@@ -695,13 +699,11 @@ Before submitting the integration PR:
 
 **Error policy:**
 
-- [ ] `isRetryable()` reads `err.retryable` from metadata
-- [ ] `rate_limited` retries once after `err.retryAfter`, not three times
-- [ ] `user_skipped` skips silently (early-return before bucket-D beep)
+- [ ] Automatic retry occurs only when `retryable === true` and `executionState === "not_dispatched"`
+- [ ] Unknown/outcome-uncertain requests preserve `requestId` and go to human review, never silent replay
 - [ ] Provider selection is validated against `/providers`; a config provider must be enabled and routable
-- [ ] `invalid_response_format` (Qwen) retried through the standard bucket-A policy
-- [ ] Bucket A retryable errors retry up to 3 attempts before `needs-review`
-- [ ] Bucket D errors beep immediately, no auto-retry
+- [ ] `invalid_response_format` is not automatically retried after dispatch
+- [ ] Failures preserve `code`, `reason`, `requestId`, `executionState`, `retryable`, `retryAfter`, `userFixable`, `details`, and `trace`
 - [ ] `DSCError` recognized by `instanceof DSCError`, not duck-typing
 
 **Provider pivot:**

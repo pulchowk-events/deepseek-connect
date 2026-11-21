@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "deepseek-connect",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Drives real AI chat tabs (DeepSeek, Qwen, etc.) over a local HTTP server.",
   "permissions": [
     "storage",

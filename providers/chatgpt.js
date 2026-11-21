@@ -160,30 +160,10 @@
   }
   // ProseMirror: synthetic paste first (keeps newlines), execCommand insertText as fallback.
   async function fillInput(el, text) {
-    el.focus();
-    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, text);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return 'value';
-    }
-    selectAll(el);
-    try { document.execCommand('delete'); } catch (_) { /* ignore */ }
-    try {
-      const dt = new DataTransfer();
-      dt.setData('text/plain', text);
-      el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-    } catch (_) { /* ignore */ }
-    await sleep(400);
-    if (okTyped(el, text)) return 'paste';
-    el.focus();
-    selectAll(el);
-    try { document.execCommand('delete'); } catch (_) { /* ignore */ }
-    try { document.execCommand('insertText', false, text); } catch (_) { /* ignore */ }
-    el.dispatchEvent(new InputEvent('input', { bubbles: true }));
-    await sleep(400);
-    return 'insertText';
+    const filled = DSC.fillPromptInput(el, text);
+    await sleep(100);
+    if (!filled.ok) return 'failed';
+    return filled.method;
   }
 
   function answerText(el) {
@@ -274,11 +254,11 @@
     return { ok: true, existing: false, mode: 'fresh', debug: debug };
   }
 
-  async function sendPrompt(prompt, delimiters) {
+  async function sendPrompt(prompt, delimiters, requestId) {
     const startedAt = Date.now();
     const trace = [];
     const T = function (phase, extra) {
-      try { chrome.runtime.sendMessage({ type: 'dsc_phase', phase: phase, extra: extra }).catch(function () {}); } catch (_) { /* port closed */ }
+      try { chrome.runtime.sendMessage({ type: 'dsc_phase', requestId: requestId, phase: phase, extra: extra }).catch(function () {}); } catch (_) { /* port closed */ }
       trace.push(Object.assign({ t: Date.now() - startedAt, phase: phase }, extra || {}));
       if (trace.length > 80) trace.splice(1, 1);
     };
@@ -292,6 +272,11 @@
     }
     lastTooLongCheck = 0;
 
+    T('gpt_page_ready', { checking: true });
+    const pageReady = await DSC.waitForPageStable(15000, DSC.STAGE_DELAY_MS);
+    T('gpt_page_ready', { ready: pageReady.ok, readyState: pageReady.readyState });
+    if (!pageReady.ok) return fail(E.INPUT_NOT_FOUND, 'page_not_stable', { details: pageReady });
+
     const input = await waitFor(function () { return findInput() || (detectBlocked() ? true : null); }, 15000);
     T('gpt_input', { found: !!input && input !== true });
     if (input === true || (!input && detectBlocked())) return fail(BOT_BLOCKED, 'turnstile_challenge', { retryAfter: 30000 });
@@ -299,29 +284,101 @@
     if (detectLoggedOut()) return fail(E.LOGGED_OUT, 'logged_out');
     if (detectRateLimit()) return fail(E.RATE_LIMITED, 'rate_limited', { retryAfter: 30000 });
 
+    T('gpt_preflight', { checking: 'idle_and_empty_input' });
+    let idleSince = 0;
+    let responseSignature = null;
+    const idle = await waitFor(function () {
+      const current = findInput();
+      const generating = stopPresent();
+      const assistant = pickAll('assistant').els;
+      const lastText = assistant.length ? answerText(assistant[assistant.length - 1]) : '';
+      const signature = assistant.length + ':' + lastText.length + ':' +
+        lastText.slice(0, 60) + ':' + lastText.slice(-60);
+      if (responseSignature !== signature) {
+        responseSignature = signature;
+        idleSince = 0;
+        return null;
+      }
+      if (!current || generating || document.readyState !== 'complete') {
+        idleSince = 0;
+        return null;
+      }
+      if (!idleSince) idleSince = Date.now();
+      if (Date.now() - idleSince < DSC.STAGE_DELAY_MS) return null;
+      return { input: current, inputEmpty: compact(readInput(current)) === '', generating: false };
+    }, 15000, 200);
+    T('gpt_preflight', {
+      ready: !!idle && idle.inputEmpty,
+      inputEmpty: !!idle && idle.inputEmpty,
+      generating: stopPresent(),
+      readyState: document.readyState,
+    });
+    if (!idle) return fail(E.SEND_FAILED, 'provider_busy_or_not_ready');
+    if (!idle.inputEmpty) {
+      return fail(E.SEND_FAILED, 'input_not_empty_before_send', {
+        details: { inputEmpty: false, recovery: 'The existing composer was left untouched; review or clear it manually before retrying.' },
+      });
+    }
+
     const beforeA = {}; const beforeU = {};
     SEL.assistant.forEach(function (s) { beforeA[s] = countOf(s); });
     SEL.user.forEach(function (s) { beforeU[s] = countOf(s); });
 
-    await sleep(400);
-    const method = await fillInput(input, prompt);
-    const typedLen = readInput(input).length;
+    await sleep(DSC.STAGE_DELAY_MS);
+    const currentInput = findInput();
+    if (!currentInput || compact(readInput(currentInput)) !== '' || stopPresent()) {
+      return fail(E.SEND_FAILED, 'pre_paste_state_changed', {
+        inputFound: !!currentInput,
+        inputEmpty: !!currentInput && compact(readInput(currentInput)) === '',
+        generating: stopPresent(),
+      });
+    }
+    const pageUrlBeforeSend = location.href;
+    const method = await fillInput(currentInput, prompt);
+    await sleep(DSC.STAGE_DELAY_MS);
+    const typedLen = readInput(currentInput).length;
     T('gpt_typed', { promptLen: prompt.length, typedLen: typedLen, method: method });
-    if (compact(readInput(input)).length === 0) return fail(E.SEND_FAILED, 'input_empty_after_set');
-    await sleep(500);
+    if (location.href !== pageUrlBeforeSend) {
+      return fail(E.USER_NAVIGATED, 'page_changed_after_input', { inputRetained: typedLen > 0 });
+    }
+    if (method === 'failed' || compact(readInput(currentInput)) !== compact(prompt)) {
+      return fail(E.SEND_FAILED, 'input_not_set');
+    }
 
     const btn = await waitFor(findSend, 10000);
-    if (btn) {
-      btn.click();
-    } else {
-      console.warn('[dsc:chatgpt] send button not found; falling back to Enter keydown');
-      input.focus();
-      const o = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-      input.dispatchEvent(new KeyboardEvent('keydown', o));
-      input.dispatchEvent(new KeyboardEvent('keyup', o));
+    if (!btn) return fail(E.SEND_FAILED, 'send_button_not_found');
+    if (location.href !== pageUrlBeforeSend) {
+      return fail(E.USER_NAVIGATED, 'page_changed_before_send', { inputRetained: true });
     }
+    if (stopPresent() || compact(readInput(currentInput)) !== compact(prompt) ||
+        currentInput.isConnected === false) {
+      return fail(E.SEND_FAILED, 'pre_send_state_changed', {
+        inputMatchesPrompt: compact(readInput(currentInput)) === compact(prompt),
+        generating: stopPresent(),
+      });
+    }
+    await sleep(DSC.STAGE_DELAY_MS);
+    const stableButton = findSend();
+    if (location.href !== pageUrlBeforeSend) {
+      return fail(E.USER_NAVIGATED, 'page_changed_before_send', { inputRetained: true });
+    }
+    if (!stableButton || stopPresent() || compact(readInput(currentInput)) !== compact(prompt)) {
+      return fail(E.SEND_FAILED, 'send_control_not_stable', {
+        sendReady: !!stableButton,
+        generating: stopPresent(),
+        inputMatchesPrompt: compact(readInput(currentInput)) === compact(prompt),
+      });
+    }
+    if (!DSC.clickSendOnce(stableButton)) return fail(E.SEND_FAILED, 'send_button_disabled');
     const sentAt = Date.now();
-    T('gpt_sent', { ms: sentAt - startedAt, viaButton: !!btn });
+    T('gpt_sent', { ms: sentAt - startedAt, viaButton: true });
+    await sleep(DSC.STAGE_DELAY_MS);
+    const postClickInput = findInput();
+    T('gpt_submit_observed', {
+      inputCleared: !!postClickInput && compact(readInput(postClickInput)) === '',
+      generating: stopPresent(),
+      assistantCount: pickAll('assistant').els.length,
+    });
 
     function grew(before, names) {
       for (const s of names) { if (countOf(s) > (before[s] || 0)) return true; }

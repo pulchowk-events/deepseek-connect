@@ -51,7 +51,7 @@ Confirm the round-trip works before making any changes:
 curl -s -X POST http://127.0.0.1:7331/chat \
   -H "Authorization: Bearer $EXTENSION_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Reply with just: setup-ok"}],"chat":"setup-check"}' \
+  -d '{"messages":[{"role":"user","content":"Reply with just: setup-ok"}],"chat":"setup-check","provider":"deepseek"}' \
   | python3 -m json.tool
 ```
 
@@ -180,12 +180,12 @@ for i in 1 2 3; do
   curl -s -X POST http://127.0.0.1:7331/chat \
     -H "Authorization: Bearer $EXTENSION_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Reply with just: $i\"}],\"chat\":\"concurrent-$i\"}" &
+    -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Reply with just: $i\"}],\"chat\":\"concurrent-$i\",\"provider\":\"deepseek\"}" &
 done
 wait
 ```
 
-Expected: three responses, each with the correct content, each in its own chat. Server log shows three `-> dispatched` lines, serialized (no overlap between them).
+Expected: three responses, each with the correct content, each in its own chat. Server log shows three `-> dispatched` lines, serialized (no overlap between them). Concurrent caller connections do not make provider work parallel.
 
 ## Changing selectors
 
@@ -225,7 +225,7 @@ Five things. Every one of them exists because a version of this was proposed and
 
 **2. A build step, bundler, or TypeScript.** The extension is load-unpacked, plain JavaScript, no build. Adding webpack/vite/tsc would make every selector change require a rebuild, which triples the iteration loop for the change that happens most often. If you want TypeScript, the answer is no — but feel free to run `tsc --checkJs` locally for your own confidence.
 
-**3. Retry logic inside the extension or the client.** Retry is caller policy (see [docs/error-codes.md](docs/error-codes.md) and [docs/integration-guide.md#sendwithretry](docs/integration-guide.md#sendwithretry)). A client that retries silently hides rate-limit conditions and breaks the caller's attempt-counting. The extension does one attempt and reports faithfully; the client throws on non-2xx and lets the caller decide.
+**3. Retry logic inside the extension or the client.** Retry is caller policy (see [docs/error-codes.md](docs/error-codes.md) and [docs/integration-guide.md#safe-retry-and-recovery](docs/integration-guide.md#safe-retry-and-recovery)). Retry only when the error is explicitly retryable and `executionState` is `not_dispatched`. Caller abort/timeout is not provider cancellation; never replay an uncertain request under a new ID.
 
 **4. New error codes without the metadata.** Every code needs `retryable`, `userFixable`, `retryAfter`, and `http` set in `src/errors.js` before it's raised anywhere. A code without metadata is a code whose cause is ambiguous. See [docs/error-codes.md#registered-codes](docs/error-codes.md#registered-codes).
 

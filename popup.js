@@ -42,7 +42,7 @@ async function saveConfig() {
   const token = tokenEl.value.trim();
   const port = Number(portEl.value.trim() || DSC.DEFAULT_PORT);
   if (!token) { msgEl.textContent = 'token required'; return; }
-  if (!Number.isFinite(port) || port < 1 || port > 65535) { msgEl.textContent = 'invalid port'; return; }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) { msgEl.textContent = 'invalid port'; return; }
   await chrome.storage.local.set({
     [DSC.STORAGE.TOKEN]: token,
     [DSC.STORAGE.PORT]: port,
@@ -58,6 +58,12 @@ async function refreshState() {
 }
 
 $('save').addEventListener('click', saveConfig);
+tokenEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') saveConfig();
+});
+portEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') saveConfig();
+});
 $('providers').addEventListener('click', () => {
   chrome.tabs.create({ url: chrome.runtime.getURL('providers.html') });
 });

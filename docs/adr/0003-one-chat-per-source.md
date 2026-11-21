@@ -83,4 +83,6 @@ The one-chat-per-source principle is unchanged. What changed is how the extensio
 
 **Multi-provider implications:** the `chat-map.json` keys are `<sourceName>::<provider>` pairs, not just `sourceName`, because a source can have one chat on DeepSeek and a different one on Qwen (via the provider-pivot pattern on rate limit). Each provider's URL is tracked independently.
 
+**Recovery constraint:** URL persistence supports a deliberate new turn in the same conversation; it does not make replaying a timed-out prompt safe. After possible dispatch, preserve the original `requestId`, inspect the provider tab, and wait for/retrieve a late result. Do not start a new turn or pivot providers until the uncertain outcome has been reconciled.
+
 Reversing this amendment requires reversing ADR 0008.

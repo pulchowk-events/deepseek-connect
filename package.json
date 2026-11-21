@@ -1,6 +1,6 @@
 {
   "name": "deepseek-connect",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Chromium extension that drives a real DeepSeek chat tab over a local HTTP server.",
   "private": true,
   "license": "MIT",

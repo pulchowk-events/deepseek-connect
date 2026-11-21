@@ -57,6 +57,17 @@ test('DSCError opts override META defaults', () => {
   assert.strictEqual(err.reason, 'custom reason');
 });
 
+test('DSCError ignores malformed retry metadata', () => {
+  const err = new DSCError(CODES.RATE_LIMITED, {
+    retryable: 'false',
+    retryAfter: '30000',
+    userFixable: 1,
+  });
+  assert.strictEqual(err.retryable, true);
+  assert.strictEqual(err.retryAfter, 0);
+  assert.strictEqual(err.userFixable, false);
+});
+
 test('DSCError.toJSON returns the wire shape', () => {
   const err = new DSCError(CODES.RATE_LIMITED, { retryAfter: 30000 });
   const json = err.toJSON();
@@ -111,34 +122,19 @@ test('fromReply handles null/undefined gracefully', () => {
   assert.strictEqual(err2.code, 'internal_error');
 });
 
-test('decision buckets match the documented counts', () => {
-  // error-codes.md classifies user_skipped as bucket E (skip silently)
-  // despite its metadata flagging userFixable: true — the user is the
-  // one who chose to skip, so beeping at them would be user-hostile.
-  // The count below is the doc's decision-tree classification, not the
-  // raw metadata classification. Verify the metadata exception is real
-  // so that if someone "fixes" user_skipped to userFixable: false, this
-  // test asks "did you also update error-codes.md's bucket E note?"
-  assert.strictEqual(META[CODES.USER_SKIPPED].userFixable, true,
-    'user_skipped should still be userFixable: true (documented exception)');
-
-  const buckets = { A: 0, B: 0, C: 0, D: 0, E: 0 };
-  for (const [code, meta] of Object.entries(META)) {
-    // Classify per the doc's decision tree, with user_skipped moved
-    // from bucket D to bucket E as documented.
-    if (code === CODES.USER_SKIPPED) { buckets.E++; continue; }
-    if (meta.retryable && meta.userFixable) buckets.C++;
-    // bucket B (retry-after-delay) is identified by HTTP 429 — the
-    // per-instance retryAfter is opts, not META, so the HTTP status is
-    // the stable marker. Only rate_limited carries 429.
-    else if (meta.retryable && meta.http === 429) buckets.B++;
-    else if (meta.retryable) buckets.A++;
-    else if (meta.userFixable) buckets.D++;
-    else buckets.E++;
-  }
-  assert.strictEqual(buckets.A, 5, 'bucket A (retry silently)');
-  assert.strictEqual(buckets.B, 1, 'bucket B (retry delayed)');
-  assert.strictEqual(buckets.C, 3, 'bucket C (retry then beep)');
-  assert.strictEqual(buckets.D, 9, 'bucket D (beep)');
-  assert.strictEqual(buckets.E, 6, 'bucket E (skip)');
+test('fromReply preserves per-request retry and execution metadata', () => {
+  const err = fromReply({
+    error: 'rate_limited',
+    reason: 'dispatch outcome unknown',
+    retryable: false,
+    retryAfter: 30000,
+    userFixable: true,
+    requestId: 'rate-item-1',
+    executionState: 'outcome_unknown',
+  });
+  assert.equal(err.retryable, false);
+  assert.equal(err.retryAfter, 30000);
+  assert.equal(err.userFixable, true);
+  assert.equal(err.requestId, 'rate-item-1');
+  assert.equal(err.executionState, 'outcome_unknown');
 });

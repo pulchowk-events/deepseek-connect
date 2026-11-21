@@ -32,7 +32,7 @@ The extension is the client of the server. The server is the client of the exten
 
 Two problems, one tool:
 
-**Problem 1: clipboard round-trips don't scale.** The Pulchowk Events Aggregator's `batch paste` wizard onboards dozens of job sources at once. Each source needs an LLM prompt dumped to the clipboard, pasted into a chat, and the reply copy-pasted back. For a 76-source batch, that's roughly 80 minutes of pure clipboard work per run. It is also error-prone in exactly one way — the wrong-clipboard-copy bug, where a previous site's reply gets pasted into the next site's prompt file, has caught real mistakes in every multi-site batch ever run.
+**Problem 1: clipboard round-trips don't scale.** A separate batch workflow may use this extension to automate provider input and reply retrieval. The caller remains responsible for checking reply syntax, source identity, verdicts, and any generated code before saving or using it. The extension does not validate extractor correctness and never executes model-produced code.
 
 **Problem 2: Puppeteer triggers provider fingerprinting.** DeepSeek and Qwen both rate-limit headless and stealth-patched browser sessions aggressively, and real auth cookies are hard to keep alive in a fresh profile. Driving the user's already-logged-in real Chrome tab sidesteps both — the browser is the same browser the user browses in, the cookies are the user's cookies, and the fingerprint is a real fingerprint because it is a real browser. No credential handling, no login flows, no API keys.
 
@@ -90,7 +90,7 @@ You get back:
 }
 ```
 
-The `url` is the stable chat identity for retry. Pass it to `/chat` when resending a prompt, or to `/open` when you only need to navigate. The extension goes directly to that conversation without relying on title matching.
+The `url` identifies the conversation. Pass it to `/open` to navigate or include it with an explicitly selected, confirmed-safe `/chat` attempt. A safe retry requires `retryable: true` and `executionState: "not_dispatched"` and uses a new request ID because the old ID is deduplicated to its original failure. Do not replay after an uncertain timeout under a new ID: inspect the provider tab first. Reuse the original `requestId` to deduplicate and retrieve a late result. The extension goes directly to the selected provider's exact-host conversation; it does not fall back to another provider or chat.
 
 **4. Same prompt, Qwen instead:**
 
@@ -112,10 +112,11 @@ Same shape, different provider. The extension routes to `providers/qwen.js`, whi
 
 | Route | What it does |
 |---|---|
-| `POST /chat` | Send `{ messages, chat?, provider }`, receive `{ content, chat, url, elapsedMs }`. The main entry point. |
+| `POST /chat` | Send `{ messages, chat?, provider, requestId? }`, receive `{ content, chat, url, elapsedMs, requestId, executionState }`. The main entry point. |
 | `POST /open` | Find-or-create a chat by name, or navigate directly to a persisted URL. Requires `chatName` and `provider`. |
 | `POST /reset` | Run the provider's reset behavior. Requires `chatName` and `provider`; current built-in implementations do not delete chat history. |
 | `GET /tabs` | Snapshot of provider tabs currently open, each with a `provider` field. |
+| `GET /status` | Authenticated server/extension queue snapshot; not a provider-readiness check. |
 | `GET /version` | Return the server package version and extension build hash. |
 | `GET, POST, PUT, DELETE /providers` | List or manage selector-based config providers. Changes require the extension's Providers page to reconcile permissions and registration. |
 | `GET /next` | Extension long-poll. Not for callers. |
@@ -146,7 +147,7 @@ try {
 }
 ```
 
-Errors thrown by the client are `DSCError` instances carrying `{ code, reason, retryable, retryAfter, userFixable, details }`. See [docs/error-codes.md](docs/error-codes.md) for the 24-code taxonomy. Error responses include retry metadata; `retryAfter` is in milliseconds.
+Errors thrown by the client are `DSCError` instances carrying `{ code, reason, retryable, retryAfter, userFixable, details, trace, requestId, executionState }` (optional fields may be absent). See [docs/error-codes.md](docs/error-codes.md) for the registered taxonomy and the distinction between default retry metadata and dispatch-safe retryability. `retryAfter` is in milliseconds. Successful `/chat` responses also include `requestId` and `executionState: "completed"`.
 
 ## Providers
 
@@ -217,7 +218,11 @@ For selector-based providers, use the Providers page and picker described in [do
 
 **No build step, by design.** Plain JavaScript, load-unpacked. `manifest.json` loads `shared.js`, `selectors.js`, the three built-in provider drivers, then `content.js`; config-provider files are registered dynamically. `background.js` uses `importScripts('shared.js')`.
 
-**No per-request server-side timeout.** The Node client times out after 180 seconds by default, but that does not cancel the server's in-flight queue entry. If the extension never replies, restart the server to clear the queue. See [docs/protocol.md#queue-state-machine](docs/protocol.md#queue-state-machine).
+**Request deadlines are not cancellation.** Queue timeout defaults to 120 seconds; dispatched-request timeout defaults to 960 seconds. The client also defaults to 960 seconds, but callers may choose a shorter deadline. A disconnect or timeout after dispatch does not cancel provider work: the result is `outcome_unknown`, and the server quarantines that queue slot until a late reply or shutdown. Inspect the provider tab before recovery. Reuse the same `requestId` to prevent duplicate dispatch and retrieve a late result. The in-memory deduplication cache (100 completed requests) is lost on server restart. There is no `/cancel` route.
+
+**Provider UI interaction is paced and guarded.** Before pasting, the extension waits for the tab document and URL to settle, checks that the composer is visible, enabled, and empty, and waits for detected generation/prior-response activity to stabilize. After pasting it verifies the value and rechecks the send control before a single click, then waits for submission evidence. UI stages have a 1-second minimum pause; config-provider pacing can be longer. If a guard reports a non-empty composer or uncertain submission, inspect the provider tab rather than clearing or resending blindly. See [docs/protocol.md](docs/protocol.md#post-progress) for progress phases.
+
+**Validation limits:** `/chat` requires JSON with a nonblank prompt in 1-100 valid message objects, max 1 MiB request body and 250,000 flattened prompt characters. Saved URLs must use HTTPS and the exact selected provider hostname. See [docs/protocol.md](docs/protocol.md) for all field constraints and recovery semantics.
 
 ## License
 

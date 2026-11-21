@@ -15,7 +15,7 @@ The original architecture was DeepSeek-only. `content.js` contained all DOM mani
 
 Two problems forced a refactor in November 2026.
 
-**Problem 1 — DeepSeek's free-tier rate limits.** A 76-source batch run against DeepSeek's free tier hits the rate limit around source 40-50. The wizard's retry policy (one delayed retry after 30 seconds, then skip the source and mark needs-review) turns a 76-source batch into a 76-source batch where 25-35 sources land in `needs-review` for no reason other than "the batch ran too fast for DeepSeek's quota." The workaround — pause 30 seconds between sources — doubles the batch's wall-clock time without solving the underlying problem (the quota is per-hour, not per-minute).
+**Problem 1 — one provider is not always available.** Provider availability and quotas can change. Routing must remain explicit: a caller may select another provider, but the extension must never silently pivot or replay an uncertain prompt.
 
 **Problem 2 — Qwen has a parallel free tier.** Qwen's free tier has its own quota, separate from DeepSeek's. A wizard that could route sources to Qwen would have twice the throughput and a natural fallback when one provider rate-limits. But wiring Qwen into the existing DeepSeek-specific `content.js` would mean every function gets a `if (provider === 'deepseek') { ... } else if (provider === 'qwen') { ... }` branch. Three providers would be triple branches. Four would be quadruple. The design would become a combinatorial mess.
 
@@ -47,11 +47,11 @@ A new provider requires exactly three registrations. Missing any of them produce
 
 | Registration | File | Missing means |
 |---|---|---|
-| `DSC.PROVIDER_DOMAINS['<name>'] = '<url-prefix>/'` | `shared.js` | `no_work_tab` — the tab is open but background can't find it |
-| `providers/<name>.js` in `manifest.json`'s `content_scripts.js` and `host_permissions`/`matches` | `manifest.json` | `no_provider_loaded` — the module never loads |
-| `providers/<name>.js` in `background.js`'s `sendToTab` re-injection file list | `background.js` | Works once, fails on retry — the re-injection re-loads the old file list, not the new one |
+| `DSC.PROVIDER_DOMAINS['<name>']` exact hostname mapping | `shared.js` | `ambiguous_provider_tab` — no exact-host match |
+| `providers/<name>.js` in `manifest.json` content scripts and host permissions | `manifest.json` | Provider registration failure, surfaced as a request failure |
+| `providers/<name>.js` in `background.js` re-injection file list | `background.js` | Works until reinjection, then provider registration failure |
 
-The third registration is the hardest to catch. It only fires after a mid-run crash (service worker killed, tab reloaded), and the symptom is intermittent: the first request works, the retry fails with `no_provider_loaded`. The `PROVIDER CONTRACT` comment in `shared.js` lists all three registrations explicitly so a contributor reading the contract doesn't miss one.
+The third registration is the hardest to catch. It only fires after reinjection (for example, after a tab reload). `no_provider_loaded` and `no_work_tab` are not registered public error codes; callers receive a structured request failure instead.
 
 ### Provider-specific concerns
 
@@ -72,7 +72,7 @@ The `provider` string threads through every layer as a data field, but only `con
 - `content.js` looks up `DSC_PROVIDERS[provider]` and dispatches
 - `src/server.js` and `src/client.js` never branch on `provider`
 
-If the provider string is normalized, defaulted, or interpreted anywhere else, that's a design smell. `src/server.js` is ~5 lines of provider threading total (the `provider: req.provider || 'deepseek'` on enqueue, and the `provider: entry.provider` on the `/next` payload). Anything more means provider-specific logic has leaked out of the provider module.
+If the provider string is normalized or silently defaulted, that is a design smell. Public routes require an explicit provider; the server stores it on the queue entry and sends it unchanged in `/next`.
 
 ## Consequences
 
@@ -83,11 +83,11 @@ If the provider string is normalized, defaulted, or interpreted anywhere else, t
 - **The provider contract is documented in code.** `shared.js`'s `PROVIDER CONTRACT` comment block names the four methods and the three registrations. `content.js`'s router references the contract block from its top. A contributor reading the router sees the reference, reads the contract, and knows what to implement.
 - **Provider internals are isolated.** `providers/qwen.js` doesn't import from `providers/deepseek.js`. A DeepSeek redesign touches only `providers/deepseek.js` (and `selectors.js`); a Qwen redesign touches only `providers/qwen.js`. A provider that isn't being actively used can drift for months without affecting the other.
 - **Failures are provider-attributed.** The trace phase names are provider-specific (`probe`/`waitInput`/`toggleDeepthink` for DeepSeek; `step_1_dismiss_modal`/`step_2_find_input` for Qwen). When a request fails, the trace's last phase identifies which provider was running — no log correlation needed.
-- **The wire protocol didn't change shape, only gained a field.** `/chat`, `/open`, `/next`, `/reply` all have the same request/response shapes as v0.1.x, with `provider` added. Backwards compatibility held for DeepSeek callers (server defaults to `'deepseek'`), and Qwen support is additive.
+- **Provider routing is explicit.** `/chat`, `/open`, and `/reset` require a provider; missing or unsupported values fail rather than defaulting to DeepSeek.
 
 ### Negative
 
-- **Three registration points to miss.** Adding a provider is single-file *for the provider module*, but the three registrations are separate edits in separate files. The `no_provider_loaded` error mode exists specifically because missing a registration is easy. Documented extensively in `providers.md#the-registration-checklist` and the `PROVIDER CONTRACT` comment, but still a real friction point.
+- **Registration points to miss.** Built-in drivers require manifest, host/domain, and reinjection wiring. Selector-based config providers use the Providers page and do not require editing these files.
 - **Providers share no implementation.** A new provider that needs the same tiered selector pattern as DeepSeek has to copy the pattern (or the code) into its own file. Two providers don't justify a shared `selector-tiers.js` abstraction; a third provider might. The current state is "duplication over premature abstraction" — acceptable, but the trade-off is real.
 - **`shared.js` DSC.ERR is a mirror of `src/errors.js` CODES, not an import.** A new error code requires updating both files. The multi-provider refactor added `INVALID_RESPONSE_FORMAT` to both; the mirror is checked by a test that asserts the key sets match. But the mirror exists because `shared.js` is a classic script and can't `require()` the Node module — a Manifest V3 constraint, not a design choice.
 - **Provider-specific error codes.** `deepthink_enable_failed` and `search_enable_failed` apply to DeepSeek; `invalid_response_format` may apply to provider response extraction. Integrators should use the current registry in `error-codes.md`.
@@ -95,7 +95,7 @@ If the provider string is normalized, defaulted, or interpreted anywhere else, t
 ### Neutral
 
 - **`selectors.js` is now DeepSeek-specific, not provider-neutral infrastructure.** This is documented in the file's header, and `providers/qwen.js` ignores it entirely. The alternative — extract the tier-list pattern into a shared `selector-tiers.js` with per-provider config — was deferred because two providers don't justify the abstraction.
-- **The provider names are case-sensitive.** `'deepseek'`, not `'DeepSeek'`. `DSC_PROVIDERS[msg.provider]` is a JavaScript object key lookup. No normalization at intermediate layers — a caller typo produces `no_provider_loaded`, which is the correct behavior (silent normalization would hide the typo).
+- **The provider names are case-sensitive.** `'deepseek'`, not `'DeepSeek'`. A caller typo fails explicitly; no fallback provider is selected.
 
 ## Alternatives considered
 
