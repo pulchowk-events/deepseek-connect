@@ -7,7 +7,10 @@ const $ = (id) => document.getElementById(id);
 const REPO_URL = 'https://github.com/pulchowk-events/deepseek-connect';
 const SUBMITTER_KEY = 'dsc_submitter';
 const REG_KEY = DSC.STORAGE.REGISTERED;
-const BUILTIN = ['deepseek', 'qwen'];
+const BUILTIN = ['deepseek', 'qwen', 'chatgpt'];
+const CHATGPT = 'chatgpt';
+const CHATGPT_KEY = 'chatgpt_overrides';
+let chatgptOv = null;
 let editing = null;
 let server = { up: false, providers: [] };
 let rows = [];
@@ -85,6 +88,10 @@ function fillForm(d) {
   $('delim-box').hidden = $('f-extraction').value !== 'delimiter';
   $('f-name').disabled = !!editing;
   $('form-title').textContent = editing ? 'Edit provider: ' + editing : 'Add provider';
+  let note = $('builtin-note');
+  if (!note) { note = el('div', undefined, 'sub'); note.id = 'builtin-note'; $('form-title').after(note); }
+  note.textContent = editing === CHATGPT ? 'Built-in provider: only input, send, stop and response are saved, to browser storage on this machine (not the server). Everything else on this form is ignored.' : '';
+  note.hidden = editing !== CHATGPT;
 }
 
 function el(tag, text, cls) { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; }
@@ -100,7 +107,15 @@ function render() {
     const r = el('div', undefined, 'row');
     const g = el('div', undefined, 'grow');
     g.append(el('strong', n + ' '), el('span', 'built-in', 'badge'), el('div', DSC.PROVIDER_HOSTS[n], 'sub'));
-    r.append(g); b.append(r);
+    if (n === CHATGPT) {
+      g.append(el('div', chatgptOv ? 'selectors: overridden in browser storage (this machine)' : 'selectors: built-in defaults', 'sub'));
+      r.append(g);
+      r.append(btn('Edit', editChatgpt));
+      if (chatgptOv) r.append(btn('Reset', resetChatgpt));
+    } else {
+      r.append(g);
+    }
+    b.append(r);
   }
 
   const c = $('custom'); c.textContent = '';
@@ -130,6 +145,7 @@ function render() {
 
 async function refresh() {
   rows = ((await chrome.storage.local.get(REG_KEY))[REG_KEY]) || [];
+  chatgptOv = ((await chrome.storage.local.get(CHATGPT_KEY))[CHATGPT_KEY]) || null;
   try { server = { up: true, providers: (await api('GET', '/providers')).providers }; }
   catch (_) { server = { up: false, providers: [] }; }
   render();
@@ -183,7 +199,83 @@ async function fallbackSave(v) {
   return true;
 }
 
+// ---- built-in chatgpt: selector overrides live in chrome.storage.local, not on the server ----
+async function chatgptEffective() {
+  const got = await chrome.storage.local.get(CHATGPT_KEY);
+  const stored = got[CHATGPT_KEY] && got[CHATGPT_KEY].selectors ? got[CHATGPT_KEY].selectors : null;
+  let live = null;
+  try {
+    const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*'] });
+    for (const t of tabs) {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: t.id },
+        func: () => {
+          const pr = globalThis.DSC_PROVIDERS && globalThis.DSC_PROVIDERS.chatgpt;
+          return pr && pr.selectors ? JSON.parse(JSON.stringify(pr.selectors)) : null;
+        },
+      });
+      if (res && res.result) { live = res.result; break; }
+    }
+  } catch (_) { live = null; }
+  const out = {};
+  for (const k of ['input', 'send', 'stop', 'response']) {
+    const liveKey = k === 'response' ? 'assistant' : k;
+    const own = stored && Array.isArray(stored[k]) && stored[k].length ? stored[k] : null;
+    const fromLive = live && Array.isArray(live[liveKey]) ? live[liveKey] : [];
+    out[k] = (own || fromLive).slice();
+  }
+  return { out, haveStored: !!stored, haveLive: !!live };
+}
+
+async function editChatgpt() {
+  const e = await chatgptEffective();
+  editing = CHATGPT;
+  fillForm({ name: CHATGPT, label: 'ChatGPT', domains: ['chatgpt.com'], selectors: e.out });
+  window.scrollTo(0, document.body.scrollHeight);
+  if (!e.haveStored && !e.haveLive) setMsg('No saved override and no open chatgpt.com tab, so the selector fields are empty. Open chatgpt.com and click Edit again to prefill the current ones.', true);
+  else setMsg('Editing built-in chatgpt (' + (e.haveStored ? 'saved override' : 'current defaults from the open tab') + '). Pick or edit, then Save.');
+}
+
+async function resetChatgpt() {
+  if (!confirm('Remove the saved chatgpt selector overrides? ChatGPT goes back to the built-in defaults.')) return;
+  await chrome.storage.local.remove(CHATGPT_KEY);
+  if (editing === CHATGPT) { editing = null; fillForm(); }
+  setMsg('chatgpt selectors reset to defaults (applies at the next request; no reload needed).');
+  await refresh();
+}
+
+function chatgptTestDef() {
+  const sel = { input: lines('f-input'), send: lines('f-send'), response: lines('f-response') };
+  if (lines('f-stop').length) sel.stop = lines('f-stop');
+  return { ok: true, value: { domains: ['chatgpt.com'], selectors: sel, dismiss: [], exclude: [] } };
+}
+
+async function saveChatgptOverrides(def) {
+  const s = (def && def.selectors) || {};
+  const out = {};
+  const errs = [];
+  const compiles = (x) => { try { document.createDocumentFragment().querySelector(x); return true; } catch (_) { return false; } };
+  for (const k of ['input', 'send', 'response', 'stop']) {
+    const list = Array.isArray(s[k]) ? s[k] : [];
+    if (list.length === 0) {
+      if (k !== 'stop') errs.push('selectors.' + k + ' needs at least one selector');
+      continue;
+    }
+    for (const x of list) {
+      if (typeof x !== 'string' || x.length > 300) errs.push('selectors.' + k + ': entry too long or not text');
+      else if (!compiles(x)) errs.push('selectors.' + k + ': invalid selector: ' + x);
+    }
+    out[k] = list.slice();
+  }
+  if (errs.length) { setMsg(errs.join('\n'), true); return false; }
+  await chrome.storage.local.set({ [CHATGPT_KEY]: { schema: 1, savedAt: new Date().toISOString(), selectors: out } });
+  setMsg('Saved chatgpt selector overrides to browser storage (input ' + out.input.length + ', send ' + out.send.length + ', response ' + out.response.length + ', stop ' + (out.stop ? out.stop.length : 'default') + '). Applies on the next request, no reload needed. Ignored for built-ins: code, exclude, dismiss, timeouts, extraction, completion.');
+  await refresh();
+  return true;
+}
+
 async function saveDefinition(def, isEdit) {
+  if (isEdit && editing === CHATGPT) return saveChatgptOverrides(def);
   const v = DSC.validateDefinition(def);
   if (!v.ok) { setMsg(v.errors.join('\n'), true); return false; }
   const value = v.value;
@@ -242,7 +334,7 @@ async function del(p) {
 }
 
 async function testSelectors() {
-  const v = DSC.validateDefinition(readForm());
+  const v = editing === CHATGPT ? chatgptTestDef() : DSC.validateDefinition(readForm());
   if (!v.ok) { setMsg(v.errors.join('\n'), true); return; }
   const origins = v.value.domains.map((d) => 'https://' + d + '/*');
   const tabs = await chrome.tabs.query({ url: origins });
@@ -379,7 +471,7 @@ $('seed').addEventListener('click', async () => {
     await saveDefinition(def, false);
   } catch (e) { setMsg('Seed failed: ' + e.message, true); }
 });
-chrome.storage.onChanged.addListener((c, a) => { if (a === 'local' && c[REG_KEY]) refresh(); });
+chrome.storage.onChanged.addListener((c, a) => { if (a === 'local' && (c[REG_KEY] || c[CHATGPT_KEY])) refresh(); });
 
 chrome.storage.local.get(SUBMITTER_KEY).then((s) => { if (s[SUBMITTER_KEY]) $('f-submitter').value = s[SUBMITTER_KEY]; });
 fillForm();

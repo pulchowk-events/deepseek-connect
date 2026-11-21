@@ -21,6 +21,38 @@
       'input[name="cf-turnstile-response"]'],
     notice: ['[role="dialog"]', '[role="alert"]', '[data-testid*="toast" i]'],
   };
+  // ---- Providers-page overrides (data only) ----------------------------------
+  // The Providers page saves { selectors: { input, send, stop, response } } under
+  // chrome.storage.local["chatgpt_overrides"]. Only those four are mapped (UI
+  // "response" -> SEL.assistant); user/challenge/notice keep their defaults.
+  const OVERRIDE_KEY = 'chatgpt_overrides';
+  const OVERRIDE_MAP = { input: 'input', send: 'send', stop: 'stop', response: 'assistant' };
+  const SEL_DEFAULTS = JSON.parse(JSON.stringify(SEL));
+  async function loadOverrides() {
+    let rec = null;
+    try {
+      const got = await chrome.storage.local.get(OVERRIDE_KEY);
+      rec = got && got[OVERRIDE_KEY] ? got[OVERRIDE_KEY] : null;
+    } catch (_) { rec = null; }
+    const picked = rec && rec.selectors && typeof rec.selectors === 'object' ? rec.selectors : {};
+    let merged = 0;
+    const dropped = [];
+    Object.keys(OVERRIDE_MAP).forEach(function (uiKey) {
+      const key = OVERRIDE_MAP[uiKey];
+      SEL[key] = SEL_DEFAULTS[key].slice();
+      const list = picked[uiKey];
+      if (!Array.isArray(list)) return;
+      const good = list.filter(function (s) {
+        if (typeof s !== 'string' || s.trim() === '' || s.length > 300) return false;
+        try { document.createDocumentFragment().querySelector(s); return true; } catch (_) { return false; }
+      }).map(function (s) { return s.trim(); });
+      if (good.length !== list.length) dropped.push(uiKey);
+      if (good.length) { SEL[key] = good; merged += good.length; }
+    });
+    console.info('[dsc:chatgpt] merged ' + merged + ' selectors from storage' +
+      (dropped.length ? ' (invalid entries dropped in: ' + dropped.join(', ') + ')' : ''));
+    return merged;
+  }
   const REASON_SEL = 'details, [data-testid*="thought" i], [data-testid*="reasoning" i], [class*="thinking" i], [class*="reasoning" i]';
   const RATE_RE = /too many requests|rate limit|you.ve (?:reached|hit)[^.]{0,80}(?:limit|cap)|you have (?:reached|hit)[^.]{0,80}(?:limit|cap)|usage (?:limit|cap)|limit (?:will )?resets?/i;
   const CHATGPT_MAX_PROMPT_CHARS = 55000;
@@ -242,6 +274,7 @@
 
   async function ensureChat(name) {
     const debug = { name: name, path: location.pathname, provider: 'chatgpt' };
+    await loadOverrides();
     const input = await waitFor(function () { return findInput() || (detectBlocked() ? true : null); }, 15000);
     if (input === true || (!input && detectBlocked())) {
       return { ok: false, error: BOT_BLOCKED, reason: 'turnstile_challenge', retryAfter: 30000, debug: debug };
@@ -271,6 +304,7 @@
       return fail(E.BAD_REQUEST, 'prompt_too_large', { promptLen: prompt.length, limit: CHATGPT_MAX_PROMPT_CHARS });
     }
     lastTooLongCheck = 0;
+    await loadOverrides();
 
     T('gpt_page_ready', { checking: true });
     const pageReady = await DSC.waitForPageStable(15000, DSC.STAGE_DELAY_MS);
@@ -468,6 +502,7 @@
   }
 
   async function checkState() {
+    await loadOverrides();
     const input = findInput();
     return {
       inputFound: !!input,
